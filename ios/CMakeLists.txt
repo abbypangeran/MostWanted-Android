@@ -17,6 +17,7 @@ FetchContent_Declare(SDL3
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(SDL3)
+find_package(Threads REQUIRED)
 
 add_executable(mostwanted_ios MACOSX_BUNDLE main.c)
 target_link_libraries(mostwanted_ios PRIVATE SDL3::SDL3-static)
@@ -31,12 +32,14 @@ set_target_properties(mostwanted_ios PROPERTIES
 add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     memory-tests/memory_test_main.c
     memory-tests/memory_tests.cpp
+    guest-memory-prototype/guest_memory.cpp
+    guest-memory-prototype/guest_memory_tests.cpp
     ../sdk/runtime/core/log.cpp
     ../sdk/runtime/kernel/memory.cpp
 )
 target_compile_features(mostwanted_memory_tests PRIVATE cxx_std_20)
-target_include_directories(mostwanted_memory_tests PRIVATE ../sdk/runtime)
-target_link_libraries(mostwanted_memory_tests PRIVATE SDL3::SDL3-static)
+target_include_directories(mostwanted_memory_tests PRIVATE ../sdk/runtime guest-memory-prototype)
+target_link_libraries(mostwanted_memory_tests PRIVATE SDL3::SDL3-static Threads::Threads)
 set_target_properties(mostwanted_memory_tests PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME "Most Wanted Memory Tests"
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist"

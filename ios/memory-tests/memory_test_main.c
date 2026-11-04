@@ -3,6 +3,7 @@
 #include <SDL3/SDL_main.h>
 
 extern int RunMemoryTests(void);
+extern int RunGuestMemoryPrototypeTests(void);
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     (void)appstate;
@@ -12,7 +13,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
         SDL_Log("memory tests: SDL_Init failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
-    return RunMemoryTests() ? SDL_APP_FAILURE : SDL_APP_SUCCESS;
+    int failures = RunMemoryTests();
+    failures += RunGuestMemoryPrototypeTests();
+    return failures ? SDL_APP_FAILURE : SDL_APP_SUCCESS;
 }
 
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {

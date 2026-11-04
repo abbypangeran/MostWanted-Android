@@ -120,6 +120,22 @@ extern "C" int RunMemoryTests() {
     Check(mem::FreeVirtual(allocation, allocation_size, mem::kMemRelease) == 0,
           "allocator release returns the guest range");
 
+    if (host_page > mem::kPage) {
+        Check(mem::AllocSystem(0x400, 64) == 0,
+              "runtime AllocSystem(0x400, 64) remains blocked by 16 KB host-page rules");
+        Check(mem::AllocSystem(0x200, 64) == 0,
+              "runtime ETHREAD-sized system allocation remains blocked");
+        uint32_t stack_top = mem::AllocStack(0x10000 + 0x40 + 0x1000);
+        Check(stack_top != 0, "runtime 64 KB-aligned stack allocation succeeds");
+        if (stack_top) {
+            Check(mem::IsCommitted(stack_top - 1), "runtime stack body is committed");
+            Check(!mem::IsCommitted(stack_top - 0x20000 - 1), "runtime stack guard remains uncommitted");
+            mem::FreeStack(stack_top);
+        }
+        Check(!mem::Commit(0x30000, 0x5000),
+              "runtime unaligned image-section commit remains blocked on a 16 KB host");
+    }
+
     uint64_t rss_after = ResidentBytes();
     Check(rss_before == UINT64_MAX || rss_after == UINT64_MAX || rss_after <= rss_before ||
               rss_after - rss_before < (8u << 20),
