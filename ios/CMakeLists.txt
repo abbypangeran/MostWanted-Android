@@ -44,3 +44,8 @@ set_target_properties(mostwanted_memory_tests PROPERTIES
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.racas.mostwanted.memorytests"
     XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1"
 )
+
+option(MOSTWANTED_BUILD_VULKAN_BOOTSTRAP "Build the optional MoltenVK iOS bootstrap app" OFF)
+if(MOSTWANTED_BUILD_VULKAN_BOOTSTRAP)
+    add_subdirectory(vulkan)
+endif()
