@@ -1,9 +1,11 @@
 #define SDL_MAIN_USE_CALLBACKS
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_metal.h>
 #include <SDL3/SDL_main.h>
 
 typedef struct AppState {
     SDL_Window *window;
+    SDL_MetalView metal_view;
     bool first_frame;
 } AppState;
 
@@ -17,14 +19,26 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
-    app.window = SDL_CreateWindow("Most Wanted iOS host", 960, 540, SDL_WINDOW_FULLSCREEN);
+    app.window = SDL_CreateWindow("Most Wanted iOS host", 960, 540,
+                                  SDL_WINDOW_FULLSCREEN | SDL_WINDOW_METAL | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!app.window) {
         SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
     *appstate = &app;
+    app.metal_view = SDL_Metal_CreateView(app.window);
+    if (!app.metal_view) {
+        SDL_Log("SDL_Metal_CreateView failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+    void *metal_layer = SDL_Metal_GetLayer(app.metal_view);
+    if (!metal_layer) {
+        SDL_Log("SDL_Metal_GetLayer failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
     SDL_Log("SDL initialized; video driver=%s; window=%u", SDL_GetCurrentVideoDriver(),
             SDL_GetWindowID(app.window));
+    SDL_Log("Metal surface initialized; layer=%p", metal_layer);
     return SDL_APP_CONTINUE;
 }
 
@@ -77,5 +91,6 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     AppState *state = appstate;
     (void)result;
     SDL_Log("SDL app quit");
+    if (state && state->metal_view) SDL_Metal_DestroyView(state->metal_view);
     if (state && state->window) SDL_DestroyWindow(state->window);
 }
