@@ -102,7 +102,10 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     LOGI("boot: title %08X, entry %08X, %zu sections", img.title_id, img.entry, img.sections.size());
     for (auto& l : img.libraries) LOGI("boot: library %-8s %u.%u.%u", l.name.c_str(), l.major, l.minor, l.build);
 
-    mem::ReserveImage(img.base, img.image_size);
+    if (!mem::ReserveImage(img.base, img.image_size)) {
+        LOGE("boot: could not reserve the XBE image at %08X+%X", img.base, img.image_size);
+        return false;
+    }
     std::memcpy(g_base + img.base, img.file.data(), std::min<size_t>(img.header_size, img.file.size()));
     // XBE header 0x120 points at the section headers, 56 bytes each, +0x18 is the reference count that marks one loaded
     uint32_t sec_hdr = img.U32(0x120);

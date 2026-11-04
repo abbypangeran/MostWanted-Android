@@ -431,7 +431,7 @@ KERNEL_EXPORT(327, XeLoadSection, 1) {
     uint32_t refs = R32(sec + 0x18);
     if (refs == 0) {
         uint32_t va = R32(sec + 4), vsize = R32(sec + 8), raw = R32(sec + 12), rsize = R32(sec + 16);
-        mem::Commit(va, vsize);
+        if (!mem::Commit(va, vsize)) return 0xC0000017;  // STATUS_NO_MEMORY
         std::memset(HostPtr(va), 0, vsize);
         if (g_image && raw + rsize <= g_image->file.size())
             std::memcpy(HostPtr(va), g_image->file.data() + raw, std::min(rsize, vsize));

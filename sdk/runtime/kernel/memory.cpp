@@ -1,9 +1,12 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "core/log.h"
@@ -13,12 +16,16 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace mem {
 
 static uint8_t* g_base = nullptr;
 static std::recursive_mutex g_lock;
+#ifdef _WIN32
+static HANDLE g_ram_mapping = nullptr;
+#endif
 
 uint8_t* Base() { return g_base; }
 
@@ -28,7 +35,30 @@ static bool InPhysical(uint32_t va) {
            (va >= kWriteCombineBase && va < kWriteCombineBase + kPhysicalSize);
 }
 
+static bool OverlapsPhysical(uint64_t start, uint64_t end) {
+    return (start < uint64_t(kContiguousBase) + kPhysicalSize && end > kContiguousBase) ||
+           (start < uint64_t(kWriteCombineBase) + kPhysicalSize && end > kWriteCombineBase);
+}
+
+static bool IsPhysicalRange(uint64_t start, uint64_t end) {
+    return (start >= kContiguousBase && end <= uint64_t(kContiguousBase) + kPhysicalSize) ||
+           (start >= kWriteCombineBase && end <= uint64_t(kWriteCombineBase) + kPhysicalSize);
+}
+
+static bool HostPageAlignedRange(uint32_t va, uint64_t size) {
+#ifdef __APPLE__
+    // shortcut: reject partial host-page operations; enable them after guest accesses are mediated.
+    static const long host_page = sysconf(_SC_PAGESIZE);
+    return host_page > 0 && va % uint64_t(host_page) == 0 && size % uint64_t(host_page) == 0;
+#else
+    (void)va;
+    (void)size;
+    return true;
+#endif
+}
+
 bool Init() {
+    if (g_base) return true;
     const uint64_t size = 1ull << 32;
 #ifdef _WIN32
     HANDLE ram = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kPhysicalSize, nullptr);
@@ -48,20 +78,55 @@ bool Init() {
         ok = ok && MapViewOfFileEx(ram, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, b + kWriteCombineBase) == b + kWriteCombineBase;
         if (ok) {
             g_base = b;
+            g_ram_mapping = ram;
             break;
         }
         for (auto& c : cuts) VirtualFree(b + c[0], 0, MEM_RELEASE);
         UnmapViewOfFile(b + kContiguousBase);
         UnmapViewOfFile(b + kWriteCombineBase);
     }
+    if (!g_base && ram) CloseHandle(ram);
 #else
-    void* p = mmap(reinterpret_cast<void*>(0x100000000ull), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
-    int fd = g_base ? memfd_create("ram", 0) : -1;
-    if (fd < 0 || ftruncate(fd, kPhysicalSize) ||
-        mmap(g_base + kContiguousBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED ||
-        mmap(g_base + kWriteCombineBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
-        g_base = nullptr;
+    auto create_backing = []() {
+#ifdef __APPLE__
+        const char* tmp = std::getenv("TMPDIR");
+        if (!tmp || !*tmp) {
+            errno = ENOENT;
+            return -1;
+        }
+        std::string path(tmp);
+        if (path.back() != '/') path.push_back('/');
+        path += "mostwanted-ram-XXXXXX";
+        std::vector<char> name(path.begin(), path.end());
+        name.push_back('\0');
+        int file = mkstemp(name.data());
+        if (file >= 0 && unlink(name.data())) {
+            int error = errno;
+            close(file);
+            errno = error;
+            return -1;
+        }
+        return file;
+#else
+        return memfd_create("ram", 0);
+#endif
+    };
+    void* reservation = mmap(reinterpret_cast<void*>(0x100000000ull), size, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (reservation != MAP_FAILED) {
+        uint8_t* base = static_cast<uint8_t*>(reservation);
+        int fd = create_backing();
+        if (fd >= 0 && !ftruncate(fd, kPhysicalSize)) {
+            bool ok = mmap(base + kContiguousBase, kPhysicalSize, PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_FIXED, fd, 0) != MAP_FAILED;
+            if (ok)
+                ok = mmap(base + kWriteCombineBase, kPhysicalSize, PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_FIXED, fd, 0) != MAP_FAILED;
+            if (ok) g_base = base;
+        }
+        if (fd >= 0) close(fd);
+        if (!g_base) munmap(reservation, size);
+    }
 #endif
     if (!g_base) {
         LOGE("memory: could not reserve the 4 GB guest space");
@@ -75,10 +140,20 @@ bool Init() {
 static std::vector<uint8_t> g_committed(0x100000, 0);
 
 bool Commit(uint32_t va, uint32_t size) {
-    if (!size || InPhysical(va)) return true;
+    if (!size) return true;
+    if (!g_base) return false;
+    uint64_t requested_end = uint64_t(va) + size;
+    if (requested_end > (1ull << 32)) return false;
+    if (OverlapsPhysical(va, requested_end)) return IsPhysicalRange(va, requested_end);
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+#ifdef __APPLE__
+    if (!HostPageAlignedRange(first, end - first)) {
+        LOGE("memory: refusing partial host-page commit %08X+%X", first, uint32_t(end - first));
+        return false;
+    }
+#endif
 #ifdef _WIN32
     if (!VirtualAlloc(g_base + first, size_t(end - first), MEM_COMMIT, PAGE_READWRITE)) {
         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
@@ -90,22 +165,53 @@ bool Commit(uint32_t va, uint32_t size) {
         return false;
     }
 #endif
+#ifdef __APPLE__
+    static const long host_page = sysconf(_SC_PAGESIZE);
+    for (uint64_t p = first; p < end; p += uint64_t(host_page))
+        if (!g_committed[size_t(p >> 12)]) std::memset(g_base + p, 0, size_t(host_page));
+#endif
     for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 1;
     return true;
 }
 
-void Decommit(uint32_t va, uint32_t size) {
-    if (InPhysical(va)) return;
+bool Decommit(uint32_t va, uint32_t size) {
+    if (!size) return true;
+    if (!g_base) return false;
+    uint64_t requested_end = uint64_t(va) + size;
+    if (requested_end > (1ull << 32)) return false;
+    if (OverlapsPhysical(va, requested_end)) return IsPhysicalRange(va, requested_end);
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+#ifdef __APPLE__
+    if (!HostPageAlignedRange(first, end - first)) {
+        LOGE("memory: refusing partial host-page decommit %08X+%X", first, uint32_t(end - first));
+        return false;
+    }
+#endif
 #ifdef _WIN32
-    VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
+    if (!VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT)) return false;
+#elif defined(__APPLE__)
+    if (mprotect(g_base + first, size_t(end - first), PROT_NONE)) {
+        LOGE("memory: decommit protection %08X+%X failed: %s", first, uint32_t(end - first), std::strerror(errno));
+        return false;
+    }
+    if (madvise(g_base + first, size_t(end - first), MADV_DONTNEED)) {
+        int error = errno;
+        if (mprotect(g_base + first, size_t(end - first), PROT_READ | PROT_WRITE))
+            LOGE("memory: could not restore protection after decommit failure %08X+%X", first, uint32_t(end - first));
+        LOGE("memory: decommit discard %08X+%X failed: %s", first, uint32_t(end - first), std::strerror(error));
+        return false;
+    }
 #else
-    madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
-    mprotect(g_base + first, size_t(end - first), PROT_NONE);
+    if (madvise(g_base + first, size_t(end - first), MADV_DONTNEED) ||
+        mprotect(g_base + first, size_t(end - first), PROT_NONE)) {
+        LOGE("memory: decommit %08X+%X failed: %s", first, uint32_t(end - first), std::strerror(errno));
+        return false;
+    }
 #endif
     for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
+    return true;
 }
 
 bool IsCommitted(uint32_t va) { return InPhysical(va) || g_committed[va >> 12] != 0; }
@@ -113,6 +219,7 @@ bool IsCommitted(uint32_t va) { return InPhysical(va) || g_committed[va >> 12] !
 // first fit allocator over a guest range
 class Ranges {
 public:
+    void Clear() { free_.clear(); used_.clear(); }
     void Init(uint32_t start, uint32_t size) { free_[start] = size; }
 
     void Remove(uint32_t start, uint32_t size) {
@@ -230,15 +337,60 @@ static void EnsureRanges() {
     Commit(kKernelDataBase, kKernelDataSize);
 }
 
-void ReserveImage(uint32_t base, uint32_t size) {
+void Shutdown() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!g_base) return;
+    const uint64_t size = 1ull << 32;
+#ifdef _WIN32
+    const uint64_t cuts[][2] = {{0, kContiguousBase},
+                                {kContiguousBase + kPhysicalSize, kWriteCombineBase},
+                                {kWriteCombineBase + kPhysicalSize, size}};
+    bool released = UnmapViewOfFile(g_base + kContiguousBase) != 0;
+    released = (UnmapViewOfFile(g_base + kWriteCombineBase) != 0) && released;
+    for (const auto& cut : cuts)
+        released = (VirtualFree(g_base + cut[0], 0, MEM_RELEASE) != 0) && released;
+    if (!released) {
+        LOGE("memory: could not release the guest address space");
+        return;
+    }
+    if (g_ram_mapping) CloseHandle(g_ram_mapping);
+    g_ram_mapping = nullptr;
+#else
+    if (munmap(g_base, size)) {
+        LOGE("memory: could not release the guest address space: %s", std::strerror(errno));
+        return;
+    }
+#endif
+    g_base = nullptr;
+    std::fill(g_committed.begin(), g_committed.end(), 0);
+    g_contig.Clear();
+    g_system.Clear();
+    g_stacks.Clear();
+    g_stack_tops.clear();
+    g_reserved.clear();
+    g_user.Clear();
+    g_ranges_ready = false;
+}
+
+bool ReserveImage(uint32_t base, uint32_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
+    uint64_t requested_end = uint64_t(base) + size;
+    if (!size || base < kUserLow || requested_end > kUserHigh) return false;
     uint32_t b = base & ~0xFFFFu;
-    uint32_t e = (base + size + 0xFFFF) & ~0xFFFFu;
+    uint64_t rounded_end = (requested_end + 0xFFFF) & ~0xFFFFull;
+    if (rounded_end > kUserHigh) return false;
+    uint32_t e = uint32_t(rounded_end);
+    if (!g_user.IsFree(b, e - b)) return false;
     g_user.Remove(b, e - b);
     Reservation r{e - b, 4, std::vector<uint8_t>((e - b) / kPage, 1)};  // 4 is PAGE_READWRITE
     g_reserved[b] = std::move(r);
-    Commit(b, e - b);
+    if (!Commit(b, e - b)) {
+        g_reserved.erase(b);
+        g_user.Release(b, e - b);
+        return false;
+    }
+    return true;
 }
 
 static Reservation* FindReservation(uint32_t addr, uint32_t* start) {
@@ -254,15 +406,25 @@ uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
     if (!size) return 0xC000000D;  // STATUS_INVALID_PARAMETER
+    const uint32_t requested_base = base, requested_size = size;
+    uint64_t requested_end = uint64_t(requested_base) + requested_size;
+    if ((requested_base && (requested_base < kUserLow || requested_end > kUserHigh)) ||
+        (!requested_base && requested_size > kUserHigh - kUserLow))
+        return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
+    uint32_t reserved_base = 0, reserved_size = 0;
     bool reserve = type & kMemReserve;
     bool commit = type & kMemCommit;
     if (!base && commit) reserve = true;
     if (reserve) {
-        uint32_t sz = (size + 0xFFFF) & ~0xFFFFu;
+        uint64_t rounded_size = (uint64_t(requested_size) + 0xFFFF) & ~0xFFFFull;
+        if (rounded_size > UINT32_MAX) return 0xC0000017;  // STATUS_NO_MEMORY
+        uint32_t sz = uint32_t(rounded_size);
         uint32_t a;
-        if (base) {
-            a = base & ~0xFFFFu;
-            sz = ((base + size + 0xFFFF) & ~0xFFFFu) - a;
+        if (requested_base) {
+            a = requested_base & ~0xFFFFu;
+            uint64_t rounded_end = (requested_end + 0xFFFF) & ~0xFFFFull;
+            if (rounded_end > kUserHigh) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
+            sz = uint32_t(rounded_end - a);
             if (!g_user.IsFree(a, sz)) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
             g_user.Remove(a, sz);
         } else {
@@ -271,20 +433,43 @@ uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t
             g_user.Forget(a);
         }
         g_reserved[a] = Reservation{sz, protect, std::vector<uint8_t>(sz / kPage, 0)};
-        base = a;
-        size = sz;
+        reserved_base = a;
+        reserved_size = sz;
     }
     if (commit) {
         uint32_t start;
-        Reservation* r = FindReservation(base, &start);
-        if (!r) return 0xC0000045;  // STATUS_INVALID_PAGE_PROTECTION stands in for not reserved
-        uint32_t first = base & ~(kPage - 1);
-        uint32_t end = (base + size + kPage - 1) & ~(kPage - 1);
-        if (end > start + r->size) return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
-        Commit(first, end - first);
+        uint32_t requested_commit_base = requested_base ? requested_base : reserved_base;
+        Reservation* r = FindReservation(requested_commit_base, &start);
+        if (!r) {
+            if (reserve) {
+                g_reserved.erase(reserved_base);
+                g_user.Release(reserved_base, reserved_size);
+            }
+            return 0xC0000045;  // STATUS_INVALID_PAGE_PROTECTION stands in for not reserved
+        }
+        uint32_t first = requested_commit_base & ~(kPage - 1);
+        uint64_t end64 = (uint64_t(requested_commit_base) + requested_size + kPage - 1) & ~uint64_t(kPage - 1);
+        if (end64 > uint64_t(start) + r->size) {
+            if (reserve) {
+                g_reserved.erase(reserved_base);
+                g_user.Release(reserved_base, reserved_size);
+            }
+            return 0xC0000018;  // STATUS_CONFLICTING_ADDRESSES
+        }
+        uint32_t end = uint32_t(end64);
+        if (!Commit(first, uint32_t(end - first))) {
+            if (reserve) {
+                g_reserved.erase(reserved_base);
+                g_user.Release(reserved_base, reserved_size);
+            }
+            return 0xC0000017;  // STATUS_NO_MEMORY
+        }
         for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 1;
         base = first;
         size = end - first;
+    } else if (reserve) {
+        base = reserved_base;
+        size = reserved_size;
     }
     return 0;
 }
@@ -296,16 +481,19 @@ uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
     if (!r) return 0xC000009F;  // STATUS_MEMORY_NOT_ALLOCATED
     if (type & kMemRelease) {
         uint32_t sz = r->size;
-        Decommit(start, sz);
+        if (!Decommit(start, sz)) return 0xC0000017;  // STATUS_NO_MEMORY
         g_reserved.erase(start);
         g_user.Release(start, sz);
         base = start;
         size = sz;
         return 0;
     }
-    uint32_t first = base & ~(kPage - 1);
-    uint32_t end = size ? (base + size + kPage - 1) & ~(kPage - 1) : start + r->size;
-    Decommit(first, end - first);
+    uint32_t first = size ? base & ~(kPage - 1) : start;
+    uint64_t end64 = size ? (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1)
+                          : uint64_t(start) + r->size;
+    if (end64 > uint64_t(start) + r->size || end64 < first) return 0xC0000018;
+    uint32_t end = uint32_t(end64);
+    if (!Decommit(first, end - first)) return 0xC0000017;  // STATUS_NO_MEMORY
     for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 0;
     base = first;
     size = end - first;
@@ -355,15 +543,18 @@ uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint3
              (unsigned long long)(g_contig.Used() >> 10));
         return 0;
     }
-    Commit(a, size);
+    if (!Commit(a, size)) {
+        g_contig.Free(a);
+        return 0;
+    }
     std::memset(g_base + a, 0, size);
     return a;
 }
 
 void FreeContiguous(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t size;
-    if (g_contig.Free(va, &size)) Decommit(va, size);
+    uint32_t size = g_contig.SizeOf(va);
+    if (size && Decommit(va, size)) g_contig.Free(va);
 }
 
 uint32_t AllocSystem(uint32_t size, uint32_t align) {
@@ -373,7 +564,10 @@ uint32_t AllocSystem(uint32_t size, uint32_t align) {
     if (!size) size = 16;
     uint32_t a = g_system.Alloc(size, std::max<uint32_t>(align, 16), kSystemBase, kSystemBase + kSystemSize - 1, false);
     if (!a) return 0;
-    Commit(a, size);
+    if (!Commit(a, size)) {
+        g_system.Free(a);
+        return 0;
+    }
     std::memset(g_base + a, 0, size);
     return a;
 }
@@ -390,7 +584,10 @@ uint32_t AllocStack(uint32_t size) {
     // one uncommitted guard page below the stack
     uint32_t a = g_stacks.Alloc(size + 0x10000, 0x10000, kStackBase, kStackBase + kStackSize - 1, false);
     if (!a) return 0;
-    Commit(a + 0x10000, size);
+    if (!Commit(a + 0x10000, size)) {
+        g_stacks.Free(a);
+        return 0;
+    }
     g_stack_tops[a + 0x10000 + size] = a;
     return a + 0x10000 + size;
 }
@@ -399,9 +596,9 @@ void FreeStack(uint32_t top) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     auto it = g_stack_tops.find(top);
     if (it == g_stack_tops.end()) return;
-    uint32_t size;
-    if (g_stacks.Free(it->second, &size)) Decommit(it->second, size);
-    g_stack_tops.erase(it);
+    uint32_t start = it->second;
+    uint32_t size = g_stacks.SizeOf(start);
+    if (size && Decommit(start, size) && g_stacks.Free(start)) g_stack_tops.erase(it);
 }
 
 uint32_t AllocationSize(uint32_t va) {
