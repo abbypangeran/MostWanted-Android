@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 #include <SDL3/SDL_main.h>
+#include <unistd.h>
 
 typedef struct AppState {
     SDL_Window *window;
@@ -19,6 +20,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
+    SDL_Log("Darwin host page size=%ld", sysconf(_SC_PAGESIZE));
     app.window = SDL_CreateWindow("Most Wanted iOS host", 960, 540,
                                   SDL_WINDOW_FULLSCREEN | SDL_WINDOW_METAL | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!app.window) {
