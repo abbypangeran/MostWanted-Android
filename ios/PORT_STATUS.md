@@ -145,6 +145,112 @@ bash ./gradlew :app:assembleDebug
 
 The NDK syntax-only command passed. Gradle failed before project configuration with `BUG! exception in phase 'semantic analysis' in source unit '_BuildScript_' Unsupported class file major version 69` under Temurin 25.0.3.
 
+## Phase 2C-1 guest memory results
+
+Verified on 2026-11-04. The Phase 2C-1 architecture record is in [`GUEST_MEMORY_ARCHITECTURE.md`](GUEST_MEMORY_ARCHITECTURE.md).
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| `GUEST_ACCESS_INVENTORY` | **PASS** | Runtime, recompiler, generated code, kernel/HLE, boot, I/O, graphics, audio, threads, atomics, and direct-pointer access categories have documented handling or explicit gaps. The inventory found `X86_MEM*` in 128 generated units, raw `X86_PTR` in 65, and atomics in 18; counts overlap. |
+| `MEMORY_ARCHITECTURE_PROTOTYPE` | **PASS — isolated prototype only** | Checked 4 KB logical-page operations and access rejection pass on 16 KB macOS and iOS Simulator hosts. This is not runtime integration. |
+| `BOOT_ALLOCATION_PROBE` | **BLOCKED** | Prototype allocation shapes pass, but real runtime `AllocSystem(0x400, 64)`, ETHREAD-sized allocation, and unaligned image-section commit remain blocked. Real runtime guarded stack allocation passes. No Xbox runtime or game boot was attempted. |
+| `ANDROID_REGRESSION` | **PARTIAL** | Java 21 Gradle task configuration passes. `assembleDebug` reaches Android CMake configuration, then fails because generated game code is unavailable. No Android C++ compilation or device run occurred. |
+
+### Prototype checks
+
+The prototype owns a 256 KB temporary backing file and two shared aliases, with 64 logical 4 KB page entries mapped onto a 16 KB host. It validates whole spans through its access API, serializes operations against decommit/protection changes, and never returns a raw guest pointer. The standalone prototype and macOS runtime allocator CTest targets each passed (`1/1`). The iOS Simulator memory-test app passed runtime and prototype checks; logs confirmed `Darwin host page size=16384`, all prototype checks passed, and the app printed `memory tests: finished`. The SDL indirect-input Info.plist warning was nonfatal.
+
+Prototype limitations: logical permissions only; host aliases remain read/write. Raw pointer accesses can bypass checks. `CheckExecute` is not wired into CPU fetch. All aliases share permission state, so alias-specific protection is absent. `FetchAdd32` is serialized only for API users. Decommit clears contents/state but retains backing storage. The allocation probes model shapes only and do not invoke Xbox runtime allocators. See the architecture record for all unimplemented access paths.
+
+Run standalone macOS prototype tests:
+
+```sh
+cmake -S ios/guest-memory-prototype -B .local/ios-port/guest-memory-prototype-macos -G Xcode
+cmake --build .local/ios-port/guest-memory-prototype-macos --config Debug \
+  --target guest_memory_prototype_tests -- -quiet
+ctest --test-dir .local/ios-port/guest-memory-prototype-macos -C Debug --output-on-failure
+```
+
+Run macOS runtime allocator checks:
+
+```sh
+cmake -S ios/memory-tests -B .local/ios-port/memory-macos -G Xcode \
+  -DCMAKE_OSX_SYSROOT=macosx -DCMAKE_OSX_ARCHITECTURES=arm64
+cmake --build .local/ios-port/memory-macos --config Debug \
+  --target mostwanted_memory_tests -- -quiet
+ctest --test-dir .local/ios-port/memory-macos -C Debug --output-on-failure
+```
+
+Build and run the combined memory checks on the iPhone 18 Pro simulator:
+
+```sh
+cmake -S ios -B .local/ios-port/ios-sim -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.2.sdk \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DMOSTWANTED_BUILD_VULKAN_BOOTSTRAP=ON
+cmake --build .local/ios-port/ios-sim --config Debug \
+  --target mostwanted_memory_tests -- -quiet
+xcrun simctl install 43A6197F-AD68-48D4-84DB-6A147D89B8DC \
+  .local/ios-port/ios-sim/Debug-iphonesimulator/mostwanted_memory_tests.app
+xcrun simctl launch --console-pty --terminate-running-process \
+  43A6197F-AD68-48D4-84DB-6A147D89B8DC com.racas.mostwanted.memorytests
+```
+
+Runtime checks intentionally report the current backend limitations: `AllocSystem(0x400, 64)` and the ETHREAD-sized allocation are refused under 16 KB host-page rules; 64 KB-aligned guarded stack allocation succeeds; unaligned `Commit(0x30000, 0x5000)` is refused. Prototype equivalents for the KPCR/ETHREAD, guarded stack/TLS, and image-section shapes pass through the checked API. This does not establish actual boot readiness.
+
+### Android Java 21 regression check
+
+Used JDK 21.0.13 for this command only; no global Java setting changed. Project Gradle 8.7 configured successfully and requested NDK 28.2.13676358. Android SDK Platform 34, that NDK, and CMake 3.31.6 were added under the existing local Android SDK. The Java 25 `Unsupported class file major version 69` failure is resolved.
+
+CMake 3.31.6 was installed with:
+
+```sh
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+/Users/abbypangeran/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager \
+  --sdk_root=/Users/abbypangeran/Library/Android/sdk 'cmake;3.31.6'
+```
+
+Gradle task configuration passed:
+
+```sh
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+bash ./gradlew --no-daemon :app:tasks
+```
+
+Output: `BUILD SUCCESSFUL`.
+
+Full app build attempt:
+
+```sh
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+bash ./gradlew --no-daemon :app:assembleDebug
+```
+
+Gradle reached `:app:configureCMakeRelease[arm64-v8a]`, using NDK Clang 19.0.1, then stopped at the repository's missing-input guard:
+
+```text
+CMake Error at CMakeLists.txt:33 (message):
+  No recompiled code: put the game in assets/ or iso/ and run build.bat, it
+  writes generated/game
+```
+
+Gradle result: `BUILD FAILED` during CMake configuration; the warning about SDK XML version 4 was nonfatal.
+
+No ISO, generated code, or copyrighted assets were added to tracked source. Android CMake and Gradle files were not changed. Therefore this verifies Gradle/JDK setup and the missing-input blocker, but not Android native compilation, packaging, or runtime behavior.
+
+### Phase 2C-2 recommendation
+
+**GO** for Phase 2C-2 work on comprehensive access mediation: convert recompiler emissions and every kernel/HLE, boot, I/O, graphics, audio, and diagnostic pointer path to checked spans or lifetime-pinned access. **NO-GO** for Xbox runtime startup or game boot until raw guest-pointer paths are eliminated or validated, real runtime allocation probes pass on 16 KB hosts, and protection/decommit races are covered. Keep runtime, simulator, physical-device, and game-boot evidence separate.
+
+Phase 2C-1 commits:
+
+- Architecture inventory and choice: `7f46bc69a5fa82fc4ab88d7067b4cc8a656b9316`
+- Isolated translated-page prototype: `6ff32dedc7556345bf08bb88c91faaa2281a3e79`
+- Prototype and runtime-shape tests: `351ef1e82c25a6d6c084b1bc423a17d201ce29f1`
+
 ## Vulkan and MoltenVK findings
 
 SDL 3.4.16's UIKit Vulkan backend requires `VK_KHR_surface` and supports `VK_EXT_metal_surface`; it creates its own UIKit Metal view and `CAMetalLayer` during `SDL_Vulkan_CreateSurface`. The bootstrap uses that path and does not create a second view. The Android Vulkan backend remains platform-specific: `native/vulkan.cpp` waits for `SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER`, so its surface path is not reused on iOS.
