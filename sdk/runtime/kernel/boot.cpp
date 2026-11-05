@@ -86,6 +86,11 @@ static xbe::Image g_xbe;
 bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir) {
     if (!mem::Init()) return false;
     g_base = mem::Base();
+    if (!g_base) {
+        LOGE("boot: raw guest access is blocked until the recompiler and host callers use checked memory");
+        mem::Shutdown();
+        return false;
+    }
 
     std::string err;
     if (!g_xbe.Parse(std::move(xbe), err)) {

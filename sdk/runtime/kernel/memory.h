@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace mem {
@@ -22,7 +23,19 @@ constexpr uint32_t kMemCommit = 0x1000, kMemReserve = 0x2000, kMemDecommit = 0x4
 
 bool Init();
 void Shutdown();
+bool IsInitialized();
 uint8_t* Base();
+
+enum Permission : uint8_t { kNoAccess = 0, kRead = 1, kWrite = 2, kExecute = 4, kReadWrite = kRead | kWrite };
+enum class AccessStatus : uint8_t { kOk, kNotInitialized, kInvalidAddress, kUncommitted, kPermissionDenied, kHostError };
+AccessStatus CheckAccess(uint32_t va, std::size_t size, uint8_t permissions);
+AccessStatus Protect(uint32_t va, uint32_t size, uint8_t permissions);
+AccessStatus Read(uint32_t va, void* destination, std::size_t size);
+AccessStatus Write(uint32_t va, const void* source, std::size_t size);
+AccessStatus Copy(uint32_t destination, uint32_t source, std::size_t size);
+AccessStatus Move(uint32_t destination, uint32_t source, std::size_t size);
+AccessStatus Fill(uint32_t va, uint8_t value, std::size_t size);
+AccessStatus AtomicFetchAdd32(uint32_t va, uint32_t value, uint32_t& previous);
 bool Commit(uint32_t va, uint32_t size);
 bool Decommit(uint32_t va, uint32_t size);
 bool IsCommitted(uint32_t va);
