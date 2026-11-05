@@ -1,5 +1,6 @@
 #include "kernel/crypto.h"
 #include "kernel/memory.h"
+#include "kernel/thread_memory.h"
 #include "xbe/image_loader.h"
 
 #include <algorithm>
@@ -213,6 +214,47 @@ void CheckSectionLoadRollback(const xbe::Image& image, const std::vector<uint8_t
           "section unload decrements its checked reference count");
 }
 
+void CheckSafePreparationCheckpoint(const std::vector<uint8_t>& bytes) {
+    const mem::Stats before = mem::Query();
+    xbe::Image image;
+    std::string error;
+    if (!image.Parse(bytes, error) || !xbe::PrepareImage(image, kEntry, kSyntheticSha1, error)) {
+        Check(false, "synthetic non-executing preparation parses and prepares the XBE");
+        return;
+    }
+    Check(mem::IsCommitted(image.entry), "synthetic preparation leaves the entry mapped without executing it");
+
+    const uint32_t kpcr = mem::AllocSystem(0x400, 64);
+    const uint32_t ethread = mem::AllocSystem(0x200, 64);
+    const uint32_t stack = mem::AllocStack(0x20000);
+    const uint32_t tls = stack ? stack - 0x100 : 0;
+    const auto status = kpcr && ethread && stack
+                            ? kernel::InitializeThreadGuestMemory(kpcr, ethread, stack, 0x10000, tls, 0x44)
+                            : mem::AccessStatus::kHostError;
+    std::array<uint8_t, 0x400> kpcr_bytes{};
+    std::array<uint8_t, 0x200> ethread_bytes{};
+    bool initialized = status == mem::AccessStatus::kOk &&
+                       mem::Read(kpcr, kpcr_bytes.data(), kpcr_bytes.size()) == mem::AccessStatus::kOk &&
+                       mem::Read(ethread, ethread_bytes.data(), ethread_bytes.size()) == mem::AccessStatus::kOk;
+    uint32_t kpcr_self = 0, kpcr_thread = 0, ethread_stack = 0, ethread_tls = 0, ethread_id = 0;
+    std::memcpy(&kpcr_self, kpcr_bytes.data() + 0x18, sizeof(kpcr_self));
+    std::memcpy(&kpcr_thread, kpcr_bytes.data() + 0x28, sizeof(kpcr_thread));
+    std::memcpy(&ethread_stack, ethread_bytes.data() + 0x1C, sizeof(ethread_stack));
+    std::memcpy(&ethread_tls, ethread_bytes.data() + 0x28, sizeof(ethread_tls));
+    std::memcpy(&ethread_id, ethread_bytes.data() + 0x12C, sizeof(ethread_id));
+    Check(initialized && kpcr_self == kpcr && kpcr_thread == ethread && ethread_bytes[0] == 6 &&
+              ethread_bytes[2] == 0x80 && ethread_stack == stack && ethread_tls == tls && ethread_id == 0x44,
+          "synthetic preparation initializes KPCR and ETHREAD through checked writes");
+
+    if (stack) mem::FreeStack(stack);
+    if (kpcr) mem::FreeSystem(kpcr);
+    if (ethread) mem::FreeSystem(ethread);
+    const bool image_released = mem::FreeVirtual(image.base, image.image_size, mem::kMemRelease) == 0;
+    const mem::Stats after = mem::Query();
+    Check(image_released && after.system_used == before.system_used && !mem::IsCommitted(kBase),
+          "synthetic preparation releases its image and allocator ownership");
+}
+
 bool ReadFile(const char* path, std::vector<uint8_t>& bytes) {
     std::ifstream file(path, std::ios::binary);
     if (!file) return false;
@@ -260,6 +302,7 @@ extern "C" int RunXbeImageLoaderTests(const char* real_xbe_path) {
     }
     Check(true, "guest memory initializes for image-loader tests");
     const std::vector<uint8_t> bytes = MakeSyntheticXbe();
+    CheckSafePreparationCheckpoint(bytes);
     xbe::Image image;
     std::string error;
     Check(image.Parse(bytes, error), "synthetic XBE parses");

@@ -495,15 +495,15 @@ This sequence is the path that would be reached if the Apple `Boot()` guard were
 | Kernel data initialization | `InitKernelData` initializes kernel data with checked `W8/W16/W32`; `PutAnsi` writes descriptor and NUL-terminated string together with one `mem::Write` and returns failure. The detached clock updater uses checked `W32` stores. | **Checked access, not runtime-tested.** Other scalar helper faults abort through the current fault policy rather than returning a status. |
 | Dispatch and thunk patching | `dispatch::Init` builds host-side mapping tables. The import loop reads and patches the parser-validated, terminated kernel thunk table using checked `R32/W32`. | **No direct pointer escape.** Invalid guest access still stops via the checked fault handler. |
 | File-system setup | `MountDefaults` maps host directories and creates the configured directories. It does not access guest memory. | **Host filesystem side effects only.** No game file was opened by this audit. |
-| Previous launch data | If `launch.bin` exists, `boot.cpp` allocates a page then calls `ifstream::read(HostPtr(page), 0x1000)` before removing the file. Allocation and read completion are not checked before the file is removed. | **Raw guest pointer. Earliest remaining boot-time escape after `MountDefaults`.** Must use checked copy-in and preserve the file on failed import before any guard change. |
-| Persisted display | When the launch-data path is taken and `display.bin` metadata is valid, `LoadPersistedDisplay` reads up to 8 MiB directly into `HostPtr(block + 0x40)`. A failed pixel read returns without releasing `block`. | **Raw guest pointer and failure-path allocation leak.** Needs bounded host-buffer read, checked guest write, and cleanup before startup. |
-| Guest thread allocation | `CreateThread` allocates stack/TLS/KPCR/ETHREAD and calls `InitializeThreadGuestMemory`; Apple failure paths release partial allocations. | **Checked setup and rollback.** Not invoked by Phase 2C-4. |
+| Previous launch data | `startup_data::ImportLaunchData` reads exactly 4 KiB into a bounded host buffer, validates allocation ownership, writes the data and pointer with `mem::Write`, and removes the source only after both writes succeed. | **Checked and failure-injected.** Failed reads/writes preserve `launch.bin`, keep the pointer unchanged, and release the new allocation. |
+| Persisted display | After a successful launch-data import, `startup_data::ImportPersistedDisplay` validates header, marker, pixel/picture limits, and exact file length; writes pixels and the full surface metadata block through checked memory; publishes state only after both writes succeed. | **Checked and failure-injected.** Failed import preserves the file and old state, releases the allocation, and retains neighboring bytes. On a cold start with no imported launch page, display data is left untouched, preserving the prior quick-reboot pairing. |
+| Guest thread allocation | `CreateThread` allocates stack/TLS/KPCR/ETHREAD and calls `InitializeThreadGuestMemory`; the isolated synthetic preparation checkpoint verifies KPCR/ETHREAD contents and cleanup without starting a host thread. | **Structure helper tested.** Full thread creation remains outside the isolated boot path. |
 | Guest execution boundary | `StartThread` registers/spawns the host thread, initializes context, then enters generated code through `CallGuest`. | **Prohibited in this phase.** Checked-mode execution still stops at unsupported instructions. |
-| First game entry sequence | Static generated function for `0x002B3916` has supported MOV/MOV/SUB/ADD instructions, then `cmp eax, [ecx]` is rejected at `0x002B3928`, before the first conditional branch. Subsequent linear instructions include PUSH, LEA, AND, and CALL rejections. | **Static blocker only.** No runtime reachability claim. |
+| First game entry sequence | Checked generated code supports MOV/MOV/SUB/ADD and CMP at `0x002B3928`; the following JNB uses the CMP result. The next linear blocker is PUSH at `0x002B393F`, followed by LEA, AND, and CALL sites. | **Static only.** No runtime reachability claim; each unsupported instruction still traps. |
 | Guest kernel exports | `XeLoadSection`/`XeUnloadSection` validate section-header addresses against the parsed table, serialize multi-call changes against guest page changes, and use checked fill/write/reference-count operations with rollback of newly committed pages on load failure. Other object, critical-section, string, and context exports still use `G<T>()` or `HostPtr()`. | **Section helpers compiled and tested through the loader API, not executed as kernel exports.** Remaining exports are unsafe on Darwin. |
 | Guest I/O and device work | `files.cpp` and `xnet.cpp` pass guest buffers to host file/socket APIs; `gpu`, D3D, texture/vertex, and sound paths use raw pointers; asynchronous paths can retain them. | **Unconverted.** Earliest use is after guest code invokes these exports; lifetime and copy direction need per-call review. |
 
-`sdk/runtime/kernel/rtl.cpp` also retains raw string copy/conversion and interlocked paths. `sdk/runtime/kernel/xboxkrnl.cpp` has raw object, critical-section, context, and crypto paths. The Phase 2C-1 inventory above lists the graphics, audio, network, and recompiler families. Do not remove the Apple guard until all paths reachable on the selected startup route have checked semantics and rollback/lifetime tests.
+`sdk/runtime/kernel/rtl.cpp` also retains raw string copy/conversion and interlocked paths. `sdk/runtime/kernel/xboxkrnl.cpp` has raw object, critical-section, context, and crypto paths. The Phase 2C-1 inventory above lists the graphics, audio, network, and recompiler families. The Phase 2C-5 section at the end records the current file-level raw-pointer inventory. Do not remove the Apple guard until all paths reachable on the selected startup route have checked semantics and rollback/lifetime tests.
 
 ### Checked-game instruction census
 
@@ -651,3 +651,134 @@ bash ./gradlew --no-daemon :app:assembleDebug
 - The simulator logged `You need UIApplicationSupportsIndirectInputEvents in your Info.plist for mouse support`; memory, loader, fixture, and fault tests still completed. No device install or game execution was attempted.
 
 The old Phase 2C-3 coverage report is retained as historical evidence. No new whole-file coverage target was pursued in this phase; semantic loader rollback, malformed-file, checked-access, and platform tests were prioritized.
+
+## Phase 2C-5 startup data, checked CMP, and preparation boundary
+
+Verified 2026-11-05 on `feature/ios-port`, starting at `7d8f5820f8551bf8fc43b7e752ab708be9804f18`. Work stayed in the requested checkout. Generated XBE data, generated C++, logs, and build products remained under ignored `.local/ios-port/`; the pre-existing `.DS_Store` was not staged.
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `LAUNCH_DATA_CHECKED_IMPORT` | **PASS** | Exact 4 KiB host-buffer read, allocation ownership, checked page and pointer writes, source preservation on injected read/allocation/write failures, cleanup, repeat import, missing and malformed file cases. |
+| `PERSISTED_DISPLAY_CHECKED_IMPORT` | **PASS** | Header, arithmetic, pixel and picture bounds, exact file length, checked pixel and metadata writes, state publication, replacement cleanup, neighbor preservation, and injected failures covered. |
+| `CHECKED_CMP_FIXTURE` | **PASS** | Actual generated CMP variants execute against independent reference flags; destination preservation, JNB/JP/signed-JL branches, and checked-memory fault state are verified. Debug and Release CTests pass. |
+| `NON_EXECUTING_KERNEL_PREPARATION` | **BLOCKED** | Isolated synthetic XBE preparation and KPCR/ETHREAD checked initialization/cleanup pass. The complete production preparation chain is not isolated: `InitKernelData` starts an unjoined worker, dispatch consumes production generated globals, filesystem mappings have no reset seam, and thunk patching has no synthetic fixture. No guest code ran. |
+| `STARTUP_REACHABILITY_LEDGER` | **PASS (static)** | Current generated entry blocks and guest-memory dependencies recorded below. This is not runtime reachability evidence. |
+| macOS ARM64 | **PASS** | Memory/import/XBE tests pass in Debug and Release; CMP and fault-handler fixtures pass in Debug and Release. |
+| iOS Simulator ARM64 | **PASS** | Memory/import/XBE test app built without a generated guest fixture, launched on iPhone 18 Pro simulator, and logged `memory tests: finished`. CMP and fault-handler fixtures pass macOS Debug and Release CTests. |
+| iPhoneOS ARM64 | **PASS (compile/link)** | Unsigned `mostwanted_memory_tests` and `mostwanted_vulkan_ios` targets linked with code signing disabled. No physical-device install or run. |
+| Android | **PASS (build)** | Java 21 / NDK 28.2.13676358 `:app:assembleDebug` passed on the final shared-source revision in 1m 5s. No Android runtime execution. |
+
+### Startup import and CMP behavior
+
+`startup_data::ImportLaunchData` and `ImportPersistedDisplay` replace the boot-time `HostPtr()` reads with bounded file buffers and checked writes. Launch data is exactly 4096 bytes; the guest pointer is published only after both checked writes succeed. Persisted display is imported only after launch data imports successfully, preserving the existing quick-reboot pairing and avoiding stale display imports on cold start. The display importer bounds pixels to 8 MiB and the path string to 1040 bytes, checks the 28-byte header and exact total file length using 64-bit arithmetic, writes pixels before the 64-byte surface structure, then publishes state and releases any previous allocation. Failed imports preserve their files and previous display state. A failure to remove a source after a successful import is reported as a warning while the valid imported state remains published.
+
+The checked recompiler now admits only the existing non-locked binary RMW operand class for CMP. It computes CF, PF, AF, ZF, SF, and OF at the operand width, sign-extends narrow immediates as x86 requires, performs a checked memory read in source order, does not write the destination, and retains the instruction PC/address/status on faults. AF is now preserved in `X86Context` alongside the other saved flags; ADD/SUB/INC update it too. Fixtures cover byte/word/dword register, memory and immediate forms; carry, signed overflow, zero, negative, parity and nibble borrow; unaligned and SIB addressing; read-only/uncommitted/cross-page/overflow faults; JNB/JP decisions; and signed JL decisions including SF/OF overflow. The checked whitelist did not expand to PUSH, LEA, AND, CALL, or other unsupported operations.
+
+### Non-executing preparation checkpoint
+
+`CheckSafePreparationCheckpoint` in `ios/memory-tests/xbe_image_tests.cpp` parses and prepares a synthetic XBE, verifies its entry is mapped, allocates a temporary stack/KPCR/ETHREAD, calls the production checked `InitializeThreadGuestMemory`, verifies structure fields, and frees those test resources. It calls neither `Boot()` nor `StartThread`, `CallGuest`, or a callback that can enter guest code. Stage A import tests run separately against dedicated temporary directories.
+
+This is not the full preparation sequence. `InitKernelData` launches a detached clock worker with no stop/join API, so a test cannot deterministically release guest memory while that worker may still write. `dispatch::Init` reads `X86CodeBase`, `X86CodeEnd`, `X86FuncMappings`, and `X86Continuations` production globals rather than receiving a synthetic mapping set. `MountDefaults` also mutates process-global mappings and creates host directories without a reset path. The production `Boot()` guard remains, and these steps were not invoked. Do not treat the safe checkpoint as permission to begin guest execution.
+
+### Current startup pointer and host-buffer inventory
+
+The early `Boot()` load paths now use checked helpers, but guest execution would still enter shared runtime code containing unchecked guest references or pointers. The file-level scan found these remaining source locations:
+
+- `sdk/runtime/kernel/kernel.h` defines raw `G<T>()` and `HostPtr()`; `rtl.cpp` retains raw string/copy/conversion and interlocked operations; `xboxkrnl.cpp` retains raw object, critical-section, context and crypto operations; `files.cpp` hands guest buffers to host file APIs. `threads.cpp` keeps a non-Apple direct-memory fallback; Apple thread setup uses the checked whole-structure helper. `guest_strings.cpp` also retains a non-Apple `HostPtr()` fallback; its Apple path uses checked reads.
+- `sdk/runtime/xdk/d3d8.cpp`, `dsound.cpp`, `xapi.cpp`, and `xnet.cpp`, plus `sdk/runtime/xdk/hle.h`, read or write guest objects through `HostPtr()`/`G<T>()`. D3D's save-side persisted-display caller passes a raw guest pixel pointer into `SavePersistedDisplay`.
+- `sdk/runtime/gpu/render_thread.cpp`, `texture.cpp`, and `vertex.cpp`, plus `src/d3d/d3d8.cpp`/`render_thread.cpp`, retain graphics buffers or pointers. `sdk/runtime/gpu/d3d12.cpp` also contains raw accesses but is a Windows-only backend and is not compiled into the iOS target. Deferred render work can outlive a call unless its source is copied or pinned.
+- `src/sound/buffers.cpp`, `device.cpp`, `mixer.cpp`, and `streams.cpp` retain raw audio buffers across device/mixer work.
+- `src/game/fe_mouse.cpp`, `game.cpp`, `game_font.cpp`, `hud_layout.cpp`, `options_menu.cpp`, and `prompts.cpp` use `kernel::G<T>()`/`HostPtr()` in game hooks, menus, fonts, HUD data, and prompt text.
+- `sdk/runtime/xdk/crt_math.cpp` reads x87 math arguments from guest stack memory through raw `X86_MEMF64`.
+- Default-mode generated code still has direct `X86_MEM*`/`X86_PTR` emissions. The actual checked-mode output uses checked scalar helpers for its supported whitelist and emits traps for unsupported instruction shapes; it does not make the runtime/HLE paths above safe.
+
+Scalar `R8/R16/R32/R64` and `W8/W16/W32/W64` are checked on Apple and abort on access failure; they are not the remaining pointer escapes. The kernel thunk patch loop uses those checked scalar helpers, but has not run in an isolated startup-preparation test. Every raw path that could be called by the selected game route still needs an owner-specific checked/copy/pin conversion and rollback or lifetime test before the Apple guard can change.
+
+### Checked generated entry audit
+
+Fresh checked-mode output was generated under `.local/ios-port/phase2c5-checked-game/`; all 129 generated translation units passed syntax-only compilation. Static inspection of `sub_002B3916` shows:
+
+| Guest PCs | Generated operations | Dependency / status |
+| --- | --- | --- |
+| `0x002B3916–0x002B3923` | Load ECX from `[0x00010118]`, load EAX from `[0x00010108]`, subtract ECX, add `0x10000`. | Checked 32-bit reads; register arithmetic updates flags. |
+| `0x002B3928–0x002B392C` | `cmp eax,[ecx]`; `jnb 0x002B392E`; if the branch is not taken, store EAX to `[ecx]`. | CMP is newly supported, JNB consumes its carry result, and the conditional store is checked. Read/write address depends on guest ECX. |
+| `0x002B392E–0x002B3939` | Read `[0x003ED3FC]`, subtract `[0x003ED3EC]`, then read `[0x003ED3F0]`. | Checked 32-bit guest-memory reads. |
+| `0x002B393F–0x002B3948` | `push esi`, `lea eax,[eax+ecx+0x0F]`, `push edi`, `and eax,0xFFFFFFF0`, `push 0xFFFFFFFC`. | First blocker is PUSH at `0x002B393F`; LEA and AND are also rejected. PUSH needs checked stack writes and ESP semantics. |
+| `0x002B396A` | `call 0x002B5CA7`. | Direct guest call remains blocked; target and any host-export calls beneath it were not executed or audited as reachable. |
+
+The `CMP` memory read reports guest PC `0x002B3928`, the ECX-derived address, and the checked access status. Its generated fault fixture confirms the CMP does not mutate architectural registers or flags when that read fails. Static block ordering does not prove any of these instructions were reached at runtime. Before the first rejected PUSH, no host API call appears in this generated sequence; later guest/HLE dependencies remain unknown until separately audited.
+
+### Phase 2C-5 exact verification commands
+
+Build and run macOS ARM64 import, loader, and synthetic preparation tests:
+
+```sh
+cmake -S ios/memory-tests -B .local/ios-port/memory-macos -G Xcode \
+  -DCMAKE_OSX_SYSROOT=macosx -DCMAKE_OSX_ARCHITECTURES=arm64
+cmake --build .local/ios-port/memory-macos --config Debug --target mostwanted_memory_tests --parallel 8 -- -quiet
+ctest --test-dir .local/ios-port/memory-macos -C Debug --output-on-failure
+cmake --build .local/ios-port/memory-macos --config Release --target mostwanted_memory_tests --parallel 8 -- -quiet
+ctest --test-dir .local/ios-port/memory-macos -C Release --output-on-failure
+```
+
+Build and run actual generated CMP and fault-handler fixtures:
+
+```sh
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Debug \
+  --target checked_recompiler_tests checked_fault_handler_tests --parallel 8 -- -quiet
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Debug --output-on-failure
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Release \
+  --target checked_recompiler_tests checked_fault_handler_tests --parallel 8 -- -quiet
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Release --output-on-failure
+
+mkdir -p .local/ios-port/phase2c5-checked-game
+.local/ios-port/recompiler-fixtures-xcode/Debug/xbe_recomp \
+  .local/ios-port/checked-game.toml "$PWD/.local/ios-port/default.xbe" \
+  "$PWD/.local/ios-port/phase2c5-checked-game" --xdk "$PWD/sdk/xdk"
+find .local/ios-port/phase2c5-checked-game -name 'x86_*.cpp' -print0 | \
+  xargs -0 -n 16 -P 8 xcrun --sdk macosx clang++ -std=c++20 -fsyntax-only \
+    -fno-strict-aliasing -fsigned-char -Wno-unused-label -Wno-unused-variable \
+    -Wno-parentheses-equality -Isdk/runtime -I.local/ios-port/phase2c5-checked-game
+```
+
+The iPhone 18 Pro simulator memory-test app was rebuilt with `MOSTWANTED_CHECKED_FIXTURE_DIR` empty and launched from `.local/ios-port/ios-sim`; it contains no generated guest fixture and logged `memory tests: finished`. Generated CMP and fault fixtures were verified by macOS Debug and Release CTests. The device project uses the iPhoneOS 27.2 SDK and local SDL checkout; the unsigned memory-test and Vulkan bootstrap targets are rebuilt with `CODE_SIGNING_ALLOWED=NO`. Android uses the verified local Java/SDK paths:
+
+```sh
+cmake -S ios -B .local/ios-port/ios-sim -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.2.sdk \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DMOSTWANTED_BUILD_VULKAN_BOOTSTRAP=ON \
+  -DMOSTWANTED_CHECKED_FIXTURE_DIR= \
+  -DFETCHCONTENT_SOURCE_DIR_SDL3="$PWD/.local/ios-port/ios-sim/_deps/sdl3-src"
+cmake --build .local/ios-port/ios-sim --config Debug --target mostwanted_memory_tests --parallel 8 -- -quiet
+xcrun simctl install 43A6197F-AD68-48D4-84DB-6A147D89B8DC \
+  .local/ios-port/ios-sim/Debug-iphonesimulator/mostwanted_memory_tests.app
+xcrun simctl launch --terminate-running-process \
+  43A6197F-AD68-48D4-84DB-6A147D89B8DC com.racas.mostwanted.memorytests
+
+cmake -S ios -B .local/ios-port/ios-device -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.2.sdk \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DMOSTWANTED_BUILD_VULKAN_BOOTSTRAP=ON \
+  -DMOSTWANTED_CHECKED_FIXTURE_DIR="$PWD/.local/ios-port/recompiler-fixtures-xcode/fixture/generated" \
+  -DFETCHCONTENT_SOURCE_DIR_SDL3="$PWD/.local/ios-port/ios-sim/_deps/sdl3-src"
+cmake --build .local/ios-port/ios-device --config Debug \
+  --target mostwanted_memory_tests mostwanted_vulkan_ios --parallel 8 -- -quiet CODE_SIGNING_ALLOWED=NO
+
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+PATH=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin:$PATH \
+bash ./gradlew --no-daemon :app:assembleDebug
+```
+
+### Resolved failures and limits
+
+- The first Android compile found `kPersistMagic` had become private to the importer while `SavePersistedDisplay` still referenced it. The constant is now shared from `startup_data.h`; the initial full Java 21/NDK 28.2.13676358 build passed in 8m 5s, and the final-source rebuild passed in 1m 5s.
+- The first simulator rebuild used a stale generated Xcode project and failed to link `_RunStartupDataTests`. Explicit CMake reconfiguration refreshed the source list; the current simulator app built, installed, and launched.
+- An initial Android invocation omitted `ANDROID_HOME` and stopped during Gradle configuration. The final command above exports the existing SDK path and Java 21.
+- The simulator build reported unavailable optional `PkgConfig`/`LibUSB`; SDL configured and linked its enabled iOS backends. This did not block the build.
+- No physical iPhone installation, real Xbox guest instruction, `Boot()` path, `StartThread`, `CallGuest`, merge, or release was performed.
+
+**Next-stage recommendation: NO-GO for kernel initialization or game execution.** Keep the Apple `Boot()` null-base guard. CMP is covered, but the entry path next reaches unsupported stack/control operations, the complete kernel-preparation sequence is not isolated, and runtime/HLE raw guest pointers remain.
