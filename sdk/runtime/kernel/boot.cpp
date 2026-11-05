@@ -1,10 +1,11 @@
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include <fstream>
 
 #include "app/app.h"
 #include "kernel/kernel.h"
+#include "kernel/startup_data.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -37,38 +38,38 @@ uint8_t* g_base = nullptr;
 std::string g_launch_file;
 
 namespace {
-uint32_t g_saved_data = 0;
-bool g_mark = false, g_kept_marked = false;
-std::string g_picture, g_kept_picture;  // the last picture the title showed, raw path string with its terminator
-constexpr uint32_t kPersistMagic = 0x50535044;  // "DPSP"
+startup_data::DisplayState g_display_state;
+bool g_mark = false;
+std::string g_picture;  // the last picture the title showed, raw path string with its terminator
 
 std::string PersistFile() { return g_launch_file.substr(0, g_launch_file.find_last_of("/\\") + 1) + "display.bin"; }
 
-// surface header (Common, Data, Lock, Format, Size) then the pixels at +0x40, as the XDK lays out its persisted copy
-void LoadPersistedDisplay() {
-    std::ifstream f(PersistFile(), std::ios::binary);
-    uint32_t head[7] = {};
-    if (!f.read(reinterpret_cast<char*>(head), sizeof head) || head[0] != kPersistMagic || !head[4] || head[4] > 0x800000 ||
-        head[6] > 1040)
-        return;
-    uint32_t block = mem::AllocContiguous(0x40 + head[4], 0, 0xFFFFFFFF, 0x1000);
-    if (!block || !f.read(static_cast<char*>(HostPtr(block + 0x40)), head[4])) return;
-    g_kept_picture.resize(head[6]);
-    if (!f.read(g_kept_picture.data(), head[6])) g_kept_picture.clear();
-    W32(block, (head[1] & 0xFFFF0000) | 1);
-    W32(block + 4, mem::PhysicalFromVirtual(block + 0x40));
-    W32(block + 8, 0);
-    W32(block + 0xC, head[2]);
-    W32(block + 0x10, head[3]);
-    g_saved_data = block;
-    g_kept_marked = head[5] != 0;
-    LOGI("boot: display kept from the previous run, %u bytes%s", head[4], g_kept_marked ? ", marked" : "");
+void LoadPreviousRunData() {
+    std::string error;
+    const startup_data::Result launch = startup_data::ImportLaunchData(g_launch_file, g_launch_data_page_va, error);
+    if (launch == startup_data::Result::kImported) {
+        LOGI("boot: launch data from the previous run imported");
+        if (!error.empty()) LOGW("boot: %s", error.c_str());
+    } else if (launch == startup_data::Result::kFailed) {
+        LOGW("boot: launch data import failed; source preserved: %s", error.c_str());
+    }
+    if (launch != startup_data::Result::kImported) return;
+
+    error.clear();
+    const startup_data::Result display = startup_data::ImportPersistedDisplay(PersistFile(), g_display_state, error);
+    if (display == startup_data::Result::kImported) {
+        LOGI("boot: display kept from the previous run%s", g_display_state.marked ? ", marked" : "");
+        if (!error.empty()) LOGW("boot: %s", error.c_str());
+    } else if (display == startup_data::Result::kFailed) {
+        LOGW("boot: persisted display import failed; source preserved: %s", error.c_str());
+    }
 }
 }  // namespace
 
 void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const void* pixels, uint32_t bytes) {
     if (FILE* f = std::fopen(PersistFile().c_str(), "wb")) {
-        uint32_t head[7] = {kPersistMagic, common, format, size, bytes, g_mark, uint32_t(g_picture.size())};
+        uint32_t head[7] = {startup_data::kPersistMagic, common, format, size, bytes, g_mark,
+                             uint32_t(g_picture.size())};
         std::fwrite(head, sizeof head, 1, f);
         std::fwrite(pixels, 1, bytes, f);
         std::fwrite(g_picture.data(), 1, g_picture.size(), f);
@@ -77,12 +78,12 @@ void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const
 }
 
 void MarkPersistedDisplay() { g_mark = true; }
-bool KeptDisplayMarked() { return g_kept_marked; }
+bool KeptDisplayMarked() { return g_display_state.marked; }
 void SetShownPicture(std::string path) { g_picture = std::move(path); }
-const std::string& KeptPicture() { return g_kept_picture; }
+const std::string& KeptPicture() { return g_display_state.picture; }
 
-uint32_t SavedDataAddress() { return g_saved_data; }
-void SetSavedDataAddress(uint32_t surface) { g_saved_data = surface; }
+uint32_t SavedDataAddress() { return g_display_state.saved_data; }
+void SetSavedDataAddress(uint32_t surface) { g_display_state.saved_data = surface; }
 const xbe::Image* g_image = nullptr;
 static xbe::Image g_xbe;
 
@@ -142,19 +143,9 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
 
     MountDefaults(game_dir, data_dir);
 
-    // a quick reboot into this title left its launch data page behind
+    // a quick reboot into this title left optional launch and display data behind
     g_launch_file = data_dir + "/launch.bin";
-    std::ifstream lf(g_launch_file, std::ios::binary);
-    if (lf) {
-        uint32_t page = mem::AllocContiguous(0x1000, 0, 0xFFFFFFFF, 0x1000);
-        lf.read(static_cast<char*>(HostPtr(page)), 0x1000);
-        lf.close();
-        std::remove(g_launch_file.c_str());
-        W32(g_launch_data_page_va, page);
-        LOGI("boot: launch data from the previous run, type %u", R32(page));
-        LoadPersistedDisplay();
-    }
-    std::remove(PersistFile().c_str());
+    LoadPreviousRunData();
 
     uint32_t tls = 0;
     if (img.tls_addr) tls = ((img.tls.data_end - img.tls.data_start + img.tls.zero_fill + 15) & ~15u) + 4;

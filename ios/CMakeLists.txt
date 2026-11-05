@@ -37,9 +37,11 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     ../sdk/runtime/core/log.cpp
     ../sdk/runtime/kernel/crypto.cpp
     ../sdk/runtime/kernel/memory.cpp
+    ../sdk/runtime/kernel/startup_data.cpp
     ../sdk/runtime/kernel/guest_strings.cpp
     ../sdk/runtime/xbe/image_loader.cpp
     memory-tests/xbe_image_tests.cpp
+    memory-tests/startup_data_tests.cpp
 )
 set(MOSTWANTED_CHECKED_FIXTURE_DIR "" CACHE PATH "Generated checked-recompiler fixture directory")
 if(MOSTWANTED_CHECKED_FIXTURE_DIR)
