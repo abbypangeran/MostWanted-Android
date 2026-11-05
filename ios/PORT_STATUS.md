@@ -253,15 +253,76 @@ Phase 2C-1 commits:
 - Isolated translated-page prototype: `6ff32dedc7556345bf08bb88c91faaa2281a3e79`
 - Prototype and runtime-shape tests: `351ef1e82c25a6d6c084b1bc423a17d201ce29f1`
 
+## Phase 2C-2 production memory checkpoint
+
+Verified on 2026-11-05. The earlier Phase 2B and 2C-1 statements above describe those checkpoints; the current Darwin memory behavior is described here and in `GUEST_MEMORY_ARCHITECTURE.md`.
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `GUEST_MEMORY_RUNTIME` | **PARTIAL** | Production checked read/write, bulk, atomic, software permission, 4 KB commit/decommit, and real allocator probes pass on 16 KB Darwin hosts. Full page-table/frame translation and all runtime callers are not integrated. |
+| `RECOMPILER_ACCESS_MEDIATION` | **BLOCKED** | `X86_MEM*`, `X86_PTR`, x87/SIMD, atomics, and REP helpers still use raw guest pointers. No generated-code fixture was attempted because Stages A/B are partial. |
+| `HOST_ACCESS_COVERAGE` | **BLOCKED** | `Base()` is null on Apple and `Boot()` stops before raw access. Kernel `G<T>()`/`HostPtr()`, boot image loading, I/O, graphics, audio, and asynchronous retained pointers remain unconverted. |
+| `IOS_MEMORY_REGRESSION` | **PARTIAL** | macOS CTest and iOS Simulator execution pass; unsigned physical ARM64 app compiles and links. Full-component branch coverage is 55.64%, below the 80% target. Physical device execution was not attempted. |
+| `ANDROID_REGRESSION` | **PARTIAL** | NDK 28.2 ARM64 syntax compilation and full `:app:assembleDebug` native build/package pass. Android execution was not attempted. |
+
+The test uses the actual `mem::Init`, `AllocSystem(0x400, 64)`, ETHREAD-sized allocation, `AllocStack`, and `ReserveImage` implementations. It verifies KPCR/ETHREAD-sized field access through checked operations, TLS and guard behavior, independent adjacent 4 KB pages, recommit zero-fill, alias coherence, 10-byte/16-byte spans, invalid bounds, concurrent atomic increments, and reads racing with protection/decommit. These are allocator and access probes; a guest thread was not started. The existing isolated prototype also runs in the simulator app.
+
+Build and run commands from the repository root:
+
+```sh
+cmake --build .local/ios-port/memory-macos --config Debug --target mostwanted_memory_tests -- -quiet
+ctest --test-dir .local/ios-port/memory-macos -C Debug --output-on-failure
+cmake --build .local/ios-port/ios-sim --config Debug --target mostwanted_memory_tests -- -quiet
+xcrun simctl install 43A6197F-AD68-48D4-84DB-6A147D89B8DC \
+  .local/ios-port/ios-sim/Debug-iphonesimulator/mostwanted_memory_tests.app
+xcrun simctl launch --console-pty --terminate-running-process \
+  43A6197F-AD68-48D4-84DB-6A147D89B8DC com.racas.mostwanted.memorytests
+cmake --build .local/ios-port/ios-device --config Debug \
+  --target mostwanted_memory_tests -- -quiet CODE_SIGNING_ALLOWED=NO
+/Users/abbypangeran/Library/Android/sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android29-clang++ \
+  -std=c++20 -fsyntax-only -DANDROID -fno-strict-aliasing -fsigned-char \
+  -include native/compat/crt.h -Inative/compat -Isdk/harness/compat -Isdk/runtime \
+  sdk/runtime/kernel/memory.cpp sdk/runtime/kernel/boot.cpp
+```
+
+Results: macOS CTest `1/1 Passed`; simulator app exit 0 with `memory tests: finished` and the new concurrency and alias checks marked `PASS`; unsigned device target linked; NDK syntax check exit 0. The device build directory was reconfigured with the exact iPhoneOS 27.2 SDK and `-DFETCHCONTENT_SOURCE_DIR_SDL3="$PWD/.local/ios-port/ios-sim/_deps/SDL3-src"` after its stale Xcode project initially failed with `Undefined symbols for architecture arm64: "_RunGuestMemoryPrototypeTests"`. Reconfiguration resolved that build-file-list error. No physical-device install or game boot occurred.
+
+LLVM coverage command and result:
+
+```sh
+LLVM_PROFILE_FILE=.local/ios-port/memory-coverage/final2-%p.profraw \
+  .local/ios-port/memory-coverage/Debug/mostwanted_memory_tests
+xcrun llvm-profdata merge -sparse .local/ios-port/memory-coverage/final2-*.profraw \
+  -o .local/ios-port/memory-coverage/final2.profdata
+xcrun llvm-cov report .local/ios-port/memory-coverage/Debug/mostwanted_memory_tests \
+  -instr-profile=.local/ios-port/memory-coverage/final2.profdata sdk/runtime/kernel/memory.cpp
+```
+
+Full `memory.cpp`: 75.55% lines, 70.83% regions, 85.42% functions, 55.64% branches. This includes legacy allocator, platform, and failure paths. The 80% branch target was not met; rollback failure injection and generated instruction paths are not covered.
+
+Debug microbenchmark prints nanoseconds per round. On the iOS Simulator: local scalar 2, checked scalar read+write 107; local 4 KB write+read 265, checked 4 KB write+read 366. On macOS: 1, 107, 217, and 302 respectively. The local operations use observable copy-in/copy-out into a local 4 KB buffer as a lower-bound proxy because Darwin no longer exposes the previous raw guest pointer. These figures show measurable checked-access cost, but are not a reliable direct-pointer slowdown ratio or a release-performance claim.
+
+Android full build used the validated local XBE and generated output through ignored `assets/default.xbe` and `generated/game` symlinks pointing into `.local/ios-port/`. Nothing under those paths was staged or committed. With local Java 21 and NDK 28.2.13676358:
+
+```sh
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+bash ./gradlew --no-daemon :app:assembleDebug
+```
+
+Result: initial `BUILD SUCCESSFUL in 11m 14s`, 37 tasks (10 executed, 27 up-to-date), including `:app:buildCMakeRelease[arm64-v8a]` and `:app:assembleDebug`. The final code rebuild also passed in 29s (5 executed, 32 up-to-date). Nonfatal diagnostics were SDK XML version 4 versus reader version 3 and SDL's deprecated `ASensorManager_getInstance`. No Android device installation or runtime test was performed.
+
+**Next milestone, Phase 2C-3:** convert a narrow recompiler fixture and startup-critical host helpers to checked access, including 10/16-byte, atomic and REP semantics; then audit every pointer escape and fault path before enabling `Boot()`. Runtime startup is **not safe to attempt** at this checkpoint. Android/Linux 16 KB host-page behavior remains unproven, and the production implementation still uses software state over linear backing rather than the selected page-table/frame architecture.
+
 ## Vulkan and MoltenVK findings
 
 SDL 3.4.16's UIKit Vulkan backend requires `VK_KHR_surface` and supports `VK_EXT_metal_surface`; it creates its own UIKit Metal view and `CAMetalLayer` during `SDL_Vulkan_CreateSurface`. The bootstrap uses that path and does not create a second view. The Android Vulkan backend remains platform-specific: `native/vulkan.cpp` waits for `SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER`, so its surface path is not reused on iOS.
 
 References: [SDL iOS guide](https://wiki.libsdl.org/SDL3/README-ios), [SDL UIKit Vulkan implementation at 3.4.16](https://github.com/libsdl-org/SDL/blob/release-3.4.16/src/video/uikit/SDL_uikitvulkan.m), [MoltenVK runtime guide](https://github.com/KhronosGroup/MoltenVK/blob/main/Docs/MoltenVK_Runtime_UserGuide.md).
 
-## Darwin memory findings before game boot
+## Phase 2B Darwin memory findings (historical)
 
-`sdk/runtime/kernel/memory.cpp` retains the 4 GB guest VA layout with sparse reservation and physical aliases. Darwin uses an unlinked temporary file instead of Linux `memfd_create`. `Commit`/`Decommit` still reject sub-host-page ranges. This is a fail-closed partial backend, not game-ready memory; see the Phase 2B blocker above. No game boot was attempted.
+At the Phase 2B checkpoint, `sdk/runtime/kernel/memory.cpp` retained the 4 GB guest VA layout with sparse reservation and physical aliases. Darwin used an unlinked temporary file instead of Linux `memfd_create`. `Commit`/`Decommit` rejected sub-host-page ranges. Phase 2C-2 supersedes that limitation through checked software page state, but does not establish game readiness. No game boot was attempted.
 
 ## Generated x86 trap sites
 
@@ -288,6 +349,6 @@ These 16 unimplemented guest instructions were found in ignored generated files 
 
 `x86_trap` in `sdk/runtime/cpu/dispatch.cpp` logs `guest trap at <PC>: <reason>`, flushes the guest stack, then aborts. Once runtime startup is integrated, capture the simulator/device log and match the reported PC against this table. A match proves that site is reachable on that run. An empty match is meaningful only if the run reaches a defined startup milestone (for example, the main menu) with complete logs. Since the handler aborts, each run can report only the first trap it reaches; no reachability run has been performed yet.
 
-## Next milestone
+## Phase 2A next milestone (historical)
 
 Design and implement comprehensive guest-access mediation or an equivalent safe 4 KB-on-16 KB memory model, then add tests for actual guest permissions and boot-thread allocations. Only after that gate, introduce Xbox runtime startup and use the existing `x86_trap` log to detect reachable trap sites. Keep simulator execution, physical-device execution, and game boot as separate acceptance checks.
