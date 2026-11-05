@@ -228,6 +228,7 @@ Full app build attempt:
 ```sh
 JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
 ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+PATH=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin:$PATH \
 bash ./gradlew --no-daemon :app:assembleDebug
 ```
 
@@ -450,10 +451,203 @@ Apple thread-source syntax checks:
 ```sh
 xcrun --sdk macosx clang++ -std=c++20 -fsyntax-only -Isdk/runtime -Isdk/harness/compat -Inative/compat sdk/runtime/kernel/threads.cpp
 xcrun --sdk iphoneos clang++ -target arm64-apple-ios15.0 -std=c++20 -fsyntax-only -Isdk/runtime -Isdk/harness/compat -Inative/compat sdk/runtime/kernel/threads.cpp
+xcrun --sdk iphoneos clang++ -target arm64-apple-ios15.0 -std=gnu++20 -fsyntax-only -fno-strict-aliasing -fsigned-char -I native/compat -I sdk/harness/compat -I native -I src -I sdk/runtime -I .local/ios-port/checked-recompiler-census -I third_party/SDL/include -include native/compat/crt.h sdk/runtime/kernel/boot.cpp sdk/runtime/kernel/xboxkrnl.cpp
 ```
 
 ### Generated trap reachability
 
 The existing “Generated x86 trap sites” table above records 16 static unimplemented-instruction sites. It does not count divide-error checks or `int3` traps, which also call `x86_trap`. During a future gated startup run, capture complete logs from `x86_trap` and `x86_checked_trap`, record each guest PC/reason, and match PCs against the 16-site table. A matching PC proves reachability. No match is meaningful only after a defined milestone is reached with complete logs. Both handlers stop execution, so each process can identify only its first fatal trap; do not skip blocked instructions to continue startup.
 
-**Next milestone: NO-GO for restricted Xbox runtime startup.** First audit and convert XBE image copies and remaining startup pointer escapes, then establish instruction reachability and access-fault coverage. This checkpoint does not attempt game boot. Simulator execution, device compilation, physical-device execution, and game boot remain separate claims; only the first two were exercised here.
+**Phase 2C-3 recommendation (historical): NO-GO for restricted Xbox runtime startup.** The Phase 2C-4 results below supersede that checkpoint. Simulator execution, device compilation, physical-device execution, and game boot remain separate claims.
+
+## Phase 2C-4: checked XBE preparation and instruction census
+
+Verified 2026-11-05 on branch `feature/ios-port`, starting from `606881c15cc6c8d12ff9fea6add68783deeb6eda`. Generated XBE data, generated recompiler C++, logs, and the local game image stayed under ignored `.local/ios-port/`; no game asset or generated game source was added to tracked files.
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `CHECKED_XBE_LOADER` | **PASS** | Synthetic XBE and local Black Edition XBE prepared by checked writes; entry, header, preloaded bytes, zero tails, and reference counts verified; no guest code executed. |
+| `XBE_FAILURE_HANDLING` | **PASS** | Malformed XBE cases rejected; injected preparation and section-load write failures rolled back reservations/newly committed pages without damaging a shared-host-page neighbor. |
+| `STARTUP_POINTER_AUDIT` | **PASS (inventory)** | Sequence and earliest remaining raw pointer paths documented below. Inventory completion does not mean those remaining paths are safe. |
+| `CHECKED_GAME_INSTRUCTION_CENSUS` | **PASS (static)** | Actual checked recompiler output analyzed; 129 generated translation units passed C++ syntax-only compilation. No game code ran. |
+| macOS ARM64 | **PASS** | Production memory and XBE loader CTests passed in Debug and Release; actual XBE CLI preparation passed. |
+| iOS Simulator ARM64 | **PASS** | iPhone 18 Pro simulator ran production memory, generated fixture, fault, and synthetic loader tests through `memory tests: finished`. |
+| iPhoneOS ARM64 | **PASS (compile/link)** | Unsigned test app linked as Mach-O ARM64 with code signing disabled. Not installed or run on a physical device. |
+| Android | **PASS (build)** | Java 21.0.13 and NDK 28.2.13676358 `:app:assembleDebug` passed. No Android runtime execution. |
+
+### Checked XBE loader results
+
+The ignored local image `.local/ios-port/default.xbe` was 4,739,072 bytes, title ID `4541007B`, entry `0x002B3916`, and SHA-1 `f636a16af04171089f879a4bed646e185c734233`. The checked loader accepted all 15 sections, including 12 preloaded sections, prepared the actual guest image, verified the committed entry address, then released the reservation. The header matched the file apart from loader-updated section reference counts. Each preloaded section's raw data, virtual zero tail, and reference count matched expected state.
+
+The parser rejects a truncated header, out-of-bounds section table, truncated section, overflowing raw offset, image or section address overflow, overlapping virtual sections, unterminated kernel thunk table, and overflowing TLS range. Identity and entry mismatches fail before reservation. An injected third checked-write failure occurs after header and section bytes/zero-fill have been written; rollback leaves no image reservation or committed pages. A second synthetic section shares a 16 KB host page with a preloaded neighbor. After decommitting its guest page, injected data-write and reference-count-write failures verify that section bytes are cleared, only the new page is decommitted, the reference count stays zero, and the neighboring preloaded page remains intact. The valid load/reload/unload reference-count sequence also passes. These checks ran in the macOS harness and simulator; the real Black Edition XBE was parsed and prepared only in the macOS harness.
+
+`xbe::PrepareImage` is separate from `Boot()`: it checks expected SHA-1 and entry, reserves guest space, writes the header and preloaded sections through `mem::Write`, zero-fills virtual tails with `mem::Fill`, writes reference counts through checked scalar access, and releases the reservation after a failed write. `Parse` now bounds section/header/file/image/TLS/certificate metadata, checks the preloaded executable entry, and requires a terminated kernel thunk table in file-backed bytes. The existing Apple `Boot()` null-base guard remains unchanged.
+
+### Startup pointer-escape ledger
+
+This sequence is the path that would be reached if the Apple `Boot()` guard were removed. It was inspected statically; the real `Boot()` sequence did not run.
+
+| Earliest stage | Code and access | Current status |
+| --- | --- | --- |
+| Apple host entry | `kernel::Boot()` calls `mem::Init()`, then sees `mem::Base() == nullptr`, logs, shuts memory down, and returns before parsing the XBE. | **Guarded.** No later row is currently reachable on Apple through `Boot()`. |
+| XBE preparation | `xbe::Image::Parse` and `xbe::PrepareImage`; checked writes/fill only. | **Checked and tested** in isolation against synthetic and actual XBE. No guest instruction or kernel initialization. |
+| Loaded callback | `app::kGame.loaded()` runs after image preparation and before kernel initialization. The target game descriptor sets `.loaded = nullptr`. | **No callback for this title.** |
+| Kernel data initialization | `InitKernelData` initializes kernel data with checked `W8/W16/W32`; `PutAnsi` writes descriptor and NUL-terminated string together with one `mem::Write` and returns failure. The detached clock updater uses checked `W32` stores. | **Checked access, not runtime-tested.** Other scalar helper faults abort through the current fault policy rather than returning a status. |
+| Dispatch and thunk patching | `dispatch::Init` builds host-side mapping tables. The import loop reads and patches the parser-validated, terminated kernel thunk table using checked `R32/W32`. | **No direct pointer escape.** Invalid guest access still stops via the checked fault handler. |
+| File-system setup | `MountDefaults` maps host directories and creates the configured directories. It does not access guest memory. | **Host filesystem side effects only.** No game file was opened by this audit. |
+| Previous launch data | If `launch.bin` exists, `boot.cpp` allocates a page then calls `ifstream::read(HostPtr(page), 0x1000)` before removing the file. Allocation and read completion are not checked before the file is removed. | **Raw guest pointer. Earliest remaining boot-time escape after `MountDefaults`.** Must use checked copy-in and preserve the file on failed import before any guard change. |
+| Persisted display | When the launch-data path is taken and `display.bin` metadata is valid, `LoadPersistedDisplay` reads up to 8 MiB directly into `HostPtr(block + 0x40)`. A failed pixel read returns without releasing `block`. | **Raw guest pointer and failure-path allocation leak.** Needs bounded host-buffer read, checked guest write, and cleanup before startup. |
+| Guest thread allocation | `CreateThread` allocates stack/TLS/KPCR/ETHREAD and calls `InitializeThreadGuestMemory`; Apple failure paths release partial allocations. | **Checked setup and rollback.** Not invoked by Phase 2C-4. |
+| Guest execution boundary | `StartThread` registers/spawns the host thread, initializes context, then enters generated code through `CallGuest`. | **Prohibited in this phase.** Checked-mode execution still stops at unsupported instructions. |
+| First game entry sequence | Static generated function for `0x002B3916` has supported MOV/MOV/SUB/ADD instructions, then `cmp eax, [ecx]` is rejected at `0x002B3928`, before the first conditional branch. Subsequent linear instructions include PUSH, LEA, AND, and CALL rejections. | **Static blocker only.** No runtime reachability claim. |
+| Guest kernel exports | `XeLoadSection`/`XeUnloadSection` validate section-header addresses against the parsed table, serialize multi-call changes against guest page changes, and use checked fill/write/reference-count operations with rollback of newly committed pages on load failure. Other object, critical-section, string, and context exports still use `G<T>()` or `HostPtr()`. | **Section helpers compiled and tested through the loader API, not executed as kernel exports.** Remaining exports are unsafe on Darwin. |
+| Guest I/O and device work | `files.cpp` and `xnet.cpp` pass guest buffers to host file/socket APIs; `gpu`, D3D, texture/vertex, and sound paths use raw pointers; asynchronous paths can retain them. | **Unconverted.** Earliest use is after guest code invokes these exports; lifetime and copy direction need per-call review. |
+
+`sdk/runtime/kernel/rtl.cpp` also retains raw string copy/conversion and interlocked paths. `sdk/runtime/kernel/xboxkrnl.cpp` has raw object, critical-section, context, and crypto paths. The Phase 2C-1 inventory above lists the graphics, audio, network, and recompiler families. Do not remove the Apple guard until all paths reachable on the selected startup route have checked semantics and rollback/lifetime tests.
+
+### Checked-game instruction census
+
+The actual local XBE was regenerated with `[xbe] checked_memory = true`; it was not executed. Recompiler log reports 28,848 functions, 1,237,217 unique guest instruction PCs, 1,369,241 generated instruction emissions across functions, 132,024 duplicate emissions, 90 overlapping decodes, and 3,705,446 generated code bytes out of 3,902,736. There were 451 jump tables and 13 callback entries. The checked output has 702,875 `x86_checked_trap` emissions at 641,426 distinct PCs and 666,366 supported emissions at 595,791 distinct PCs. The rejected-emission histogram contains 234 mnemonics. Counts are static code-generation counts, not runtime frequency.
+
+The rejected instruction operand-shape histogram is based on top-level Intel-syntax operands (memory base/index registers are part of the memory operand):
+
+| Operand shape | Emissions |
+| --- | ---: |
+| Register | 329,223 |
+| Immediate | 160,709 |
+| Memory | 75,688 |
+| Memory + register | 68,372 |
+| Immediate + register | 46,469 |
+| Immediate + memory | 11,767 |
+| Other | 4 |
+| No explicit operand | 10,623 |
+| Immediate + memory + register | 20 |
+
+Primary access category is a syntax/operation heuristic; it assigns each rejected emission once and is not a full x86 semantic decoder. In particular, stack operations include their implicit stack access, and indirect call targets are counted with stack writes.
+
+| Primary access category | Emissions |
+| --- | ---: |
+| Implicit stack write | 283,474 |
+| Implicit stack read | 70,954 |
+| No explicit memory operand | 204,354 |
+| Address-only LEA | 48,798 |
+| Explicit memory read | 67,957 |
+| Indirect-control memory read | 688 |
+| Explicit memory write | 16,966 |
+| Explicit memory read-modify-write | 4,605 |
+| Implicit REP/string | 4,406 |
+| Atomic/locked memory | 282 |
+| Prefetch hint | 339 |
+| Memory-order/cache control | 49 |
+| Implicit XLAT read | 3 |
+
+The family counts include 77,895 x87 emissions; 16,441 SIMD/MMX emissions (explicit XMM/MMX operands plus EMMS/SFENCE); and 4,406 implicit string operations, including 2,896 REP-prefixed forms (2,778 REP, 115 REPE, 3 REPNE). The 282 atomic/locked memory cases are LOCK-prefixed memory instructions plus memory XCHG, which is implicitly locked. They do not include ordinary unlocked read-modify-write instructions.
+
+All rejected emissions grouped by mnemonic:
+
+```text
+aas=1, adc=263, addps=1115, addss=631, and=10279, bound=2, bsf=4, bswap=28
+bt=1, bts=1, call=88893, cdq=1164, cld=22, cli=4, cmovb=3, cmovbe=1
+cmovl=11, cmovle=4, cmovnb=1, cmovnbe=14, cmovnl=6, cmovnle=26, cmovz=7, cmp=49168
+cmpsb=30, cmpsd=66, cmpsw=19, cmpxchg=21, comiss=70, cpuid=5, cvtpi2ps=4, cvtsi2ss=104
+cvtss2si=29, cvttss2si=316, das=1, dec=5944, div=319, divss=29, emms=114, f2xm1=9
+fabs=216, fadd=4575, faddp=1267, fchs=1066, fcmovnbe=2, fcom=1044, fcomi=2, fcomip=23
+fcomp=4575, fcompp=119, fcos=36, fdiv=679, fdivp=166, fdivr=215, fdivrp=22, fiadd=20
+fidiv=37, fidivr=2, fild=2465, fimul=28, fist=16, fistp=48, fisub=12, fisubr=7
+fld=20395, fld1=67, fldcw=15, fldl2e=6, fldlg2=5, fldln2=6, fldpi=2, fldz=51
+fmul=10055, fmulp=324, fnclex=2, fnsave=2, fnstcw=15, fnstsw=6343, fpatan=10, fprem=1
+fptan=1, frndint=14, frstor=2, fscale=18, fsin=48, fsqrt=185, fst=1550, fstp=16068
+fsub=3162, fsubp=484, fsubr=500, fsubrp=24, ftst=6, fucomip=1, fucompp=598, fwait=63
+fxam=3, fxch=1198, fxtract=1, fyl2x=19, hlt=1, idiv=552, imul=2981, in=3
+insd=1, int=2, int3=193, into=1, jmp=29306, lahf=29, lea=48798, leave=1343
+lodsb=1, maxps=26, maxss=7, minps=26, minss=5, mov=1, movaps=2931, movd=254
+movdqa=4, movdqu=2, movhlps=12, movhps=383, movlhps=42, movlps=494, movntps=16, movntq=208
+movq=329, movsb=441, movsd=1731, movss=2277, movsw=76, movups=628, mul=84, mulps=1313
+mulss=632, neg=1311, nop=686, not=262, or=6447, out=1, outsd=2, packssdw=12
+packsswb=3, packuswb=22, paddb=4, paddd=21, paddsw=350, paddusb=5, paddw=231, pand=109
+pcmpeqd=14, pcmpeqw=8, pinsrw=8, pmaddwd=25, pmaxsw=33, pminsw=33, pmovmskb=12, pmulhuw=2
+pmulhw=197, pmullw=104, pop=69603, popad=4, popfd=4, por=116, prefetchnta=279, prefetcht0=60
+pshufw=28, pslld=3, psllq=45, psllw=5, psrad=11, psraw=102, psrld=29, psrlq=70
+psrlw=4, psubd=4, psubsw=164, psubw=24, punpckhbw=12, punpckhdq=32, punpckhwd=28, punpcklbw=54
+punpckldq=34, punpcklwd=43, push=194573, pushad=4, pushfd=4, pxor=69, rcl=2, rcr=11
+rdtsc=3, rol=20, ror=5, rsqrtss=6, sahf=10, sar=2951, sbb=985, scasb=3
+setb=25, setl=53, setle=42, setnbe=2, setnl=44, setnle=43, setnz=704, sets=6
+setz=698, sfence=43, sgdt=1, shl=5691, shld=39, shr=4187, shrd=19, shufps=466
+sqrtss=9, std=17, sti=3, stosb=294, stosd=1609, stosw=133, subps=962, subss=476
+test=53765, ucomiss=28, unpckhps=118, unpcklps=162, wbinvd=6, xadd=279, xchg=19, xlat=3
+xor=21708, xorps=167
+```
+
+The original 16 static `x86_trap` sites remain in the separate table above. Do not add them to the 702,875 checked-mode rejections. To detect reachability in a future approved startup run, capture complete `x86_trap` and `x86_checked_trap` logs, match each reported guest PC against the original table, and record the startup milestone reached. Since the handlers stop the process, a single run identifies only its first fatal trap. No game boot or instruction reachability run occurred in Phase 2C-4.
+
+The checked-memory emitter remains viable for staged startup: the real entry function's first linear instructions use supported checked MOV/SUB/ADD, then first reject memory CMP at `0x002B3928`, followed by stack/control and address-generation work. Add and test that startup sequence first. Full game coverage requires broader semantics across 234 rejected mnemonics; the census alone does not justify a wholesale memory-addressing rewrite because many rejects are register/immediate/control instructions. Keep checked memory operand lowering shared, then add explicit classes for stack/control, flags, REP/string direction and partial-fault semantics, locked atomics, and 10/16-byte x87/SIMD access.
+
+**Controlled kernel initialization: NO-GO.** Earliest remaining raw startup pointers are `launch.bin` and persisted-display reads, followed by broad kernel/HLE/device paths; the actual entry also blocks on memory CMP. Do not lift the Apple `Boot()` guard or start Xbox guest threads in this phase.
+
+### Phase 2C-4 exact commands
+
+From repository root. Generated game files and real XBE paths below are local ignored development outputs.
+
+```sh
+# macOS ARM64 production memory/XBE tests, both configurations
+cmake --build .local/ios-port/memory-macos --config Debug --target mostwanted_memory_tests --parallel 8
+ctest --test-dir .local/ios-port/memory-macos -C Debug --output-on-failure
+cmake --build .local/ios-port/memory-macos --config Release --target mostwanted_memory_tests --parallel 8
+ctest --test-dir .local/ios-port/memory-macos -C Release --output-on-failure
+.local/ios-port/memory-macos/Debug/mostwanted_memory_tests "$PWD/.local/ios-port/default.xbe"
+
+# checked-mode actual game generation; no output is executed
+.local/ios-port/recompiler-fixtures-xcode/Debug/xbe_recomp \
+  .local/ios-port/checked-game.toml \
+  "$PWD/.local/ios-port/default.xbe" \
+  "$PWD/.local/ios-port/checked-recompiler-census" \
+  --xdk "$PWD/sdk/xdk" > .local/ios-port/checked-recompiler-census.log 2>&1
+
+# generated C++ syntax check, all 129 translation units
+find .local/ios-port/checked-recompiler-census -name 'x86_*.cpp' -print0 | \
+  xargs -0 -n 16 -P 8 xcrun --sdk macosx clang++ -std=c++20 -fsyntax-only -fno-strict-aliasing \
+    -fsigned-char -Wno-unused-label -Wno-unused-variable -Wno-parentheses-equality \
+    -Isdk/runtime -I.local/ios-port/checked-recompiler-census
+
+# generated fixture and fault handler, Debug and Release
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Debug \
+  --target checked_recompiler_tests checked_fault_handler_tests --parallel 8
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Debug --output-on-failure
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Release \
+  --target checked_recompiler_tests checked_fault_handler_tests --parallel 8
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Release --output-on-failure
+
+# iOS Simulator ARM64; simulator UDID is local to this Mac
+cmake --build .local/ios-port/ios-sim --config Debug --target mostwanted_memory_tests --parallel 8
+xcrun simctl install 43A6197F-AD68-48D4-84DB-6A147D89B8DC \
+  .local/ios-port/ios-sim/Debug-iphonesimulator/mostwanted_memory_tests.app
+xcrun simctl launch --console-pty --terminate-running-process \
+  43A6197F-AD68-48D4-84DB-6A147D89B8DC com.racas.mostwanted.memorytests
+
+# regenerate iPhoneOS project with the available SDL checkout, then compile/link unsigned ARM64
+cmake -S ios -B .local/ios-port/ios-device -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.2.sdk \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DMOSTWANTED_CHECKED_FIXTURE_DIR="$PWD/.local/ios-port/recompiler-fixtures-xcode/fixture/generated" \
+  -DFETCHCONTENT_SOURCE_DIR_SDL3="$PWD/.local/ios-port/ios-sim/_deps/sdl3-src"
+cmake --build .local/ios-port/ios-device --config Debug --target mostwanted_memory_tests --parallel 8 -- CODE_SIGNING_ALLOWED=NO
+
+# Android Java 21 / NDK 28.2.13676358
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+PATH=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin:$PATH \
+bash ./gradlew --no-daemon :app:assembleDebug
+```
+
+### Resolved errors and nonfatal diagnostics
+
+- Before the alias-copy fix, optimized macOS CTest printed `FAIL: multi-chunk overlapping copy across physical aliases preserves source order and prefix`; an `-O3` probe reproduced repeated source bytes. Volatile overlap-ordered alias access fixed it; Debug and Release now pass.
+- The first iPhoneOS build without `CODE_SIGNING_ALLOWED=NO` failed with `Signing for "mostwanted_memory_tests" requires a development team.` The retry disabled signing as requested.
+- The first unsigned retry linked a stale generated Xcode project and failed with `Undefined symbols for architecture arm64: "_RunXbeImageLoader"`. Explicit CMake regeneration fixed the source list. Its first configure used a nonexistent `ios-device/_deps/sdl3-src`; the final configure points to the existing simulator SDL source checkout.
+- An initial Android invocation selected Java 25 and failed with `SDK location not found. Define a valid SDK location...`. The final command sets Java 21 and `ANDROID_HOME`; build passed. Android also emitted nonfatal SDK XML v4 versus reader v3 warnings.
+- The first Phase 2C-4 CTest run after expanding the synthetic XBE failed only the `truncated raw section rejected` assertion because the larger valid fixture now contained the old test's chosen eight-byte range. The malformed case now starts one byte before EOF with a two-byte section; final Debug and Release CTests pass.
+- An early fixture build failed parser validation with `entry point is not in a preloaded executable section`; the synthetic section was marked preloaded and the thunk table fixture was moved to bounded header data. Debug/Release fixture CTests now pass.
+- The simulator logged `You need UIApplicationSupportsIndirectInputEvents in your Info.plist for mouse support`; memory, loader, fixture, and fault tests still completed. No device install or game execution was attempted.
+
+The old Phase 2C-3 coverage report is retained as historical evidence. No new whole-file coverage target was pursued in this phase; semantic loader rollback, malformed-file, checked-access, and platform tests were prioritized.
