@@ -5,6 +5,7 @@ enable_testing()
 add_executable(mostwanted_memory_tests
     ../../sdk/runtime/core/log.cpp
     ../../sdk/runtime/kernel/memory.cpp
+    ../../sdk/runtime/kernel/guest_strings.cpp
     memory_tests.cpp
     memory_test_cli.cpp
 )

@@ -1,4 +1,6 @@
+#include "kernel/kernel.h"
 #include "kernel/memory.h"
+#include "kernel/thread_memory.h"
 
 #include <mach/mach.h>
 #include <sys/mman.h>
@@ -15,6 +17,10 @@
 #include <cstring>
 #include <string>
 #include <thread>
+
+namespace kernel {
+uint8_t* g_base = nullptr;
+}
 
 namespace {
 
@@ -61,6 +67,37 @@ extern "C" int RunMemoryTests() {
     Check(mem::Base() != nullptr, "legacy guest base remains available on non-Darwin platforms");
 #endif
     Check(mem::Init() && mem::IsInitialized(), "repeated initialization is idempotent");
+#ifdef __APPLE__
+    kernel::g_base = nullptr;
+#else
+    kernel::g_base = mem::Base();
+#endif
+    constexpr uint32_t helper_va = mem::kContiguousBase + 0x22000;
+    kernel::W8(helper_va, 0xA5);
+    kernel::W16(helper_va + 2, 0xBEEF);
+    kernel::W32(helper_va + 4, 0x12345678);
+    kernel::W64(helper_va + 8, 0x0123456789ABCDEFull);
+    Check(kernel::R8(helper_va) == 0xA5 && kernel::R16(helper_va + 2) == 0xBEEF &&
+              kernel::R32(helper_va + 4) == 0x12345678 && kernel::R64(helper_va + 8) == 0x0123456789ABCDEFull,
+          "kernel scalar helpers use checked guest access with no Darwin base pointer");
+    Check(std::strcmp(mem::StatusName(mem::AccessStatus::kUncommitted), "uncommitted") == 0 &&
+              std::strcmp(mem::StatusName(mem::AccessStatus::kPermissionDenied), "permission-denied") == 0,
+          "checked access status names distinguish uncommitted and denied memory");
+    constexpr uint32_t string_descriptor = 0x62000, string_pages = 0x63000, ansi_buffer = 0x63FFE,
+                       c_string = 0x64FFE;
+    Check(mem::Commit(string_descriptor, mem::kPage) && mem::Commit(string_pages, 3 * mem::kPage),
+          "guest string fixture pages commit");
+    const uint16_t ansi_length = 4;
+    const uint32_t ansi_address = ansi_buffer;
+    const char ansi_bytes[] = {'a', 'n', 's', 'i'};
+    const char c_string_bytes[] = {'a', 'b', 0, 'x', 'y', 'z'};
+    kernel::W16(string_descriptor, ansi_length);
+    kernel::W32(string_descriptor + 4, ansi_address);
+    Check(mem::Write(ansi_buffer, ansi_bytes, sizeof(ansi_bytes)) == mem::AccessStatus::kOk &&
+              mem::Write(c_string, c_string_bytes, sizeof(c_string_bytes)) == mem::AccessStatus::kOk &&
+              kernel::ReadAnsiString(string_descriptor) == "ansi" && kernel::ReadCString(c_string, 8) == "ab" &&
+              kernel::ReadCString(c_string + 3, 3) == "xyz",
+          "production counted and bounded string helpers use checked cross-page reads");
 
     const size_t host_page = size_t(sysconf(_SC_PAGESIZE));
     Check(host_page >= mem::kPage && host_page % mem::kPage == 0, "host page is a multiple of the guest page");
@@ -270,17 +307,26 @@ extern "C" int RunMemoryTests() {
     Check(ethread && mem::Read(ethread, zero_ethread.data(), zero_ethread.size()) == mem::AccessStatus::kOk &&
               std::all_of(zero_ethread.begin(), zero_ethread.end(), [](uint8_t value) { return value == 0; }),
           "ETHREAD-sized runtime allocation is zero-filled");
-    const uint32_t self_pcr = kpcr, current_thread = ethread;
-    uint32_t readback = 0;
-    Check(kpcr && mem::Write(kpcr + 0x18, &self_pcr, sizeof(self_pcr)) == mem::AccessStatus::kOk &&
-              mem::Read(kpcr + 0x18, &readback, sizeof(readback)) == mem::AccessStatus::kOk && readback == kpcr,
-          "KPCR self field initializes through checked guest access");
-    Check(kpcr && mem::Write(kpcr + 0x28, &current_thread, sizeof(current_thread)) == mem::AccessStatus::kOk &&
-              mem::Read(kpcr + 0x28, &readback, sizeof(readback)) == mem::AccessStatus::kOk && readback == ethread,
-          "KPCR current-thread field initializes through checked guest access");
-    Check(ethread && mem::Write(ethread, &page_markers[1], 1) == mem::AccessStatus::kOk &&
-              mem::Read(ethread, &guest_byte, 1) == mem::AccessStatus::kOk && guest_byte == page_markers[1],
-          "ETHREAD header initializes through checked guest access");
+    uint32_t thread_stack = mem::AllocStack(0x20000);
+    uint32_t thread_tls = thread_stack ? thread_stack - 0x100 : 0;
+    auto thread_status = kpcr && ethread && thread_stack
+                             ? kernel::InitializeThreadGuestMemory(kpcr, ethread, thread_stack, 0x10000, thread_tls, 0x44)
+                             : mem::AccessStatus::kInvalidAddress;
+    std::array<uint8_t, 0x400> kpcr_bytes{};
+    std::array<uint8_t, 0x200> ethread_bytes{};
+    Check(thread_status == mem::AccessStatus::kOk && mem::Read(kpcr, kpcr_bytes.data(), kpcr_bytes.size()) == mem::AccessStatus::kOk &&
+              mem::Read(ethread, ethread_bytes.data(), ethread_bytes.size()) == mem::AccessStatus::kOk,
+          "production thread initializer writes full KPCR and ETHREAD through checked access");
+    uint32_t kpcr_self = 0, kpcr_thread = 0, ethread_stack = 0, ethread_tls = 0, ethread_id = 0;
+    std::memcpy(&kpcr_self, kpcr_bytes.data() + 0x18, sizeof(kpcr_self));
+    std::memcpy(&kpcr_thread, kpcr_bytes.data() + 0x28, sizeof(kpcr_thread));
+    std::memcpy(&ethread_stack, ethread_bytes.data() + 0x1C, sizeof(ethread_stack));
+    std::memcpy(&ethread_tls, ethread_bytes.data() + 0x28, sizeof(ethread_tls));
+    std::memcpy(&ethread_id, ethread_bytes.data() + 0x12C, sizeof(ethread_id));
+    Check(kpcr_self == kpcr && kpcr_thread == ethread && ethread_bytes[0] == 6 && ethread_bytes[2] == 0x80 &&
+              ethread_stack == thread_stack && ethread_tls == thread_tls && ethread_id == 0x44,
+          "thread initializer preserves KPCR self and ETHREAD layout fields");
+    if (thread_stack) mem::FreeStack(thread_stack);
     if (kpcr) mem::FreeSystem(kpcr);
     if (ethread) mem::FreeSystem(ethread);
 
@@ -373,6 +419,7 @@ extern "C" int RunMemoryTests() {
           "4 GB reservation does not commit gigabytes of resident memory");
 
     mem::Shutdown();
+    kernel::g_base = nullptr;
     Check(!mem::IsInitialized(), "shutdown releases guest address space");
     mem::Shutdown();
     Check(!mem::IsInitialized(), "repeated shutdown is idempotent");

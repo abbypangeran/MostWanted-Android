@@ -800,6 +800,7 @@ KERNEL_EXPORT(255, PsCreateSystemThreadEx, 10) {
     bool suspended = a[7] & 0xFF;
     uint32_t system = a[9];
     ThreadRef t = CreateThread(stack ? stack : 0x10000, tls, system, start, context, suspended);
+    if (!t) return kNoMemory;
     if (handle_out) W32(handle_out, NewHandle(t));
     if (id_out) W32(id_out, t->id);
     StartThread(t);
@@ -854,6 +855,7 @@ KERNEL_EXPORT(104, KeGetCurrentThread, 0) { return Current()->ethread; }
 
 KERNEL_EXPORT(254, PsCreateSystemThread, 5) {
     ThreadRef t = CreateThread(0x10000, 0, 0, a[2], a[3], false);
+    if (!t) return kNoMemory;
     if (a[0]) W32(a[0], NewHandle(t));
     if (a[1]) W32(a[1], t->id);
     StartThread(t);

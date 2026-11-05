@@ -5,6 +5,7 @@
 #include <memory>
 
 #include "kernel/kernel.h"
+#include "kernel/thread_memory.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -26,31 +27,67 @@ std::atomic<uint32_t> g_next_id{0x10};
 constexpr uint32_t kKpcrSize = 0x400;
 constexpr uint32_t kEthreadSize = 0x200;
 
-void SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
+bool SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     stack_size = std::max<uint32_t>(stack_size, 0x10000);
     tls_size = (tls_size + 3) & ~3u;
     t.stack_top = mem::AllocStack(stack_size + tls_size + 0x1000);
     t.stack_size = stack_size;
+#ifdef __APPLE__
+    if (!t.stack_top) {
+        LOGE("thread: guest stack allocation failed");
+        return false;
+    }
+#endif
     t.kpcr = mem::AllocSystem(kKpcrSize, 64);
+#ifdef __APPLE__
+    if (!t.kpcr) {
+        LOGE("thread: KPCR allocation failed");
+        mem::FreeStack(t.stack_top);
+        t.stack_top = 0;
+        return false;
+    }
+#endif
     t.ethread = mem::AllocSystem(kEthreadSize, 64);
+#ifdef __APPLE__
+    if (!t.ethread) {
+        LOGE("thread: ETHREAD allocation failed");
+        mem::FreeSystem(t.kpcr);
+        mem::FreeStack(t.stack_top);
+        t.kpcr = t.stack_top = 0;
+        return false;
+    }
+#endif
     // TLS sits at the top of the stack: StackBase + tls_index * 4 must equal TlsData
     t.tls = t.stack_top - tls_size;
+#ifdef __APPLE__
+    const auto status = InitializeThreadGuestMemory(t.kpcr, t.ethread, t.stack_top, stack_size, t.tls, t.id);
+    if (status != mem::AccessStatus::kOk) {
+        LOGE("thread: guest KPCR/ETHREAD initialization failed: %s", mem::StatusName(status));
+        mem::FreeSystem(t.ethread);
+        mem::FreeSystem(t.kpcr);
+        mem::FreeStack(t.stack_top);
+        t.ethread = t.kpcr = t.stack_top = t.tls = 0;
+        return false;
+    }
+#else
     uint32_t k = t.kpcr;
-    W32(k + 0x00, 0xFFFFFFFF);                  // NtTib.ExceptionList
-    W32(k + 0x04, t.stack_top);                 // NtTib.StackBase
-    W32(k + 0x08, t.stack_top - stack_size);    // NtTib.StackLimit
-    W32(k + 0x18, k);                           // NtTib.Self
-    W32(k + 0x1C, k);                           // SelfPcr
-    W32(k + 0x20, k + 0x28);                    // Prcb
-    G<uint8_t>(k + 0x24) = 0;                   // Irql
-    W32(k + 0x28, t.ethread);                   // PrcbData.CurrentThread
+    W32(k + 0x00, 0xFFFFFFFF);
+    W32(k + 0x04, t.stack_top);
+    W32(k + 0x08, t.stack_top - stack_size);
+    W32(k + 0x18, k);
+    W32(k + 0x1C, k);
+    W32(k + 0x20, k + 0x28);
+    G<uint8_t>(k + 0x24) = 0;
+    W32(k + 0x28, t.ethread);
     uint32_t e = t.ethread;
-    G<uint8_t>(e + 0) = 6;                      // dispatcher type ThreadObject
-    G<uint8_t>(e + 2) = uint8_t(kEthreadSize / 4);  // Header.Size in dwords
-    W32(e + 0x1C, t.stack_top);                 // KTHREAD.StackBase
-    W32(e + 0x20, t.stack_top - stack_size);    // KTHREAD.StackLimit
-    W32(e + 0x28, t.tls);                       // KTHREAD.TlsData
-    W32(e + 0x12C, t.id);                       // ETHREAD.UniqueThread
+    G<uint8_t>(e + 0) = 6;
+    G<uint8_t>(e + 2) = uint8_t(kEthreadSize / 4);
+    W32(e + 0x1C, t.stack_top);
+    W32(e + 0x20, t.stack_top - stack_size);
+    W32(e + 0x28, t.tls);
+    W32(e + 0x12C, t.id);
+#endif
+    return true;
 }
 
 void InitContext(Thread& t, X86Context& ctx) {
@@ -91,7 +128,11 @@ void NameHostThread(const char* name) {
     static Fn set = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
     if (set) set(GetCurrentThread(), w);
 #else
+#ifdef __APPLE__
+    pthread_setname_np(name);
+#else
     pthread_setname_np(pthread_self(), name);
+#endif
 #endif
 }
 
@@ -142,7 +183,7 @@ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_r
                        uint32_t start_context, bool suspended) {
     auto t = std::make_shared<Thread>();
     t->id = g_next_id.fetch_add(4);
-    SetupGuestBlocks(*t, stack_size, tls_size);
+    if (!SetupGuestBlocks(*t, stack_size, tls_size)) return {};
     Bind(t, t->ethread);
     if (suspended) t->suspend = 1;
     std::lock_guard<std::mutex> lock(g_start_lock);
@@ -151,6 +192,7 @@ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_r
 }
 
 void StartThread(ThreadRef t) {
+    if (!t) return;
     Register(t);
     Spawn([t] {
         t_current = t;
@@ -186,7 +228,7 @@ void StartThread(ThreadRef t) {
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
     auto t = std::make_shared<Thread>();
     t->id = g_next_id.fetch_add(4);
-    SetupGuestBlocks(*t, 0x20000, 0x100);
+    if (!SetupGuestBlocks(*t, 0x20000, 0x100)) return;
     Bind(t, t->ethread);
     std::string n = name;
     Spawn([t, fn, n] {

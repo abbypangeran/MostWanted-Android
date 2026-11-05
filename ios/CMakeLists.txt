@@ -36,7 +36,22 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     guest-memory-prototype/guest_memory_tests.cpp
     ../sdk/runtime/core/log.cpp
     ../sdk/runtime/kernel/memory.cpp
+    ../sdk/runtime/kernel/guest_strings.cpp
 )
+set(MOSTWANTED_CHECKED_FIXTURE_DIR "" CACHE PATH "Generated checked-recompiler fixture directory")
+if(MOSTWANTED_CHECKED_FIXTURE_DIR)
+    foreach(FIXTURE_FILE x86_recomp.0.cpp x86_recomp_shared.h)
+        if(NOT EXISTS "${MOSTWANTED_CHECKED_FIXTURE_DIR}/${FIXTURE_FILE}")
+            message(FATAL_ERROR "Missing checked-recompiler fixture file: ${MOSTWANTED_CHECKED_FIXTURE_DIR}/${FIXTURE_FILE}")
+        endif()
+    endforeach()
+    target_sources(mostwanted_memory_tests PRIVATE
+        recompiler-fixtures/fixture_runner.cpp
+        "${MOSTWANTED_CHECKED_FIXTURE_DIR}/x86_recomp.0.cpp"
+    )
+    target_include_directories(mostwanted_memory_tests PRIVATE "${MOSTWANTED_CHECKED_FIXTURE_DIR}")
+    target_compile_definitions(mostwanted_memory_tests PRIVATE MOSTWANTED_CHECKED_RECOMPILER_FIXTURE=1)
+endif()
 target_compile_features(mostwanted_memory_tests PRIVATE cxx_std_20)
 target_include_directories(mostwanted_memory_tests PRIVATE ../sdk/runtime guest-memory-prototype)
 target_link_libraries(mostwanted_memory_tests PRIVATE SDL3::SDL3-static Threads::Threads)

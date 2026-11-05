@@ -352,3 +352,108 @@ These 16 unimplemented guest instructions were found in ignored generated files 
 ## Phase 2A next milestone (historical)
 
 Design and implement comprehensive guest-access mediation or an equivalent safe 4 KB-on-16 KB memory model, then add tests for actual guest permissions and boot-thread allocations. Only after that gate, introduce Xbox runtime startup and use the existing `x86_trap` log to detect reachable trap sites. Keep simulator execution, physical-device execution, and game boot as separate acceptance checks.
+
+## Phase 2C-3 checked recompiler checkpoint
+
+Verified on 2026-11-05 from branch `feature/ios-port`, starting HEAD `8841aa36558d807da6a1e0d816987e5af334ef46`. This checkpoint uses a synthetic XBE generated locally by the fixture builder; no game executable, assets, or generated game C++ were added to tracked source.
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `RECOMPILER_CHECKED_FIXTURE` | **PASS (scoped whitelist)** | Real `xbe_recomp` output compiled and ran against production `mem::` APIs: MOV/MOVZX/MOVSX, 64-bit MMX MOVQ, memory ADD/SUB/INC, success/fault paths, and correct flags. |
+| `CPU_FAULT_PROPAGATION` | **PASS (diagnostic stop)** | Generated uncommitted read, denied write, and blocked opcode reached production logging and `SIGABRT` in isolated child processes. Not Xbox exception delivery. |
+| x87/SIMD | **BLOCKED** | 10-byte FLD and 16-byte MOVUPS are rejected by checked mode; no x87/SIMD guest instruction executes. |
+| Atomics | **BLOCKED** | Implicit memory XCHG, locked XADD, and other atomic shapes are rejected; alignment and guest concurrency semantics are not established. |
+| REP/string | **BLOCKED** | REP MOVSD is rejected; DF, overlap, multi-page partial progress, and fault boundaries are not established. |
+| `HOST_STARTUP_ACCESS` | **PARTIAL** | Apple scalar kernel helpers, KPCR/ETHREAD setup, bounded/counting strings, and selected Rtl bulk helpers are checked and tested. XBE copies and raw pointer callers remain. |
+| macOS ARM64 | **PASS** | `mostwanted_memory_tests`: CTest `1/1`; coverage report below. |
+| iOS Simulator ARM64 | **PASS** | App launched on iPhone 18 Pro simulator; production memory tests, generated fixture, and fault outcomes printed PASS through `memory tests: finished`. |
+| iOS device ARM64 compile/link | **PASS** | Unsigned iPhoneOS app linked as Mach-O ARM64. No physical-device install or execution. |
+| Android regression | **PASS (build)** | Java 21 / NDK 28.2.13676358 `:app:assembleDebug` passed; generated Ninja source list includes the new runtime files. No Android runtime execution. |
+
+### Checked fixture and fault semantics
+
+Checked mode is opt-in with `[xbe] checked_memory = true`; it defaults off. It supports scalar MOV, MOVZX/MOVSX, MMX MOVQ, memory ADD/SUB/INC, conditional branches, and RET. Unsupported operand forms and locked instructions use `x86_checked_trap`, which avoids the existing guest-stack scan. Faults carry guest PC, address, read/write direction, and `AccessStatus`; `mem::Read`/`Write` validate the full span before touching guest data. The production handler logs and aborts to stop guest execution deterministically. It does not synthesize Xbox exception records or recover the guest thread.
+
+The fixture verifies 4 KB guest-page boundaries on a 16 KB Darwin host, unaligned scalar spans, signed and unsigned extension, 64-bit MMX transfers, overflow, uncommitted/no-access/read-only pages, faulting PCs, no partial cross-page stores, and RMW results/flags. The generated fault handler test separately exercises uncommitted reads, permission-denied writes, and blocked instructions through the production handler. Unlocked RMW read/write is not one atomic transaction.
+
+### Host helpers and remaining raw paths
+
+Apple-only checked helpers now cover R8/R16/R32/R64 and W8/W16/W32/W64, complete KPCR/ETHREAD initialization with rollback, counted ANSI and bounded C strings with full descriptor-span validation, and RtlZeroMemory/RtlFillMemory/RtlMoveMemory. RtlFillMemoryUlong validates the whole dword span before writing; RtlCompareMemory rejects cursor overflow. The ULONG fill does not pin across per-word writes, so concurrent decommit can still cause partial progress. Darwin thread naming uses the Apple pthread API. Android/Windows/Linux retain direct scalar, thread initialization, and string paths. Android's existing recompiler output remains the default because checked emission defaults off.
+
+Still unconverted: `kernel::G<T>()`, `HostPtr()`, XBE header/section copies in `boot.cpp`, `XeLoadSection` host copies, other RTL string copy/conversion and interlocked exports, `X86_MEM*`/`X86_PTR` paths outside the checked subset, file/network buffers, GPU/texture/vertex/render buffers, audio buffers, and pointers retained by asynchronous operations. Relevant code remains in `sdk/runtime/kernel/{boot,files,objects,rtl,xboxkrnl}.cpp`, `sdk/runtime/gpu`, `sdk/runtime/xdk`, `src/d3d`, and `src/sound`. Apple `Boot()` still rejects a null base before these paths. The complete access inventory and architecture decision remain above.
+
+### Platform and coverage evidence
+
+The Darwin test binary now covers the production memory implementation plus `guest_strings.cpp`: `memory.cpp` 75.19% lines, 70.38% regions, 85.71% functions, and 55.92% branches; `guest_strings.cpp` 100% lines and functions, 74.07% regions, and 61.11% branches. Combined branch coverage is 56.14%. Active checked read/write, access status, 4 KB page, string, allocation, and fault branches are exercised. The generated child-process tests also exercise production memory-fault logging, denied writes, checked helper overflow, and unsupported-instruction stops, but are not included in this coverage binary. Remaining gaps include rollback failure injection, rare host mapping errors, and non-Apple platform branches. The 80% branch target remains unmet.
+
+Release fixture benchmark on this Mac ARM64 host: empty generated call 1.1 ns; generated checked scalar load+store 32.0 ns; measured delta 30.9 ns per call, about 62.57 million checked scalar operations/s. Checked `mem::Copy` measured 60.43 GiB/s; a local-buffer `memcpy` proxy measured 79.27 GiB/s and is not direct guest memory. Measurements are microbenchmarks, not a device performance claim.
+
+Nonfatal diagnostics observed: Zydis CMake minimum-version deprecation and missing optional Doxygen; SDL configure could not find optional PkgConfig/LibUSB; simulator logged `You need UIApplicationSupportsIndirectInputEvents in your Info.plist for mouse support`; Android tooling warned that SDK XML version 4 exceeds its version-3 reader. These did not fail the builds or tests.
+
+Intermediate failures were fixed before this checkpoint. The first generated fixture CTest reported failures for memory SUB/INC flags because checked RET did not save local flags; checked RET now emits `X86_SAVE_FLAGS()`. The first standalone macOS Xcode build reported `Undefined symbols for architecture arm64: "kernel::ReadCString(unsigned int, unsigned long)"` and `ReadAnsiString`; explicitly regenerating the Xcode project included the newly added `guest_strings.cpp` and resolved the link failure. The first macOS syntax check reported `no matching function for call to 'pthread_setname_np'`; Darwin now uses its one-argument form, and macOS/iPhoneOS syntax checks pass. An earlier unchecked raw-output probe exited 139 when it dereferenced the intentionally null Apple base, confirming that unchecked generated memory must remain blocked.
+
+### Exact commands
+
+From repository root:
+
+```sh
+cmake -S ios/recompiler-fixtures -B .local/ios-port/recompiler-fixtures-xcode -G Xcode
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Debug --target checked_recompiler_tests checked_fault_handler_tests -- -quiet
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Debug --output-on-failure
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Release --target checked_recompiler_tests checked_fault_handler_tests -- -quiet
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Release -V
+
+cmake -S ios/memory-tests -B .local/ios-port/memory-macos -G Xcode
+cmake --build .local/ios-port/memory-macos --config Debug --target mostwanted_memory_tests -- -quiet
+ctest --test-dir .local/ios-port/memory-macos -C Debug --output-on-failure
+
+cmake -S ios -B .local/ios-port/ios-sim -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.2.sdk \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DMOSTWANTED_CHECKED_FIXTURE_DIR="$PWD/.local/ios-port/recompiler-fixtures-xcode/fixture/generated" \
+  -DFETCHCONTENT_SOURCE_DIR_SDL3="$PWD/.local/ios-port/ios-sim/_deps/sdl3-src"
+cmake --build .local/ios-port/ios-sim --config Debug --target mostwanted_memory_tests -- -quiet
+xcrun simctl install 43A6197F-AD68-48D4-84DB-6A147D89B8DC .local/ios-port/ios-sim/Debug-iphonesimulator/mostwanted_memory_tests.app
+xcrun simctl launch --console-pty --terminate-running-process 43A6197F-AD68-48D4-84DB-6A147D89B8DC com.racas.mostwanted.memorytests
+
+cmake -S ios -B .local/ios-port/ios-device -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.2.sdk \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DMOSTWANTED_CHECKED_FIXTURE_DIR="$PWD/.local/ios-port/recompiler-fixtures-xcode/fixture/generated" \
+  -DFETCHCONTENT_SOURCE_DIR_SDL3="$PWD/.local/ios-port/ios-sim/_deps/sdl3-src"
+cmake --build .local/ios-port/ios-device --config Debug --target mostwanted_memory_tests -- -quiet CODE_SIGNING_ALLOWED=NO
+
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+bash ./gradlew --no-daemon :app:assembleDebug
+```
+
+Coverage commands:
+
+```sh
+cmake -S ios/memory-tests -B .local/ios-port/memory-coverage -G Xcode \
+  -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
+cmake --build .local/ios-port/memory-coverage --config Debug --target mostwanted_memory_tests -- -quiet
+LLVM_PROFILE_FILE=.local/ios-port/memory-coverage/phase2c3-%p.profraw \
+  .local/ios-port/memory-coverage/Debug/mostwanted_memory_tests
+xcrun llvm-profdata merge -sparse .local/ios-port/memory-coverage/phase2c3-*.profraw \
+  -o .local/ios-port/memory-coverage/phase2c3.profdata
+xcrun llvm-cov report .local/ios-port/memory-coverage/Debug/mostwanted_memory_tests \
+  -instr-profile=.local/ios-port/memory-coverage/phase2c3.profdata \
+  sdk/runtime/kernel/memory.cpp sdk/runtime/kernel/guest_strings.cpp
+```
+
+Apple thread-source syntax checks:
+
+```sh
+xcrun --sdk macosx clang++ -std=c++20 -fsyntax-only -Isdk/runtime -Isdk/harness/compat -Inative/compat sdk/runtime/kernel/threads.cpp
+xcrun --sdk iphoneos clang++ -target arm64-apple-ios15.0 -std=c++20 -fsyntax-only -Isdk/runtime -Isdk/harness/compat -Inative/compat sdk/runtime/kernel/threads.cpp
+```
+
+### Generated trap reachability
+
+The existing “Generated x86 trap sites” table above records 16 static unimplemented-instruction sites. It does not count divide-error checks or `int3` traps, which also call `x86_trap`. During a future gated startup run, capture complete logs from `x86_trap` and `x86_checked_trap`, record each guest PC/reason, and match PCs against the 16-site table. A matching PC proves reachability. No match is meaningful only after a defined milestone is reached with complete logs. Both handlers stop execution, so each process can identify only its first fatal trap; do not skip blocked instructions to continue startup.
+
+**Next milestone: NO-GO for restricted Xbox runtime startup.** First audit and convert XBE image copies and remaining startup pointer escapes, then establish instruction reachability and access-fault coverage. This checkpoint does not attempt game boot. Simulator execution, device compilation, physical-device execution, and game boot remain separate claims; only the first two were exercised here.

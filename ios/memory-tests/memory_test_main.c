@@ -4,6 +4,9 @@
 
 extern int RunMemoryTests(void);
 extern int RunGuestMemoryPrototypeTests(void);
+#ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
+extern int RunCheckedRecompilerFixtureTests(void);
+#endif
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     (void)appstate;
@@ -15,6 +18,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     }
     int failures = RunMemoryTests();
     failures += RunGuestMemoryPrototypeTests();
+#ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
+    failures += RunCheckedRecompilerFixtureTests();
+#endif
     return failures ? SDL_APP_FAILURE : SDL_APP_SUCCESS;
 }
 
