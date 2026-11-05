@@ -63,7 +63,7 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
                     if (x->set && !x->ret) targets.insert(x->to);
     }
     body_.clear();
-    if (body.empty()) Line(F("\tx86_trap(ctx, 0x%X, \"function was not decoded\");", entry));
+    if (body.empty()) Line(F("\t%s(ctx, 0x%X, \"function was not decoded\");", an_.cfg.checked_memory ? "x86_checked_trap" : "x86_trap", entry));
     for (size_t i = 0; i < body.size(); i++) {
         uint32_t va = body[i];
         if ((targets.count(va) && va != entry) || (va == entry && body.front() != entry)) {
@@ -75,7 +75,7 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
         ZydisDecodedInstruction in;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
         if (!info || info->flow == Flow::Invalid || !an_.Decode(va, in, ops)) {
-            Line(F("\tx86_trap(ctx, 0x%X, \"undecodable instruction\");", va));
+            Line(F("\t%s(ctx, 0x%X, \"undecodable instruction\");", an_.cfg.checked_memory ? "x86_checked_trap" : "x86_trap", va));
             pending_.valid = false;
             continue;
         }
@@ -90,7 +90,7 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
             if (an_.InsnAt(next) || an_.functions.count(next))
                 Line("\t" + Target(next));
             else
-                Line(F("\tx86_trap(ctx, 0x%X, \"fell off decoded code\");", next));
+                Line(F("\t%s(ctx, 0x%X, \"fell off decoded code\");", an_.cfg.checked_memory ? "x86_checked_trap" : "x86_trap", next));
         }
     }
     // a function that registers an SEH frame (mov fs:[0], ...) may be where a C++ catch resumes: the CRT's jump to
@@ -106,14 +106,18 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
     }
     std::string out;
     out += F("X86_FUNC(__imp__%s) {\n", FuncName(entry).c_str());
-    if (seh) out += "\tconst uint32_t x86_frame = ctx.esp;\n\ttry {\n";
+    bool checked = an_.cfg.checked_memory;
+    if (seh) out += "\tconst uint32_t x86_frame = ctx.esp;\n";
+    if (seh || checked) out += "\ttry {\n";
     out += "\tX86_LOAD_FLAGS();\n\tuint32_t ca = 0, cb = 0;\n\t(void)ca; (void)cb;\n";
     // code below the entry (a shared tail reached by a jump) is emitted first, so enter by label
     bool entry_first = !body.empty() && body.front() == entry;
     if (!entry_first) out += F("\tgoto loc_%08X;\n", entry);
     if (labels_.count(entry) && entry_first) out += F("loc_%08X:;\n", entry);
     out += body_;
-    if (seh) out += "\t} catch (const X86Resume& r) {\n\t\tif (r.esp >= x86_frame) throw;\n\t\tx86_resume(ctx, base, r);\n\t}\n";
+    if (checked) out += "\t} catch (const X86MemoryFault& fault) {\n\t\tx86_memory_fault(ctx, fault);\n";
+    if (seh) out += "\t} catch (const X86Resume& r) {\n\t\tif (r.esp >= x86_frame) throw;\n\t\tx86_resume(ctx, base, r);\n";
+    if (seh || checked) out += "\t}\n";
     out += "}\n";
     if (an_.cfg.trace.count(entry))
         out += F("X86_TRACED_FUNC(%s, __imp__%s, 0x%XU)\n\n", FuncName(entry).c_str(), FuncName(entry).c_str(), entry);
@@ -278,7 +282,8 @@ bool CodeGen::Run() {
     for (uint32_t c : an_.continuations) map += F("\t0x%Xu,\n", c);
     map += "\t0,\n};\n";
     for (uint32_t f : absent) {
-        map += F("\nX86_FUNC(__imp__%s) { x86_trap(ctx, 0x%Xu, \"not in this image\"); }\n", FuncName(f).c_str(), f);
+        map += F("\nX86_FUNC(__imp__%s) { %s(ctx, 0x%Xu, \"not in this image\"); }\n", FuncName(f).c_str(),
+                 an_.cfg.checked_memory ? "x86_checked_trap" : "x86_trap", f);
         map += F("X86_WEAK_FUNC(%s, __imp__%s)\n", FuncName(f).c_str(), FuncName(f).c_str());
     }
     WriteIfChanged(out_ / "x86_func_mapping.cpp", map);

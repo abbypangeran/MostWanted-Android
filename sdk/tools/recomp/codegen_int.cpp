@@ -57,7 +57,7 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
     int mi;
     bool mem = FindMem(in, ops, mi);
     std::string ea = mem ? "ea" : "";
-    std::string open = mem ? "\t{ uint32_t ea = " + AddrExpr(ops[mi]) + "; " : "\t{ ";
+    std::string open = mem ? "\t{ uint32_t ea = " + AddrExpr(ops[mi], an_.cfg.checked_memory) + "; " : "\t{ ";
     bool lock = (in.attributes & ZYDIS_ATTRIB_HAS_LOCK) && mem && mi == 0;
     unsigned W = ops[0].size == 8 || ops[0].size == 16 ? ops[0].size : 32;
     std::string T = CType(W), S = CType(W, true);

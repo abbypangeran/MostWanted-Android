@@ -276,6 +276,18 @@ AccessStatus CheckAccess(uint32_t va, std::size_t size, uint8_t permissions) {
     return CheckAccessLocked(va, size, permissions);
 }
 
+const char* StatusName(AccessStatus status) {
+    switch (status) {
+        case AccessStatus::kOk: return "ok";
+        case AccessStatus::kNotInitialized: return "not-initialized";
+        case AccessStatus::kInvalidAddress: return "invalid-address";
+        case AccessStatus::kUncommitted: return "uncommitted";
+        case AccessStatus::kPermissionDenied: return "permission-denied";
+        case AccessStatus::kHostError: return "host-error";
+    }
+    return "unknown";
+}
+
 AccessStatus Protect(uint32_t va, uint32_t size, uint8_t permissions) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (permissions & ~(kRead | kWrite | kExecute)) return AccessStatus::kPermissionDenied;

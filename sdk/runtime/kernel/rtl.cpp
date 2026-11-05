@@ -98,35 +98,64 @@ std::string Digits(uint32_t v, uint32_t base) {
 
 // DbgPrint(format, ...): cdecl, the caller pops; the format goes to the log as it is, without its arguments
 KERNEL_EXPORT(8, DbgPrint, 0) {
-    std::string s;
-    for (uint32_t p = a[0]; p && s.size() < 256; p++) {
-        char c = *static_cast<const char*>(HostPtr(p));
-        if (!c) break;
-        if (c != '\n' && c != '\r') s += c;
-    }
+    std::string s = ReadCString(a[0], 256);
+    s.erase(std::remove_if(s.begin(), s.end(), [](char c) { return c == '\n' || c == '\r'; }), s.end());
     LOG_FIRST(64, "DbgPrint: %s", s.c_str());
     return 0;
 }
 
 KERNEL_EXPORT(320, RtlZeroMemory, 2) {
+#ifdef __APPLE__
+    const auto status = mem::Fill(a[0], 0, a[1]);
+    if (status != mem::AccessStatus::kOk) GuestMemoryAccessFailure("write", a[0], status);
+#else
     std::memset(HostPtr(a[0]), 0, a[1]);
+#endif
     return 0;
 }
 KERNEL_EXPORT(284, RtlFillMemory, 3) {
+#ifdef __APPLE__
+    const auto status = mem::Fill(a[0], uint8_t(a[2]), a[1]);
+    if (status != mem::AccessStatus::kOk) GuestMemoryAccessFailure("write", a[0], status);
+#else
     std::memset(HostPtr(a[0]), int(a[2] & 0xFF), a[1]);
+#endif
     return 0;
 }
 KERNEL_EXPORT(285, RtlFillMemoryUlong, 3) {
+#ifdef __APPLE__
+    const uint32_t size = a[1] & ~3u;
+    const auto status = mem::CheckAccess(a[0], size, mem::kWrite);
+    if (status != mem::AccessStatus::kOk) GuestMemoryAccessFailure("write", a[0], status);
+    // shortcut: per-word writes can partially progress after concurrent decommit; add a pinned pattern write before concurrent runtime use.
+    for (uint64_t offset = 0; offset < size; offset += 4) W32(uint32_t(uint64_t(a[0]) + offset), a[2]);
+#else
     for (uint32_t o = 0; o + 4 <= a[1]; o += 4) W32(a[0] + o, a[2]);
+#endif
     return 0;
 }
 KERNEL_EXPORT(298, RtlMoveMemory, 3) {
+#ifdef __APPLE__
+    const auto status = mem::Move(a[0], a[1], a[2]);
+    if (status != mem::AccessStatus::kOk) GuestMemoryAccessFailure("move", a[0], status);
+#else
     std::memmove(HostPtr(a[0]), HostPtr(a[1]), a[2]);
+#endif
     return 0;
 }
 KERNEL_EXPORT(268, RtlCompareMemory, 3) {
     uint32_t n = 0;
-    while (n < a[2] && G<uint8_t>(a[0] + n) == G<uint8_t>(a[1] + n)) n++;
+#ifdef __APPLE__
+    while (n < a[2]) {
+        const uint64_t left = uint64_t(a[0]) + n, right = uint64_t(a[1]) + n;
+        if (left > UINT32_MAX) GuestMemoryAccessFailure("read", UINT32_MAX, mem::AccessStatus::kInvalidAddress);
+        if (right > UINT32_MAX) GuestMemoryAccessFailure("read", UINT32_MAX, mem::AccessStatus::kInvalidAddress);
+        if (R8(uint32_t(left)) != R8(uint32_t(right))) break;
+        ++n;
+    }
+#else
+    while (n < a[2] && R8(a[0] + n) == R8(a[1] + n)) n++;
+#endif
     return n;
 }
 

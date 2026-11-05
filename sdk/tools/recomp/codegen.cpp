@@ -113,7 +113,9 @@ std::string CodeGen::Mem(unsigned bits, const std::string& ea) const {
 std::string CodeGen::Read(const ZydisDecodedOperand& o, const std::string& ea) const {
     switch (o.type) {
         case ZYDIS_OPERAND_TYPE_REGISTER: return RegRead(o.reg.value);
-        case ZYDIS_OPERAND_TYPE_MEMORY: return Mem(o.size, ea);
+        case ZYDIS_OPERAND_TYPE_MEMORY:
+            return an_.cfg.checked_memory ? Fmt("x86_mem_read<%s>(0x%Xu, %s)", CType(o.size).c_str(), instruction_pc_, ea.c_str())
+                                          : Mem(o.size, ea);
         case ZYDIS_OPERAND_TYPE_IMMEDIATE: {
             uint64_t v = o.imm.value.u;
             return Hex(uint32_t(v));
@@ -124,7 +126,12 @@ std::string CodeGen::Read(const ZydisDecodedOperand& o, const std::string& ea) c
 
 std::string CodeGen::Write(const ZydisDecodedOperand& o, const std::string& ea, const std::string& v) const {
     if (o.type == ZYDIS_OPERAND_TYPE_REGISTER) return RegWrite(o.reg.value, v);
-    if (o.type == ZYDIS_OPERAND_TYPE_MEMORY) return Mem(o.size, ea) + " = (" + CType(o.size) + ")(" + v + ");";
+    if (o.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (an_.cfg.checked_memory)
+            return Fmt("x86_mem_write<%s>(0x%Xu, %s, (%s)(%s));", CType(o.size).c_str(), instruction_pc_, ea.c_str(),
+                       CType(o.size).c_str(), v.c_str());
+        return Mem(o.size, ea) + " = (" + CType(o.size) + ")(" + v + ");";
+    }
     return "/* bad write */";
 }
 
@@ -146,7 +153,8 @@ void CodeGen::Unimpl(uint32_t va, const ZydisDecodedInstruction& in, const Zydis
     unimpl_[ZydisMnemonicGetString(in.mnemonic)]++;
     std::string esc;
     for (char c : t) esc += c == '"' ? '\'' : c;
-    Line(Fmt("\tx86_trap(ctx, 0x%X, \"unimplemented: %s\");", va, esc.c_str()));
+    Line(Fmt("\t%s(ctx, 0x%X, \"unimplemented: %s\");", an_.cfg.checked_memory ? "x86_checked_trap" : "x86_trap", va,
+             esc.c_str()));
 }
 
 std::string CodeGen::Target(uint32_t t) {
@@ -225,9 +233,57 @@ std::string CodeGen::Cond(ZydisMnemonic m) {
 
 void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const ZydisDecodedOperand* ops, uint32_t next_body) {
     insn_count_++;
+    instruction_pc_ = va;
     bool keep_pending = false;
     auto m = in.mnemonic;
     uint32_t next = va + in.length;
+
+    if (an_.cfg.checked_memory) {
+        auto is_scalar_register = [](const ZydisDecodedOperand& op) {
+            return op.type == ZYDIS_OPERAND_TYPE_REGISTER && Reg32Name(op.reg.value) != nullptr;
+        };
+        auto is_scalar_memory = [](const ZydisDecodedOperand& op) {
+            return op.type == ZYDIS_OPERAND_TYPE_MEMORY && (op.size == 8 || op.size == 16 || op.size == 32);
+        };
+        auto is_qword_memory = [](const ZydisDecodedOperand& op) {
+            return op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.size == 64;
+        };
+        auto is_mmx = [](const ZydisDecodedOperand& op) {
+            return op.type == ZYDIS_OPERAND_TYPE_REGISTER && op.reg.value >= ZYDIS_REGISTER_MM0 &&
+                   op.reg.value <= ZYDIS_REGISTER_MM7;
+        };
+        auto is_scalar_source = [&](const ZydisDecodedOperand& op) {
+            return is_scalar_register(op) || is_scalar_memory(op) || op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+        };
+        auto is_binary_rmw = [&] {
+            if (in.operand_count_visible != 2 || (ops[0].size != 8 && ops[0].size != 16 && ops[0].size != 32)) return false;
+            if (!is_scalar_register(ops[0]) && !is_scalar_memory(ops[0])) return false;
+            return is_scalar_memory(ops[0]) ? !is_scalar_memory(ops[1]) && is_scalar_source(ops[1]) : is_scalar_source(ops[1]);
+        };
+        bool checked_mov = m == ZYDIS_MNEMONIC_MOV && in.operand_count_visible == 2 &&
+                           (is_scalar_register(ops[0]) || is_scalar_memory(ops[0])) && is_scalar_source(ops[1]) &&
+                           !(is_scalar_memory(ops[0]) && is_scalar_memory(ops[1]));
+        bool checked_extend = (m == ZYDIS_MNEMONIC_MOVZX || m == ZYDIS_MNEMONIC_MOVSX) &&
+                              in.operand_count_visible == 2 && is_scalar_register(ops[0]) &&
+                              (is_scalar_register(ops[1]) || is_scalar_memory(ops[1])) &&
+                              (ops[1].size == 8 || ops[1].size == 16) && ops[0].size > ops[1].size;
+        bool checked_movq = m == ZYDIS_MNEMONIC_MOVQ && in.operand_count_visible == 2 &&
+                            ((is_qword_memory(ops[0]) && is_mmx(ops[1])) ||
+                             (is_mmx(ops[0]) && is_qword_memory(ops[1])));
+        bool checked_rmw = ((m == ZYDIS_MNEMONIC_ADD || m == ZYDIS_MNEMONIC_SUB) && is_binary_rmw()) ||
+                           (m == ZYDIS_MNEMONIC_INC && in.operand_count_visible == 1 &&
+                            (is_scalar_register(ops[0]) || is_scalar_memory(ops[0])));
+        bool checked_branch = in.meta.category == ZYDIS_CATEGORY_COND_BR && in.operand_count_visible == 1 &&
+                              ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+        bool checked_ret = m == ZYDIS_MNEMONIC_RET && in.operand_count_visible <= 1 &&
+                           (!in.operand_count_visible || ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE);
+        bool locked = in.attributes & ZYDIS_ATTRIB_HAS_LOCK;
+        if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_branch || checked_ret) || locked) {
+            Unimpl(va, in, ops);
+            pending_.valid = false;
+            return;
+        }
+    }
 
     // control flow first
     switch (m) {
@@ -289,6 +345,7 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         }
         case ZYDIS_MNEMONIC_RET: {
             uint32_t n = in.operand_count_visible && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE ? uint32_t(ops[0].imm.value.u) : 0;
+            if (an_.cfg.checked_memory) Line("\tX86_SAVE_FLAGS();");
             Line(Fmt("\tctx.esp += %u; return;", 4 + n));
             pending_.valid = false;
             return;

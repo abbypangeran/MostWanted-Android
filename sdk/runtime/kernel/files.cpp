@@ -171,25 +171,6 @@ void Complete(uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
 
 }  // namespace
 
-std::string ReadAnsiString(uint32_t str) {
-    if (!str) return {};
-    uint16_t len = R16(str);
-    uint32_t buf = R32(str + 4);
-    if (!buf) return {};
-    return std::string(reinterpret_cast<const char*>(HostPtr(buf)), len);
-}
-
-std::string ReadCString(uint32_t va, size_t max) {
-    std::string s;
-    if (!va) return s;
-    for (size_t i = 0; i < max; i++) {
-        char c = char(G<uint8_t>(va + uint32_t(i)));
-        if (!c) break;
-        s += c;
-    }
-    return s;
-}
-
 void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
     std::lock_guard<std::mutex> lock(g_links_lock);
     fs::path d = data_dir;

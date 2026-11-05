@@ -382,7 +382,8 @@ bool CodeGen::EmitMmx(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
     int d = MmIndex(ops[0]);
     int s = in.operand_count_visible > 1 ? MmIndex(ops[1]) : -1;
     if (d < 0 && s < 0 && m != ZYDIS_MNEMONIC_MOVD && m != ZYDIS_MNEMONIC_MOVQ) return false;
-    std::string src = s >= 0 ? F("ctx.mm[%d]", s) : mi >= 0 ? "X86_MEM64(ea)" : "0ull";
+    std::string src = s >= 0 ? F("ctx.mm[%d]", s)
+                             : mi >= 0 ? (an_.cfg.checked_memory ? Read(ops[mi], "ea") : "X86_MEM64(ea)") : "0ull";
     if (in.operand_count_visible > 1 && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) src = F("%lluull", (unsigned long long)ops[1].imm.value.u);
     std::string D = d >= 0 ? F("ctx.mm[%d]", d) : "";
 
@@ -440,6 +441,7 @@ bool CodeGen::EmitMmx(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
     switch (m) {
         case ZYDIS_MNEMONIC_MOVQ:
             if (d >= 0) emit(F("%s = %s;", D.c_str(), src.c_str()));
+            else if (an_.cfg.checked_memory) emit(Write(ops[0], "ea", F("ctx.mm[%d]", s)));
             else emit(F("X86_MEM64(ea) = ctx.mm[%d];", s));
             return true;
         case ZYDIS_MNEMONIC_MOVNTQ:

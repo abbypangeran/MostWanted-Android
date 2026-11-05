@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -55,28 +56,94 @@ enum : uint32_t {
 
 extern uint8_t* g_base;
 
+#ifdef __APPLE__
+[[noreturn]] inline void GuestMemoryAccessFailure(const char* operation, uint32_t va, mem::AccessStatus status) {
+    LOGE("kernel guest %s at %08X failed: %s", operation, va, mem::StatusName(status));
+    logx::Flush();
+    std::abort();
+}
+
+template <typename T>
+inline T ReadGuestScalar(uint32_t va) {
+    T value{};
+    const auto status = mem::Read(va, &value, sizeof(value));
+    if (status != mem::AccessStatus::kOk) GuestMemoryAccessFailure("read", va, status);
+    return value;
+}
+
+template <typename T>
+inline void WriteGuestScalar(uint32_t va, T value) {
+    const auto status = mem::Write(va, &value, sizeof(value));
+    if (status != mem::AccessStatus::kOk) GuestMemoryAccessFailure("write", va, status);
+}
+#endif
+
 template <typename T>
 inline T& G(uint32_t va) {
     return *reinterpret_cast<T*>(g_base + va);
 }
 inline uint32_t R32(uint32_t va) {
+#ifdef __APPLE__
+    return ReadGuestScalar<uint32_t>(va);
+#else
     uint32_t v;
     std::memcpy(&v, g_base + va, 4);
     return v;
+#endif
 }
-inline void W32(uint32_t va, uint32_t v) { std::memcpy(g_base + va, &v, 4); }
+inline void W32(uint32_t va, uint32_t v) {
+#ifdef __APPLE__
+    WriteGuestScalar(va, v);
+#else
+    std::memcpy(g_base + va, &v, 4);
+#endif
+}
+inline uint8_t R8(uint32_t va) {
+#ifdef __APPLE__
+    return ReadGuestScalar<uint8_t>(va);
+#else
+    return G<uint8_t>(va);
+#endif
+}
+inline void W8(uint32_t va, uint8_t v) {
+#ifdef __APPLE__
+    WriteGuestScalar(va, v);
+#else
+    G<uint8_t>(va) = v;
+#endif
+}
 inline uint16_t R16(uint32_t va) {
+#ifdef __APPLE__
+    return ReadGuestScalar<uint16_t>(va);
+#else
     uint16_t v;
     std::memcpy(&v, g_base + va, 2);
     return v;
+#endif
 }
-inline void W16(uint32_t va, uint16_t v) { std::memcpy(g_base + va, &v, 2); }
+inline void W16(uint32_t va, uint16_t v) {
+#ifdef __APPLE__
+    WriteGuestScalar(va, v);
+#else
+    std::memcpy(g_base + va, &v, 2);
+#endif
+}
 inline uint64_t R64(uint32_t va) {
+#ifdef __APPLE__
+    return ReadGuestScalar<uint64_t>(va);
+#else
     uint64_t v;
     std::memcpy(&v, g_base + va, 8);
     return v;
+#endif
 }
-inline void W64(uint32_t va, uint64_t v) { std::memcpy(g_base + va, &v, 8); }
+inline void W64(uint32_t va, uint64_t v) {
+#ifdef __APPLE__
+    WriteGuestScalar(va, v);
+#else
+    std::memcpy(g_base + va, &v, 8);
+#endif
+}
 inline void* HostPtr(uint32_t va) { return g_base + va; }
 
 // ANSI_STRING / OBJECT_STRING: USHORT Length, USHORT MaximumLength, PCHAR Buffer

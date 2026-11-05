@@ -28,6 +28,7 @@ uint8_t* Base();
 
 enum Permission : uint8_t { kNoAccess = 0, kRead = 1, kWrite = 2, kExecute = 4, kReadWrite = kRead | kWrite };
 enum class AccessStatus : uint8_t { kOk, kNotInitialized, kInvalidAddress, kUncommitted, kPermissionDenied, kHostError };
+const char* StatusName(AccessStatus status);
 AccessStatus CheckAccess(uint32_t va, std::size_t size, uint8_t permissions);
 AccessStatus Protect(uint32_t va, uint32_t size, uint8_t permissions);
 AccessStatus Read(uint32_t va, void* destination, std::size_t size);

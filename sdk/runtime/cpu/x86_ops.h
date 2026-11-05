@@ -5,6 +5,7 @@
 #include <limits>
 #include <type_traits>
 
+#include "kernel/memory.h"
 #include "x86_context.h"
 
 typedef uint16_t __attribute__((aligned(1), may_alias)) x86_u16u;
@@ -56,10 +57,35 @@ struct X86Resume {
 void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r);
 void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal);
 [[noreturn]] void x86_trap(X86Context& ctx, uint32_t va, const char* what);
+struct X86MemoryFault {
+    uint32_t instruction, address;
+    mem::AccessStatus status;
+    bool write;
+};
+[[noreturn]] void x86_memory_fault(X86Context& ctx, const X86MemoryFault& fault);
+[[noreturn]] void x86_checked_trap(X86Context& ctx, uint32_t va, const char* what);
 void x86_priv(X86Context& ctx, uint32_t va, const char* what);
 uint32_t x86_trace(X86Context& ctx, uint32_t va, uint32_t ret);  // ret 0 on entry, returns the return address
 uint64_t x86_rdtsc();
 void x86_cpuid(X86Context& ctx);
+
+template <class T>
+T x86_mem_read(uint32_t instruction, uint32_t address) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    T value{};
+    const auto status = mem::Read(address, &value, sizeof(value));
+    if (status != mem::AccessStatus::kOk)
+        throw X86MemoryFault{instruction, address, status, false};
+    return value;
+}
+
+template <class T>
+void x86_mem_write(uint32_t instruction, uint32_t address, T value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    const auto status = mem::Write(address, &value, sizeof(value));
+    if (status != mem::AccessStatus::kOk)
+        throw X86MemoryFault{instruction, address, status, true};
+}
 
 inline void x87_push(X86Context& ctx, double v) {
     ctx.top = (ctx.top - 1) & 7;
