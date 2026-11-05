@@ -18,6 +18,9 @@
 #include <unistd.h>
 #endif
 #include "xbe/xbe.h"
+#include "xbe/image_loader.h"
+
+extern const char kImageSha1[];
 
 namespace dispatch {
 void Init();
@@ -97,7 +100,6 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
         LOGE("boot: %s: %s", xbe_name.c_str(), err.c_str());
         return false;
     }
-    g_image = &g_xbe;
     const xbe::Image& img = g_xbe;
     if (img.entry != X86EntryPoint) {
         LOGE("boot: %s entry %08X does not match the recompiled entry %08X, wrong executable", xbe_name.c_str(), img.entry,
@@ -107,22 +109,21 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     LOGI("boot: title %08X, entry %08X, %zu sections", img.title_id, img.entry, img.sections.size());
     for (auto& l : img.libraries) LOGI("boot: library %-8s %u.%u.%u", l.name.c_str(), l.major, l.minor, l.build);
 
-    if (!mem::ReserveImage(img.base, img.image_size)) {
-        LOGE("boot: could not reserve the XBE image at %08X+%X", img.base, img.image_size);
+    if (!xbe::PrepareImage(img, X86EntryPoint, kImageSha1, err)) {
+        LOGE("boot: %s: %s", xbe_name.c_str(), err.c_str());
         return false;
     }
-    std::memcpy(g_base + img.base, img.file.data(), std::min<size_t>(img.header_size, img.file.size()));
-    // XBE header 0x120 points at the section headers, 56 bytes each, +0x18 is the reference count that marks one loaded
-    uint32_t sec_hdr = img.U32(0x120);
-    for (size_t i = 0; i < img.sections.size(); i++) {
-        auto& s = img.sections[i];
-        if (!(s.flags & xbe::kPreload)) continue;
-        std::memcpy(g_base + s.va, img.file.data() + s.raw, std::min(s.rsize, s.vsize));
-        W32(sec_hdr + uint32_t(i) * 56 + 0x18, 1);
-    }
+    g_image = &g_xbe;
     if (app::kGame.loaded) app::kGame.loaded();
 
-    InitKernelData();
+    if (!InitKernelData()) {
+        LOGE("boot: kernel data initialization failed");
+        g_image = nullptr;
+        uint32_t image_base = img.base, image_size = 0;
+        if (mem::FreeVirtual(image_base, image_size, mem::kMemRelease) != 0)
+            LOGE("boot: could not roll back the prepared XBE image");
+        return false;
+    }
     dispatch::Init();
 
     uint32_t missing = 0;

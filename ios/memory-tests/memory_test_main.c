@@ -3,6 +3,7 @@
 #include <SDL3/SDL_main.h>
 
 extern int RunMemoryTests(void);
+extern int RunXbeImageLoaderTests(const char *real_xbe_path);
 extern int RunGuestMemoryPrototypeTests(void);
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
 extern int RunCheckedRecompilerFixtureTests(void);
@@ -21,6 +22,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
     failures += RunCheckedRecompilerFixtureTests();
 #endif
+    failures += RunXbeImageLoaderTests(NULL);
     return failures ? SDL_APP_FAILURE : SDL_APP_SUCCESS;
 }
 

@@ -60,9 +60,9 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
     Put32(image, 0x11C, 1);
     Put32(image, 0x120, kBase + kSectionTable);
     Put32(image, 0x128, kEntry ^ xbe::kRetailEntryKey);
-    Put32(image, 0x158, kEntry ^ xbe::kRetailThunkKey);
+    Put32(image, 0x158, (kBase + 0x280) ^ xbe::kRetailThunkKey);
 
-    Put32(image, kSectionTable + 0, xbe::kExecutable);
+    Put32(image, kSectionTable + 0, xbe::kExecutable | xbe::kPreload);
     Put32(image, kSectionTable + 4, kEntry);
     Put32(image, kSectionTable + 8, 0x1000);
     Put32(image, kSectionTable + 12, kRawCode);

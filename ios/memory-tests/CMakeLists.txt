@@ -4,9 +4,12 @@ project(MostWantedDarwinMemoryTests LANGUAGES CXX)
 enable_testing()
 add_executable(mostwanted_memory_tests
     ../../sdk/runtime/core/log.cpp
+    ../../sdk/runtime/kernel/crypto.cpp
     ../../sdk/runtime/kernel/memory.cpp
     ../../sdk/runtime/kernel/guest_strings.cpp
+    ../../sdk/runtime/xbe/image_loader.cpp
     memory_tests.cpp
+    xbe_image_tests.cpp
     memory_test_cli.cpp
 )
 target_compile_features(mostwanted_memory_tests PRIVATE cxx_std_20)

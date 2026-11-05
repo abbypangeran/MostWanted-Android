@@ -7,6 +7,7 @@
 #include "app/app.h"
 #include "kernel/crypto.h"
 #include "kernel/exports.h"
+#include "xbe/image_loader.h"
 #include "xbe/xbe.h"
 
 // XC_LANGUAGE: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian; a game may pick its own
@@ -52,13 +53,31 @@ KERNEL_DATA(154, KeSystemTime, 12);
 KERNEL_DATA(157, KeTimeIncrement, 4);
 KERNEL_DATA(321, XboxEEPROMKey, 16);
 
-void PutAnsi(uint32_t str, const char* text) {
-    uint32_t buf = str + 8;
+const xbe::Section* ImageSection(uint32_t address) {
+    if (!g_image) return nullptr;
+    const uint32_t table = g_image->U32(0x120);
+    if (address < table) return nullptr;
+    const uint32_t offset = address - table;
+    if (offset % 56 || offset / 56 >= g_image->sections.size()) return nullptr;
+    return &g_image->sections[offset / 56];
+}
+
+bool PutAnsi(uint32_t str, const char* text) {
     size_t n = std::strlen(text);
-    std::memcpy(HostPtr(buf), text, n + 1);
-    W16(str, uint16_t(n));
-    W16(str + 2, uint16_t(n + 1));
-    W32(str + 4, buf);
+    if (n >= UINT16_MAX || str > UINT32_MAX - 8) return false;
+    std::vector<uint8_t> descriptor(9 + n, 0);
+    const uint16_t length = uint16_t(n), maximum = uint16_t(n + 1);
+    const uint32_t buffer = str + 8;
+    std::memcpy(descriptor.data(), &length, sizeof(length));
+    std::memcpy(descriptor.data() + 2, &maximum, sizeof(maximum));
+    std::memcpy(descriptor.data() + 4, &buffer, sizeof(buffer));
+    std::memcpy(descriptor.data() + 8, text, n + 1);
+    const auto status = mem::Write(str, descriptor.data(), descriptor.size());
+    if (status != mem::AccessStatus::kOk) {
+        LOGE("kernel: ANSI initialization at %08X failed: %s", str, mem::StatusName(status));
+        return false;
+    }
+    return true;
 }
 
 uint8_t& Irql() { return G<uint8_t>(Current()->kpcr + 0x24); }
@@ -83,29 +102,29 @@ uint64_t InterruptTime() {
 uint32_t g_tick_count_va = 0;
 uint32_t g_launch_data_page_va = 0;
 
-void InitKernelData() {
+bool InitKernelData() {
     g_tick_count_va = DataAddress(156);
     g_launch_data_page_va = DataAddress(164);
     W32(DataAddress(164), 0);
     uint32_t hw = DataAddress(322);
     W32(hw, 0x00000020);
-    G<uint8_t>(hw + 4) = 0xD3;  // GPU revision
-    G<uint8_t>(hw + 5) = 0xB1;  // MCP revision
+    W8(hw + 4, 0xD3);  // GPU revision
+    W8(hw + 5, 0xB1);  // MCP revision
     uint32_t ver = DataAddress(324);
     W16(ver, 1);
     W16(ver + 2, 0);
     W16(ver + 4, 5838);
     W16(ver + 6, 1);
-    PutAnsi(DataAddress(326), "\\Device\\CdRom0\\default.xbe");
-    PutAnsi(DataAddress(41), "RECOMP HARD DISK");
-    PutAnsi(DataAddress(42), "0000000000000000");
+    if (!PutAnsi(DataAddress(326), "\\Device\\CdRom0\\default.xbe") ||
+        !PutAnsi(DataAddress(41), "RECOMP HARD DISK") || !PutAnsi(DataAddress(42), "0000000000000000"))
+        return false;
     W32(DataAddress(40), 3);
     W32(DataAddress(356), 0);
     // IDE_CHANNEL_OBJECT DeviceQueue.DeviceListHead, XAPI walks it to cancel file I/O
     uint32_t queue = DataAddress(357) + 0x28;
     W32(queue, queue);
     W32(queue + 4, queue);
-    G<uint8_t>(DataAddress(89)) = 1;
+    W8(DataAddress(89), 1);
     W32(DataAddress(157), 10000);  // 1 ms in 100 ns units
     // the start of the clock
     std::thread([] {
@@ -118,6 +137,7 @@ void InitKernelData() {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }).detach();
+    return true;
 }
 
 // critical sections
@@ -428,24 +448,27 @@ KERNEL_EXPORT(181, MmQueryStatistics, 1) {
 // sec is an XBE section header, +0x18 its reference count
 KERNEL_EXPORT(327, XeLoadSection, 1) {
     uint32_t sec = a[0];
-    uint32_t refs = R32(sec + 0x18);
-    if (refs == 0) {
-        uint32_t va = R32(sec + 4), vsize = R32(sec + 8), raw = R32(sec + 12), rsize = R32(sec + 16);
-        if (!mem::Commit(va, vsize)) return 0xC0000017;  // STATUS_NO_MEMORY
-        std::memset(HostPtr(va), 0, vsize);
-        if (g_image && raw + rsize <= g_image->file.size())
-            std::memcpy(HostPtr(va), g_image->file.data() + raw, std::min(rsize, vsize));
-        LOGI("XeLoadSection %s at %08X", ReadCString(R32(sec + 0x14)).c_str(), va);
+    const xbe::Section* section = ImageSection(sec);
+    if (!section) return kInvalidParameter;
+    std::string error;
+    const xbe::SectionStatus status = xbe::LoadSection(*g_image, sec, error);
+    if (status != xbe::SectionStatus::kOk) {
+        LOGE("XeLoadSection %s failed: %s", section->name.c_str(), error.c_str());
+        return status == xbe::SectionStatus::kNoMemory ? kNoMemory : kInvalidParameter;
     }
-    W32(sec + 0x18, refs + 1);
+    LOGI("XeLoadSection %s at %08X", section->name.c_str(), section->va);
     return kSuccess;
 }
 
 KERNEL_EXPORT(328, XeUnloadSection, 1) {
     uint32_t sec = a[0];
-    uint32_t refs = R32(sec + 0x18);
-    if (!refs) return kInvalidParameter;
-    W32(sec + 0x18, refs - 1);
+    if (!ImageSection(sec)) return kInvalidParameter;
+    std::string error;
+    const xbe::SectionStatus status = xbe::UnloadSection(*g_image, sec, error);
+    if (status != xbe::SectionStatus::kOk) {
+        LOGE("XeUnloadSection failed: %s", error.c_str());
+        return kInvalidParameter;
+    }
     return kSuccess;
 }
 
