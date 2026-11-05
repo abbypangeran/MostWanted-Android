@@ -132,7 +132,8 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
 
         case ZYDIS_MNEMONIC_ADD:
             rmw(F("%s b = %s;", T.c_str(), rd(1).c_str()), "a + b",
-                F("cf = r < a; of = (uint32_t)(((a ^ r) & (b ^ r)) >> %u) & 1; %s", W - 1, Szp(W).c_str()));
+                F("cf = r < a; af = ((a ^ b ^ r) >> 4) & 1; of = (uint32_t)(((a ^ r) & (b ^ r)) >> %u) & 1; %s",
+                  W - 1, Szp(W).c_str()));
             return true;
         case ZYDIS_MNEMONIC_OR:
             rmw(F("%s b = %s;", T.c_str(), rd(1).c_str()), "a | b", "cf = 0; of = 0; " + Szp(W));
@@ -145,7 +146,8 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             return true;
         case ZYDIS_MNEMONIC_SUB:
             rmw(F("%s b = %s;", T.c_str(), rd(1).c_str()), "a - b",
-                F("cf = a < b; of = (uint32_t)(((a ^ b) & (a ^ r)) >> %u) & 1; %s", W - 1, Szp(W).c_str()));
+                F("cf = a < b; af = ((a ^ b ^ r) >> 4) & 1; of = (uint32_t)(((a ^ b) & (a ^ r)) >> %u) & 1; %s",
+                  W - 1, Szp(W).c_str()));
             return true;
         case ZYDIS_MNEMONIC_ADC:
             rmw(F("%s b = %s; uint32_t c0 = cf;", T.c_str(), rd(1).c_str()), "a + b + c0",
@@ -158,8 +160,17 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
                   Szp(W).c_str()));
             return true;
         case ZYDIS_MNEMONIC_CMP:
-            emit(F("%s a = %s, b = %s; %s r = (%s)(a - b); ca = a; cb = b; cf = a < b; of = (uint32_t)(((a ^ b) & (a ^ r)) >> %u) & 1; %s",
-                   T.c_str(), rd(0).c_str(), rd(1).c_str(), T.c_str(), T.c_str(), W - 1, Szp(W).c_str()));
+            if (an_.cfg.checked_memory && mem) Line("\tX86_SAVE_FLAGS();");
+            {
+                std::string source = Read(ops[1], ea);
+                if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[1].imm.is_signed && ops[1].size < W)
+                    source = "(" + T + ")(" + CType(ops[1].size, true) + ")(" + source + ")";
+                else
+                    source = "(" + T + ")(" + source + ")";
+                emit(F("%s a = %s, b = %s; %s r = (%s)(a - b); ca = a; cb = b; cf = a < b; "
+                       "af = ((a ^ b ^ r) >> 4) & 1; of = (uint32_t)(((a ^ b) & (a ^ r)) >> %u) & 1; %s",
+                       T.c_str(), rd(0).c_str(), source.c_str(), T.c_str(), T.c_str(), W - 1, Szp(W).c_str()));
+            }
             pending_ = {true, false, W};
             return true;
         case ZYDIS_MNEMONIC_TEST:
@@ -168,7 +179,8 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             pending_ = {true, true, W};
             return true;
         case ZYDIS_MNEMONIC_INC:
-            rmw("", "a + 1", F("of = r == (%s)(1u << %u); %s", T.c_str(), W - 1, Szp(W).c_str()));
+            rmw("", "a + 1", F("af = (a & 0xFu) == 0xFu; of = r == (%s)(1u << %u); %s", T.c_str(), W - 1,
+                                 Szp(W).c_str()));
             return true;
         case ZYDIS_MNEMONIC_DEC:
             rmw("", "a - 1", F("of = a == (%s)(1u << %u); %s", T.c_str(), W - 1, Szp(W).c_str()));

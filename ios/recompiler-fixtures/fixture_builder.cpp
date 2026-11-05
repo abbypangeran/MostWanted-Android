@@ -24,7 +24,7 @@ void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
 }
 
 bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& config_path) {
-    const std::array<uint8_t, 81> code = {
+    const std::vector<uint8_t> code = {
         0x8B, 0x03,                   // mov eax, [ebx]
         0x89, 0x07,                   // mov [edi], eax
         0x88, 0x47, 0x04,             // mov [edi+4], al
@@ -49,7 +49,21 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, // mov eax, 1; ret
         0x8B, 0x03, 0x89, 0x07, 0xC3, // mov eax, [ebx]; mov [edi], eax; ret
         0x83, 0x2F, 0x01, 0xC3,       // sub dword [edi], 1; ret
-        0xFF, 0x07, 0xC3              // inc dword [edi]; ret
+        0xFF, 0x07, 0xC3,             // inc dword [edi]; ret
+        0x39, 0xD8, 0xC3,             // cmp eax, ebx; ret
+        0x38, 0xD8, 0xC3,             // cmp al, bl; ret
+        0x66, 0x39, 0xD8, 0xC3,       // cmp ax, bx; ret
+        0x3D, 0x00, 0x00, 0x00, 0x80, 0xC3, // cmp eax, 0x80000000; ret
+        0x83, 0xF8, 0xFF, 0xC3,       // cmp eax, sign-extended -1; ret
+        0x39, 0x06, 0xC3,             // cmp dword [esi], eax; ret
+        0x3B, 0x06, 0xC3,             // cmp eax, dword [esi]; ret
+        0x38, 0x06, 0xC3,             // cmp al, byte [esi]; ret
+        0x66, 0x39, 0x06, 0xC3,       // cmp ax, word [esi]; ret
+        0x39, 0x44, 0xB3, 0xFC, 0xC3, // cmp dword [ebx+esi*4-4], eax; ret
+        0x83, 0x3E, 0xFF, 0xC3,       // cmp dword [esi], sign-extended -1; ret
+        0x3B, 0x06, 0x73, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3,
+        0x3B, 0x06, 0x7A, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3,
+        0x3B, 0x06, 0x7C, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3
     };
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
@@ -113,7 +127,49 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "end = 0x1104E\n\n"
               "[[function]]\n"
               "at = 0x1104E\n"
-              "end = 0x11051\n";
+              "end = 0x11051\n\n"
+              "[[function]]\n"
+              "at = 0x11051\n"
+              "end = 0x11054\n\n"
+              "[[function]]\n"
+              "at = 0x11054\n"
+              "end = 0x11057\n\n"
+              "[[function]]\n"
+              "at = 0x11057\n"
+              "end = 0x1105B\n\n"
+              "[[function]]\n"
+              "at = 0x1105B\n"
+              "end = 0x11061\n\n"
+              "[[function]]\n"
+              "at = 0x11061\n"
+              "end = 0x11065\n\n"
+              "[[function]]\n"
+              "at = 0x11065\n"
+              "end = 0x11068\n\n"
+              "[[function]]\n"
+              "at = 0x11068\n"
+              "end = 0x1106B\n\n"
+              "[[function]]\n"
+              "at = 0x1106B\n"
+              "end = 0x1106E\n\n"
+              "[[function]]\n"
+              "at = 0x1106E\n"
+              "end = 0x11072\n\n"
+              "[[function]]\n"
+              "at = 0x11072\n"
+              "end = 0x11077\n\n"
+              "[[function]]\n"
+              "at = 0x11077\n"
+              "end = 0x1107B\n\n"
+              "[[function]]\n"
+              "at = 0x1107B\n"
+              "end = 0x1108B\n\n"
+              "[[function]]\n"
+              "at = 0x1108B\n"
+              "end = 0x1109B\n\n"
+              "[[function]]\n"
+              "at = 0x1109B\n"
+              "end = 0x110AB\n";
     return bool(config);
 }
 

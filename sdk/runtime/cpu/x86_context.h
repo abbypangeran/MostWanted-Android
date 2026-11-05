@@ -10,7 +10,7 @@ union X86Xmm {
 
 struct alignas(64) X86Context {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
-    uint32_t cf, zf, sf, of, pf;  // only live across tail calls, functions keep flags in locals
+    uint32_t cf, zf, sf, of, pf, af;  // only live across tail calls, functions keep flags in locals
     uint32_t df;
     uint32_t xflags;  // AC and ID, kept so feature probes see them toggle
     uint32_t fs_base;

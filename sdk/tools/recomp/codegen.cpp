@@ -273,12 +273,14 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         bool checked_rmw = ((m == ZYDIS_MNEMONIC_ADD || m == ZYDIS_MNEMONIC_SUB) && is_binary_rmw()) ||
                            (m == ZYDIS_MNEMONIC_INC && in.operand_count_visible == 1 &&
                             (is_scalar_register(ops[0]) || is_scalar_memory(ops[0])));
+        bool checked_cmp = m == ZYDIS_MNEMONIC_CMP && is_binary_rmw();
         bool checked_branch = in.meta.category == ZYDIS_CATEGORY_COND_BR && in.operand_count_visible == 1 &&
                               ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
         bool checked_ret = m == ZYDIS_MNEMONIC_RET && in.operand_count_visible <= 1 &&
                            (!in.operand_count_visible || ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE);
         bool locked = in.attributes & ZYDIS_ATTRIB_HAS_LOCK;
-        if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_branch || checked_ret) || locked) {
+        if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_cmp || checked_branch || checked_ret) ||
+            locked) {
             Unimpl(va, in, ops);
             pending_.valid = false;
             return;

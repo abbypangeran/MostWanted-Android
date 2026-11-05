@@ -41,8 +41,8 @@ typedef double __attribute__((aligned(1), may_alias)) x86_f64u;
         X86_MEM32(ctx.esp) = _v; \
     } while (0)
 
-#define X86_SAVE_FLAGS() (ctx.cf = cf, ctx.zf = zf, ctx.sf = sf, ctx.of = of, ctx.pf = pf)
-#define X86_LOAD_FLAGS() uint32_t cf = ctx.cf, zf = ctx.zf, sf = ctx.sf, of = ctx.of, pf = ctx.pf
+#define X86_SAVE_FLAGS() (ctx.cf = cf, ctx.zf = zf, ctx.sf = sf, ctx.of = of, ctx.pf = pf, ctx.af = af)
+#define X86_LOAD_FLAGS() uint32_t cf = ctx.cf, zf = ctx.zf, sf = ctx.sf, of = ctx.of, pf = ctx.pf, af = ctx.af
 #define X86_BARRIER() __asm__ volatile("" ::: "memory")
 #define X86_PARITY(r) ((uint32_t)(__builtin_parity((uint32_t)(r)&0xFF) ^ 1))
 

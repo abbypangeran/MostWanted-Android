@@ -40,6 +40,7 @@ namespace {
 
 enum class Scenario {
     kReadFault,
+    kCmpReadFault,
     kWriteFault,
     kStringDescriptorOverflow,
     kUlongFillOverflow,
@@ -66,6 +67,10 @@ bool AbortsWithDiagnostic(Scenario scenario, const char* expected) {
         } else if (scenario == Scenario::kReadFault) {
             ctx.ebx = 0x24000;
             sub_00011000(ctx, nullptr);
+        } else if (scenario == Scenario::kCmpReadFault) {
+            ctx.eax = 0xDEADBEEF;
+            ctx.esi = 0x24000;
+            sub_00011068(ctx, nullptr);
         } else if (scenario == Scenario::kWriteFault) {
             if (!mem::Commit(0x20000, mem::kPage) || !mem::Commit(0x30000, mem::kPage) ||
                 mem::Protect(0x30000, mem::kPage, mem::kNoAccess) != mem::AccessStatus::kOk)
@@ -122,6 +127,8 @@ bool RtlSuccessPaths() {
 int main() {
     bool read_fault = AbortsWithDiagnostic(Scenario::kReadFault,
                                            "checked guest read fault at 00011000 for 00024000: uncommitted");
+    bool cmp_read_fault = AbortsWithDiagnostic(Scenario::kCmpReadFault,
+                                               "checked guest read fault at 00011068 for 00024000: uncommitted");
     bool write_fault = AbortsWithDiagnostic(Scenario::kWriteFault,
                                             "checked guest write fault at 00011002 for 00030000: permission-denied");
     bool descriptor_overflow = AbortsWithDiagnostic(Scenario::kStringDescriptorOverflow,
@@ -134,6 +141,8 @@ int main() {
                                                     "checked recompiler blocked instruction at 0001102D");
     bool rtl_success = RtlSuccessPaths();
     std::printf("%s: generated uncommitted read reaches production logger and abort handler\n", read_fault ? "PASS" : "FAIL");
+    std::printf("%s: generated CMP read fault reports its PC and guest address before aborting\n",
+                cmp_read_fault ? "PASS" : "FAIL");
     std::printf("%s: generated denied write logs direction, PC, status, and aborts\n", write_fault ? "PASS" : "FAIL");
     std::printf("%s: counted string descriptor overflow is rejected without address wrap\n",
                 descriptor_overflow ? "PASS" : "FAIL");
@@ -142,8 +151,8 @@ int main() {
     std::printf("%s: generated blocked instruction reaches production handler without stack scan\n",
                 blocked_instruction ? "PASS" : "FAIL");
     std::printf("%s: checked RTL fill and compare success paths preserve guest data\n", rtl_success ? "PASS" : "FAIL");
-    return read_fault && write_fault && descriptor_overflow && fill_overflow && compare_overflow && blocked_instruction &&
-                   rtl_success
+    return read_fault && cmp_read_fault && write_fault && descriptor_overflow && fill_overflow && compare_overflow &&
+                   blocked_instruction && rtl_success
                ? 0
                : 1;
 }

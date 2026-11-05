@@ -188,7 +188,7 @@ void CodeGen::EmitHooks(uint32_t va, bool after) {
             return (x.to <= va ? std::string("X86_BARRIER(); ") : std::string()) + Target(x.to);
         };
         Line("\tX86_SAVE_FLAGS();");
-        std::string reload = "cf = ctx.cf; zf = ctx.zf; sf = ctx.sf; of = ctx.of; pf = ctx.pf;";
+        std::string reload = "cf = ctx.cf; zf = ctx.zf; sf = ctx.sf; of = ctx.of; pf = ctx.pf; af = ctx.af;";
         if (!h.Returns()) {
             Line(F("\t%s(ctx, base); %s", h.call.c_str(), reload.c_str()));
         } else {

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <bit>
 #include <exception>
 #include <string>
 
@@ -102,6 +103,235 @@ bool ThrowsTrap(X86Func* function, X86Context& ctx) {
         return traps == 1;
     }
     return false;
+}
+
+struct SubFlags {
+    uint32_t cf, pf, af, zf, sf, of;
+};
+
+uint64_t WidthMask(unsigned width) { return width == 32 ? UINT32_MAX : (uint64_t(1) << width) - 1; }
+
+int64_t SignedValue(uint32_t value, unsigned width) {
+    const uint64_t mask = WidthMask(width), sign = uint64_t(1) << (width - 1);
+    value &= uint32_t(mask);
+    return value & sign ? int64_t(value) - int64_t(uint64_t(1) << width) : value;
+}
+
+SubFlags ReferenceSubFlags(unsigned width, uint32_t left, uint32_t right) {
+    const uint64_t mask = WidthMask(width);
+    const uint64_t a = left & mask, b = right & mask, result = (a - b) & mask;
+    const int64_t difference = SignedValue(uint32_t(a), width) - SignedValue(uint32_t(b), width);
+    const int64_t minimum = -(int64_t(1) << (width - 1));
+    const int64_t maximum = (int64_t(1) << (width - 1)) - 1;
+    return {uint32_t(a < b), uint32_t(std::popcount(uint8_t(result)) % 2 == 0), uint32_t((a & 0xF) < (b & 0xF)),
+            uint32_t(result == 0), uint32_t((result >> (width - 1)) & 1), uint32_t(difference < minimum || difference > maximum)};
+}
+
+bool Runs(X86Func* function, X86Context& ctx) {
+    try {
+        function(ctx, nullptr);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool MatchesFlags(const X86Context& ctx, const SubFlags& expected) {
+    return ctx.cf == expected.cf && ctx.pf == expected.pf && ctx.af == expected.af && ctx.zf == expected.zf &&
+           ctx.sf == expected.sf && ctx.of == expected.of;
+}
+
+bool SeedCmpFlags(X86Context& ctx) {
+    ctx.cf = 1;
+    ctx.pf = 0;
+    ctx.af = 1;
+    ctx.zf = 0;
+    ctx.sf = 1;
+    ctx.of = 0;
+    return true;
+}
+
+void CheckCmpTests(uint32_t destination) {
+    struct Case {
+        X86Func* function;
+        unsigned width;
+        uint32_t left, right;
+        const char* name;
+    };
+    const Case cases[] = {
+        {sub_00011054, 8, 0x80, 1, "8-bit negative CMP flags match independent subtraction reference"},
+        {sub_00011054, 8, 0x7F, 0xFF, "8-bit signed overflow and parity flags match reference"},
+        {sub_00011054, 8, 0, 1, "8-bit carry and half-carry flags match reference"},
+        {sub_00011054, 8, 0x55, 0x55, "8-bit zero and parity flags match reference"},
+        {sub_00011057, 16, 0x8000, 1, "16-bit negative CMP flags match independent subtraction reference"},
+        {sub_00011057, 16, 0x7FFF, 0xFFFF, "16-bit signed overflow flags match reference"},
+        {sub_00011057, 16, 0x10, 1, "16-bit half-carry flags match reference"},
+        {sub_00011051, 32, 0x80000000, 1, "32-bit negative CMP flags match independent subtraction reference"},
+        {sub_00011051, 32, 0x7FFFFFFF, 0xFFFFFFFF, "32-bit signed overflow flags match reference"},
+        {sub_00011051, 32, 0, 1, "32-bit carry and half-carry flags match reference"},
+        {sub_00011051, 32, 0x101, 1, "32-bit parity uses low result byte"},
+        {sub_00011051, 32, 9, 9, "32-bit zero comparison flags match reference"},
+    };
+    for (const Case& test : cases) {
+        X86Context ctx{};
+        ctx.eax = test.width == 32 ? test.left : test.left | 0xA5A50000;
+        ctx.ebx = test.width == 32 ? test.right : test.right | 0x5A5A0000;
+        const uint32_t eax_before = ctx.eax, ebx_before = ctx.ebx;
+        SeedCmpFlags(ctx);
+        const SubFlags expected = ReferenceSubFlags(test.width, test.left, test.right);
+        Check(Runs(test.function, ctx) && ctx.eax == eax_before && ctx.ebx == ebx_before && MatchesFlags(ctx, expected), test.name);
+    }
+
+    X86Context ctx{};
+    ctx.eax = 0x7FFFFFFF;
+    const SubFlags immediate32 = ReferenceSubFlags(32, ctx.eax, 0x80000000);
+    SeedCmpFlags(ctx);
+    Check(Runs(sub_0001105B, ctx) && ctx.eax == 0x7FFFFFFF && MatchesFlags(ctx, immediate32),
+          "32-bit immediate CMP uses destination operand width");
+    ctx = X86Context{};
+    ctx.eax = UINT32_MAX;
+    const SubFlags signed_imm8 = ReferenceSubFlags(32, ctx.eax, UINT32_MAX);
+    Check(Runs(sub_00011061, ctx) && ctx.eax == UINT32_MAX && MatchesFlags(ctx, signed_imm8),
+          "sign-extended imm8 CMP compares against -1 at 32-bit width");
+
+    constexpr uint32_t unaligned = 0x30001;
+    uint32_t memory_value = 0x44332280;
+    Check(mem::Write(unaligned, &memory_value, sizeof(memory_value)) == mem::AccessStatus::kOk,
+          "CMP unaligned memory fixture initializes");
+    ctx = X86Context{};
+    ctx.eax = 0x4433227F;
+    ctx.esi = unaligned;
+    const SubFlags memory_flags = ReferenceSubFlags(32, ctx.eax, memory_value);
+    Check(Runs(sub_00011068, ctx) && ctx.eax == 0x4433227F && MatchesFlags(ctx, memory_flags),
+          "CMP register-memory uses checked unaligned dword read and exact arithmetic flags");
+
+    const uint32_t memory_dest = destination + 0x100;
+    memory_value = 0xABCDEF01;
+    Check(mem::Write(memory_dest, &memory_value, sizeof(memory_value)) == mem::AccessStatus::kOk,
+          "CMP memory destination fixture initializes");
+    ctx = X86Context{};
+    ctx.eax = memory_value - 1;
+    ctx.esi = memory_dest;
+    const SubFlags destination_flags = ReferenceSubFlags(32, memory_value, ctx.eax);
+    uint32_t register_left = ctx.eax;
+    Check(Runs(sub_00011065, ctx) && ctx.eax == register_left &&
+              mem::Read(memory_dest, &memory_value, sizeof(memory_value)) == mem::AccessStatus::kOk &&
+              memory_value == 0xABCDEF01 && MatchesFlags(ctx, destination_flags),
+          "CMP memory-register performs read-only operand access without destination write");
+
+    uint8_t byte_value = 0x7F;
+    Check(mem::Write(unaligned, &byte_value, sizeof(byte_value)) == mem::AccessStatus::kOk,
+          "byte CMP fixture initializes");
+    ctx = X86Context{};
+    ctx.eax = 0xA5A50080;
+    ctx.esi = unaligned;
+    Check(Runs(sub_0001106B, ctx) && ctx.eax == 0xA5A50080 && MatchesFlags(ctx, ReferenceSubFlags(8, 0x7F, 0x80)),
+          "CMP byte memory operand uses 8-bit flags and preserves upper register bits");
+
+    uint16_t word_value = 0x8001;
+    Check(mem::Write(unaligned, &word_value, sizeof(word_value)) == mem::AccessStatus::kOk,
+          "word CMP fixture initializes");
+    ctx = X86Context{};
+    ctx.eax = 0x12348000;
+    ctx.esi = unaligned;
+    Check(Runs(sub_0001106E, ctx) && ctx.eax == 0x12348000 && MatchesFlags(ctx, ReferenceSubFlags(16, 0x8001, 0x8000)),
+          "CMP word memory operand uses 16-bit flags and preserves upper register bits");
+
+    const uint32_t scaled = 0x30204;
+    memory_value = 0x11223344;
+    Check(mem::Write(scaled, &memory_value, sizeof(memory_value)) == mem::AccessStatus::kOk,
+          "scaled CMP address fixture initializes");
+    ctx = X86Context{};
+    ctx.ebx = 0x30200;
+    ctx.esi = 2;
+    ctx.eax = memory_value + 1;
+    Check(Runs(sub_00011072, ctx) && MatchesFlags(ctx, ReferenceSubFlags(32, memory_value, memory_value + 1)),
+          "CMP SIB address applies scale, base, and signed displacement");
+
+    memory_value = UINT32_MAX;
+    Check(mem::Write(unaligned, &memory_value, sizeof(memory_value)) == mem::AccessStatus::kOk,
+          "memory-immediate CMP fixture initializes");
+    ctx = X86Context{};
+    ctx.esi = unaligned;
+    Check(Runs(sub_00011077, ctx) && MatchesFlags(ctx, ReferenceSubFlags(32, UINT32_MAX, UINT32_MAX)),
+          "memory CMP sign-extends imm8 without writing operand");
+
+    memory_value = 3;
+    Check(mem::Write(unaligned, &memory_value, sizeof(memory_value)) == mem::AccessStatus::kOk,
+          "CMP branch fixture initializes");
+    ctx = X86Context{};
+    ctx.eax = 4;
+    ctx.esi = unaligned;
+    Check(Runs(sub_0001107B, ctx) && ctx.eax == 2,
+          "CMP feeds correct unsigned not-below conditional branch");
+    ctx = X86Context{};
+    ctx.eax = 2;
+    ctx.esi = unaligned;
+    Check(Runs(sub_0001107B, ctx) && ctx.eax == 1,
+          "CMP carry feeds opposite unsigned conditional branch");
+    memory_value = 0;
+    mem::Write(unaligned, &memory_value, sizeof(memory_value));
+    ctx = X86Context{};
+    ctx.esi = unaligned;
+    Check(Runs(sub_0001108B, ctx) && ctx.eax == 2 && ctx.pf == 1,
+          "CMP parity flag drives subsequent JP branch");
+    ctx = X86Context{};
+    ctx.eax = 1;
+    ctx.esi = unaligned;
+    Check(Runs(sub_0001108B, ctx) && ctx.eax == 1 && ctx.pf == 0,
+          "CMP odd-result parity skips subsequent JP branch");
+
+    memory_value = 2;
+    Check(mem::Write(unaligned, &memory_value, sizeof(memory_value)) == mem::AccessStatus::kOk,
+          "signed CMP branch fixture initializes");
+    ctx = X86Context{};
+    ctx.eax = 1;
+    ctx.esi = unaligned;
+    Check(Runs(sub_0001109B, ctx) && ctx.eax == 2,
+          "CMP signed less-than branch uses SF and OF for negative result");
+    memory_value = 0x80000000;
+    Check(mem::Write(unaligned, &memory_value, sizeof(memory_value)) == mem::AccessStatus::kOk,
+          "signed-overflow CMP branch fixture initializes");
+    ctx = X86Context{};
+    ctx.eax = 0x7FFFFFFF;
+    ctx.esi = unaligned;
+    Check(Runs(sub_0001109B, ctx) && ctx.eax == 1,
+          "CMP signed less-than branch rejects negative wrapped result when OF is set");
+
+    const auto check_fault_unchanged = [&](uint32_t base, uint32_t index, uint32_t address, uint32_t pc,
+                                           mem::AccessStatus status, const char* name, X86Func* function) {
+        X86Context fault_ctx{};
+        fault_ctx.eax = 0xDEADBEEF;
+        fault_ctx.ebx = base;
+        fault_ctx.esi = index;
+        fault_ctx.esp = 0x12345678;
+        fault_ctx.cf = 1; fault_ctx.pf = 0; fault_ctx.af = 1; fault_ctx.zf = 0; fault_ctx.sf = 1; fault_ctx.of = 0;
+        const X86Context before = fault_ctx;
+        Check(ThrowsMemoryFault(function, fault_ctx) && last_fault.instruction == pc && last_fault.address == address &&
+                  last_fault.status == status && !last_fault.write && fault_ctx.eax == before.eax &&
+                  fault_ctx.ebx == before.ebx && fault_ctx.esi == before.esi && fault_ctx.esp == before.esp &&
+                  fault_ctx.cf == before.cf && fault_ctx.pf == before.pf && fault_ctx.af == before.af &&
+                  fault_ctx.zf == before.zf && fault_ctx.sf == before.sf && fault_ctx.of == before.of,
+              name);
+    };
+    check_fault_unchanged(0, 0x24000, 0x24000, 0x11068, mem::AccessStatus::kUncommitted,
+                          "CMP uncommitted read preserves all registers and arithmetic flags", sub_00011068);
+    check_fault_unchanged(0, 0x21FFF, 0x21FFF, 0x11068, mem::AccessStatus::kUncommitted,
+                          "CMP cross-page read reports starting guest address and fault PC", sub_00011068);
+    Check(mem::Commit(0x40000, mem::kPage) && mem::Protect(0x40000, mem::kPage, mem::kWrite) == mem::AccessStatus::kOk,
+          "CMP denied-read fixture page becomes write-only");
+    check_fault_unchanged(0, 0x40000, 0x40000, 0x11068, mem::AccessStatus::kPermissionDenied,
+                          "CMP permission denial preserves registers and flags", sub_00011068);
+    check_fault_unchanged(3, 0, UINT32_MAX, 0x11072, mem::AccessStatus::kInvalidAddress,
+                          "CMP SIB address overflow reports wrapped guest address", sub_00011072);
+
+    X86Context denied{};
+    denied.esi = 0x40000;
+    Check(ThrowsMemoryFault(sub_00011068, denied) && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              last_fault.instruction == 0x11068 && last_fault.address == 0x40000 && !last_fault.write,
+          "CMP reports exact memory-read permission fault");
+    Check(mem::Protect(0x40000, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "CMP permission test restores guest page");
 }
 
 }  // namespace
@@ -276,6 +506,8 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     Check(mem::Read(rmw_va, &rmw_value, sizeof(rmw_value)) == mem::AccessStatus::kOk && rmw_value == 0 &&
               ctx.cf == 1 && ctx.zf == 1,
           "generated memory INC commits result while preserving carry flag");
+
+    CheckCmpTests(destination);
 
     ctx = X86Context{};
     ctx.edi = destination;
