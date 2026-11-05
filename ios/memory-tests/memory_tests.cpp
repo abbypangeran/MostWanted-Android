@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 
@@ -144,18 +145,27 @@ extern "C" int RunMemoryTests() {
     Check(mem::Read(guest_va, &guest_byte, 1) == mem::AccessStatus::kOk && guest_byte == page_markers[0],
           "repeated commit preserves existing guest data");
 
+    const uint32_t crossing_va = guest_va + mem::kPage - 2;
+    const uint32_t pattern = 0xA1B2C3D4;
+    const uint32_t prior_words[2] = {0x11223344, 0x55667788};
+    uint32_t pattern_read[2] = {};
+    Check(mem::Write(crossing_va, prior_words, sizeof(prior_words)) == mem::AccessStatus::kOk,
+          "cross-page pattern fixture initialized");
     Check(mem::Protect(guest_va + mem::kPage, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
           "one guest page receives independent read-only protection");
     Check(mem::Read(guest_va + mem::kPage, &guest_byte, 1) == mem::AccessStatus::kOk &&
-              guest_byte == page_markers[1],
-          "protected guest page remains readable");
+              guest_byte == uint8_t(prior_words[0] >> 16),
+          "protected guest page remains readable after pattern fixture initialization");
     Check(mem::Write(guest_va + mem::kPage, &physical_byte, 1) == mem::AccessStatus::kPermissionDenied,
           "checked write rejects protected guest page");
     Check(mem::Write(guest_va + 2 * mem::kPage, &physical_byte, 1) == mem::AccessStatus::kOk,
           "neighboring guest page retains write permission");
+    Check(mem::FillPattern32(crossing_va, pattern, 2) == mem::AccessStatus::kPermissionDenied &&
+              mem::Read(crossing_va, pattern_read, sizeof(pattern_read)) == mem::AccessStatus::kOk &&
+              std::memcmp(pattern_read, prior_words, sizeof(prior_words)) == 0,
+          "denied cross-page pattern fill makes no partial progress");
 
     uint32_t crossing = 0x44332211, crossing_read = 0;
-    const uint32_t crossing_va = guest_va + mem::kPage - 2;
     uint16_t crossing_prefix_before = 0, crossing_prefix_after = 0;
     Check(mem::Read(crossing_va, &crossing_prefix_before, sizeof(crossing_prefix_before)) == mem::AccessStatus::kOk,
           "cross-page prefix can be sampled before write");
@@ -170,6 +180,51 @@ extern "C" int RunMemoryTests() {
               mem::Read(crossing_va, &crossing_read, sizeof(crossing_read)) == mem::AccessStatus::kOk &&
               crossing_read == crossing,
           "scalar read and write cross a guest-page boundary");
+    Check(mem::FillPattern32(crossing_va, pattern, 2) == mem::AccessStatus::kOk &&
+              mem::Read(crossing_va, pattern_read, sizeof(pattern_read)) == mem::AccessStatus::kOk &&
+              pattern_read[0] == pattern && pattern_read[1] == pattern,
+          "checked 32-bit pattern fill spans guest pages");
+    Check(mem::FillPattern32(guest_va, pattern, std::numeric_limits<size_t>::max()) ==
+              mem::AccessStatus::kInvalidAddress,
+          "checked pattern fill rejects host-size multiplication overflow");
+
+    bool pattern_decommit_serialized = true;
+    constexpr uint32_t raced_fill_va = guest_va + 4 * mem::kPage;
+    std::array<uint32_t, 2 * mem::kPage / sizeof(uint32_t)> fill_sentinel{};
+    fill_sentinel.fill(0x5A5A5A5A);
+    for (unsigned attempt = 0; attempt < 8 && pattern_decommit_serialized; ++attempt) {
+        pattern_decommit_serialized = mem::Commit(raced_fill_va, 2 * mem::kPage) &&
+                                      mem::Write(raced_fill_va, fill_sentinel.data(), sizeof(fill_sentinel)) ==
+                                          mem::AccessStatus::kOk;
+        if (!pattern_decommit_serialized) break;
+        std::atomic<bool> start{false};
+        mem::AccessStatus fill_status = mem::AccessStatus::kHostError;
+        bool decommit_ok = false;
+        std::thread fill([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            fill_status = mem::FillPattern32(raced_fill_va, pattern, fill_sentinel.size());
+        });
+        std::thread decommit([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            decommit_ok = mem::Decommit(raced_fill_va + mem::kPage, mem::kPage);
+        });
+        start.store(true, std::memory_order_release);
+        fill.join();
+        decommit.join();
+        std::array<uint32_t, mem::kPage / sizeof(uint32_t)> first_page{};
+        const auto read_status = mem::Read(raced_fill_va, first_page.data(), sizeof(first_page));
+        const bool all_pattern = std::all_of(first_page.begin(), first_page.end(), [pattern](uint32_t value) {
+            return value == pattern;
+        });
+        const bool all_sentinel = std::all_of(first_page.begin(), first_page.end(), [](uint32_t value) {
+            return value == 0x5A5A5A5A;
+        });
+        pattern_decommit_serialized = decommit_ok && !mem::IsCommitted(raced_fill_va + mem::kPage) &&
+                                      read_status == mem::AccessStatus::kOk &&
+                                      ((fill_status == mem::AccessStatus::kOk && all_pattern) ||
+                                       (fill_status == mem::AccessStatus::kUncommitted && all_sentinel));
+    }
+    Check(pattern_decommit_serialized, "concurrent pattern fill and decommit make no partial progress");
 
     std::array<uint8_t, 48> bulk{};
     for (size_t i = 0; i < bulk.size(); ++i) bulk[i] = uint8_t(i ^ 0x5A);

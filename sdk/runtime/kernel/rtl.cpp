@@ -125,10 +125,8 @@ KERNEL_EXPORT(284, RtlFillMemory, 3) {
 KERNEL_EXPORT(285, RtlFillMemoryUlong, 3) {
 #ifdef __APPLE__
     const uint32_t size = a[1] & ~3u;
-    const auto status = mem::CheckAccess(a[0], size, mem::kWrite);
+    const auto status = mem::FillPattern32(a[0], a[2], size / sizeof(uint32_t));
     if (status != mem::AccessStatus::kOk) GuestMemoryAccessFailure("write", a[0], status);
-    // shortcut: per-word writes can partially progress after concurrent decommit; add a pinned pattern write before concurrent runtime use.
-    for (uint64_t offset = 0; offset < size; offset += 4) W32(uint32_t(uint64_t(a[0]) + offset), a[2]);
 #else
     for (uint32_t o = 0; o + 4 <= a[1]; o += 4) W32(a[0] + o, a[2]);
 #endif

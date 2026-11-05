@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 namespace mem {
 
@@ -26,6 +27,18 @@ void Shutdown();
 bool IsInitialized();
 uint8_t* Base();
 
+// Holds page state stable across a multi-call checked memory operation.
+class ScopedLock {
+public:
+    ScopedLock();
+    ~ScopedLock();
+    ScopedLock(const ScopedLock&) = delete;
+    ScopedLock& operator=(const ScopedLock&) = delete;
+
+private:
+    std::unique_lock<std::recursive_mutex> lock_;
+};
+
 enum Permission : uint8_t { kNoAccess = 0, kRead = 1, kWrite = 2, kExecute = 4, kReadWrite = kRead | kWrite };
 enum class AccessStatus : uint8_t { kOk, kNotInitialized, kInvalidAddress, kUncommitted, kPermissionDenied, kHostError };
 const char* StatusName(AccessStatus status);
@@ -36,6 +49,7 @@ AccessStatus Write(uint32_t va, const void* source, std::size_t size);
 AccessStatus Copy(uint32_t destination, uint32_t source, std::size_t size);
 AccessStatus Move(uint32_t destination, uint32_t source, std::size_t size);
 AccessStatus Fill(uint32_t va, uint8_t value, std::size_t size);
+AccessStatus FillPattern32(uint32_t va, uint32_t value, std::size_t count);
 AccessStatus AtomicFetchAdd32(uint32_t va, uint32_t value, uint32_t& previous);
 bool Commit(uint32_t va, uint32_t size);
 bool Decommit(uint32_t va, uint32_t size);

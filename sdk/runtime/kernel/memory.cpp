@@ -25,6 +25,8 @@ static uint8_t* g_base = nullptr;
 static bool g_poisoned = false;
 // shortcut: one lock serializes checked access and page changes; use page pins when concurrent throughput matters.
 static std::recursive_mutex g_lock;
+ScopedLock::ScopedLock() : lock_(g_lock) {}
+ScopedLock::~ScopedLock() = default;
 #ifdef _WIN32
 static HANDLE g_ram_mapping = nullptr;
 #endif
@@ -328,21 +330,21 @@ AccessStatus Copy(uint32_t destination, uint32_t source, std::size_t size) {
         (source >= kWriteCombineBase) != (destination >= kWriteCombineBase)) {
         const uint32_t src_offset = source & (kPhysicalSize - 1);
         const uint32_t dst_offset = destination & (kPhysicalSize - 1);
-        uint8_t chunk[kPage];
-        if (dst_offset > src_offset && uint64_t(dst_offset) < uint64_t(src_offset) + size) {
-            for (std::size_t remaining = size; remaining;) {
-                std::size_t count = std::min<std::size_t>(remaining, sizeof(chunk));
-                remaining -= count;
-                std::memcpy(chunk, g_base + source + remaining, count);
-                std::memcpy(g_base + destination + remaining, chunk, count);
+        const uint64_t src_end = uint64_t(src_offset) + size;
+        const uint64_t dst_end = uint64_t(dst_offset) + size;
+        if (dst_offset == src_offset) {
+            return AccessStatus::kOk;
+        } else if (dst_offset < src_end && src_offset < dst_end) {
+            // Virtual aliases share backing storage; volatile preserves physical overlap order under optimization.
+            volatile uint8_t* dst = g_base + destination;
+            const volatile uint8_t* src = g_base + source;
+            if (dst_offset > src_offset) {
+                for (std::size_t i = size; i; --i) dst[i - 1] = src[i - 1];
+            } else {
+                for (std::size_t i = 0; i < size; ++i) dst[i] = src[i];
             }
         } else {
-            for (std::size_t offset = 0; offset < size;) {
-                std::size_t count = std::min<std::size_t>(size - offset, sizeof(chunk));
-                std::memcpy(chunk, g_base + source + offset, count);
-                std::memcpy(g_base + destination + offset, chunk, count);
-                offset += count;
-            }
+            std::memcpy(g_base + destination, g_base + source, size);
         }
     } else {
         std::memmove(g_base + destination, g_base + source, size);
@@ -359,6 +361,17 @@ AccessStatus Fill(uint32_t va, uint8_t value, std::size_t size) {
     AccessStatus status = CheckAccessLocked(va, size, kWrite);
     if (status == AccessStatus::kOk && size) std::memset(g_base + va, value, size);
     return status;
+}
+
+AccessStatus FillPattern32(uint32_t va, uint32_t value, std::size_t count) {
+    if (count > SIZE_MAX / sizeof(value)) return AccessStatus::kInvalidAddress;
+    const size_t size = count * sizeof(value);
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    const AccessStatus status = CheckAccessLocked(va, size, kWrite);
+    if (status != AccessStatus::kOk) return status;
+    for (size_t offset = 0; offset < size; offset += sizeof(value))
+        std::memcpy(g_base + uint64_t(va) + offset, &value, sizeof(value));
+    return AccessStatus::kOk;
 }
 
 AccessStatus AtomicFetchAdd32(uint32_t va, uint32_t value, uint32_t& previous) {
