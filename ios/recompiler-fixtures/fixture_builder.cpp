@@ -122,7 +122,22 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xC1, 0xE8, 0x01, 0xC3,             // checked SHR EAX, 1
         0xC1, 0xEB, 0x00, 0xC3,             // checked SHR EBX, 0
         0xC1, 0xE8, 0x1F, 0xC3,             // checked SHR EAX, 31
-        0xC1, 0xE8, 0x20, 0xC3              // checked SHR EAX, 32 masks count to zero
+        0xC1, 0xE8, 0x20, 0xC3,             // checked SHR EAX, 32 masks count to zero
+        0xFF, 0x15, 0x00, 0x20, 0x01, 0x00, 0xC3, // indirect outer: call [0x12000]; ret
+        0xFF, 0x15, 0x04, 0x20, 0x01, 0x00, 0xC3, // nested indirect: call [0x12004]; ret
+        0xE8, 0x01, 0x00, 0x00, 0x00, 0xC3,       // nested direct call 0x111B2; ret
+        0x83, 0xC0, 0x01, 0xC3,                   // nested leaf: add eax, 1; ret
+        0xC2, 0x08, 0x00,                         // indirect callee cleanup: ret 8
+        0xFF, 0x15, 0x08, 0x20, 0x01, 0x00, 0xC3, // call [0x12008]; ret
+        0xFF, 0x15, 0x00, 0x40, 0x01, 0x00, 0xC3, // uncommitted source: call [0x14000]; ret
+        0xFF, 0x15, 0xFE, 0x5F, 0x01, 0x00, 0xC3, // cross-page source: call [0x15FFE]; ret
+        0xFF, 0x15, 0xFE, 0xFF, 0xFF, 0xFF, 0xC3, // overflowing source: call [0xFFFFFFFE]; ret
+        0xFF, 0x16, 0xC3,                           // unsupported indirect form: call [esi]; ret
+        0x85, 0xC9, 0xC3,                           // checked TEST ECX, ECX; ret
+        0x5D, 0xC3,                                 // checked POP EBP; ret
+        0xEB, 0x05, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, // checked short JMP skips EAX sentinel
+        0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3,       // checked short JMP target returns 42
+        0x5F, 0x5E, 0xC3                            // checked POP EDI, POP ESI; ret
     };
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
@@ -390,7 +405,49 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "end = 0x1119A\n\n"
               "[[function]]\n"
               "at = 0x1119A\n"
-              "end = 0x1119E\n";
+              "end = 0x1119E\n\n"
+              "[[function]]\n"
+              "at = 0x1119E\n"
+              "end = 0x111A5\n\n"
+              "[[function]]\n"
+              "at = 0x111A5\n"
+              "end = 0x111AC\n\n"
+              "[[function]]\n"
+              "at = 0x111AC\n"
+              "end = 0x111B2\n\n"
+              "[[function]]\n"
+              "at = 0x111B2\n"
+              "end = 0x111B6\n\n"
+              "[[function]]\n"
+              "at = 0x111B6\n"
+              "end = 0x111B9\n\n"
+              "[[function]]\n"
+              "at = 0x111B9\n"
+              "end = 0x111C0\n\n"
+              "[[function]]\n"
+              "at = 0x111C0\n"
+              "end = 0x111C7\n\n"
+              "[[function]]\n"
+              "at = 0x111C7\n"
+              "end = 0x111CE\n\n"
+              "[[function]]\n"
+              "at = 0x111CE\n"
+              "end = 0x111D5\n\n"
+              "[[function]]\n"
+              "at = 0x111D5\n"
+              "end = 0x111D8\n\n"
+              "[[function]]\n"
+              "at = 0x111D8\n"
+              "end = 0x111DB\n\n"
+              "[[function]]\n"
+              "at = 0x111DB\n"
+              "end = 0x111DD\n\n"
+              "[[function]]\n"
+              "at = 0x111DD\n"
+              "end = 0x111EA\n\n"
+              "[[function]]\n"
+              "at = 0x111EA\n"
+              "end = 0x111ED\n";
     return bool(config);
 }
 

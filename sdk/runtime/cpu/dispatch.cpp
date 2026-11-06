@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_set>
 #include <vector>
 
@@ -14,6 +15,11 @@
 namespace {
 
 dispatch::Table g_dispatch;
+std::shared_mutex g_dispatch_lock;
+thread_local size_t g_call_lease_depth = 0;
+constexpr uint32_t kHostThunkBase = 0xFD000000;
+std::vector<X86Func*> g_host_thunks;
+std::mutex g_host_lock;
 
 struct Export {
     const char* name = nullptr;
@@ -27,12 +33,38 @@ Export g_exports[400];
 // synthetic guest addresses for kernel functions reached through a pointer
 constexpr uint32_t kKernelThunkBase = 0xFE000000;
 
+namespace {
+
+dispatch::ResolvedTarget ResolveTargetLocked(uint32_t guest) {
+    if (!guest) return {dispatch::TargetKind::kNull, nullptr};
+    if (guest >= kKernelThunkBase && guest < kKernelThunkBase + 400 * 4)
+        return {dispatch::TargetKind::kKernelThunk, nullptr};
+    if (guest >= kHostThunkBase) {
+        const size_t index = (guest - kHostThunkBase) / 4;
+        std::lock_guard<std::mutex> lock(g_host_lock);
+        if (index < g_host_thunks.size() && g_host_thunks[index])
+            return {dispatch::TargetKind::kHostThunk, g_host_thunks[index]};
+        return {dispatch::TargetKind::kUnknown, nullptr};
+    }
+    if (!g_dispatch.Ready()) return {dispatch::TargetKind::kUninitialized, nullptr};
+    if (g_dispatch.IsContinuation(guest))
+        return {dispatch::TargetKind::kContinuation, g_dispatch.Find(guest)};
+    if (X86Func* function = g_dispatch.Find(guest)) return {dispatch::TargetKind::kGeneratedFunction, function};
+    if (guest >= g_dispatch.CodeBase() && guest < g_dispatch.CodeEnd())
+        return {dispatch::TargetKind::kUnmapped, nullptr};
+    return {dispatch::TargetKind::kUnknown, nullptr};
+}
+
+}  // namespace
+
 namespace dispatch {
 
 bool Init(const Metadata& metadata, std::string& error) {
+    std::unique_lock<std::shared_mutex> lock(g_dispatch_lock);
     if (!g_dispatch.Initialize(metadata, error)) {
-        LOGE("dispatch: %s", error.c_str());
         g_dispatch.Reset();
+        lock.unlock();
+        LOGE("dispatch: %s", error.c_str());
         return false;
     }
     LOGI("dispatch: %zu functions over %08X..%08X", metadata.functions.size(), metadata.code_base, metadata.code_end);
@@ -46,18 +78,22 @@ bool Init(std::string& error) {
     return Init(metadata, error);
 }
 
-void Reset() { g_dispatch.Reset(); }
+void Reset() {
+    std::unique_lock<std::shared_mutex> lock(g_dispatch_lock);
+    g_dispatch.Reset();
+}
 
 X86Func* Find(uint32_t guest) {
+    if (g_call_lease_depth) return g_dispatch.Find(guest);
+    std::shared_lock<std::shared_mutex> lock(g_dispatch_lock);
     return g_dispatch.Find(guest);
 }
 
-bool IsContinuation(uint32_t guest) { return g_dispatch.IsContinuation(guest); }
-
-// host code the guest may call through a pointer gets an address in this range
-constexpr uint32_t kHostThunkBase = 0xFD000000;
-static std::vector<X86Func*> g_host_thunks;
-static std::mutex g_host_lock;
+bool IsContinuation(uint32_t guest) {
+    if (g_call_lease_depth) return g_dispatch.IsContinuation(guest);
+    std::shared_lock<std::shared_mutex> lock(g_dispatch_lock);
+    return g_dispatch.IsContinuation(guest);
+}
 
 uint32_t HostThunk(X86Func* fn) {
     std::lock_guard<std::mutex> lock(g_host_lock);
@@ -69,30 +105,49 @@ uint32_t HostThunk(X86Func* fn) {
 
 uint32_t KernelThunkAddress(uint32_t ordinal) { return ordinal < 400 ? kKernelThunkBase + ordinal * 4 : 0; }
 
+ResolvedTarget ResolveTarget(uint32_t guest) {
+    if (g_call_lease_depth) return ResolveTargetLocked(guest);
+    std::shared_lock<std::shared_mutex> lock(g_dispatch_lock);
+    return ResolveTargetLocked(guest);
+}
+
+const char* TargetKindName(TargetKind kind) {
+    switch (kind) {
+        case TargetKind::kGeneratedFunction: return "generated function entry";
+        case TargetKind::kContinuation: return "generated continuation";
+        case TargetKind::kKernelThunk: return "kernel export thunk";
+        case TargetKind::kHostThunk: return "registered host thunk";
+        case TargetKind::kNull: return "null target";
+        case TargetKind::kUninitialized: return "uninitialized dispatch table";
+        case TargetKind::kUnmapped: return "unmapped target";
+        case TargetKind::kUnknown: return "unknown target";
+    }
+    return "unknown target";
+}
+
+CallLease::CallLease() : lock_(g_dispatch_lock, std::defer_lock), outer_(g_call_lease_depth == 0) {
+    if (outer_) lock_.lock();
+    ++g_call_lease_depth;
+}
+
+CallLease::~CallLease() { --g_call_lease_depth; }
+
+ResolvedTarget CallLease::Resolve(uint32_t guest) const { return ResolveTargetLocked(guest); }
+
 }  // namespace dispatch
 
 void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
     ctx.last_icall = target;
-    if (g_dispatch.IsContinuation(target)) throw X86Resume{target, ctx.esp};
-    if (X86Func* f = dispatch::Find(target)) {
-        f(ctx, base);
+    dispatch::CallLease lease;
+    const dispatch::ResolvedTarget resolved = lease.Resolve(target);
+    if (resolved.kind == dispatch::TargetKind::kContinuation) throw X86Resume{target, ctx.esp};
+    if (resolved.kind == dispatch::TargetKind::kGeneratedFunction || resolved.kind == dispatch::TargetKind::kHostThunk) {
+        resolved.function(ctx, base);
         return;
     }
-    if (target >= kKernelThunkBase && target < kKernelThunkBase + 400 * 4) {
+    if (resolved.kind == dispatch::TargetKind::kKernelThunk) {
         x86_kernel(ctx, base, (target - kKernelThunkBase) / 4);
         return;
-    }
-    if (target >= dispatch::kHostThunkBase) {
-        size_t i = (target - dispatch::kHostThunkBase) / 4;
-        X86Func* f = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(dispatch::g_host_lock);
-            if (i < dispatch::g_host_thunks.size()) f = dispatch::g_host_thunks[i];
-        }
-        if (f) {
-            f(ctx, base);
-            return;
-        }
     }
     uint32_t ret = kernel::R32(ctx.esp);
     LOGE("indirect call to %08X has no recompiled function (return address %08X, esp %08X)", target, ret, ctx.esp);
@@ -100,10 +155,15 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
     x86_trap(ctx, ret, "indirect call to unknown code");
 }
 
-void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
-    if (!dispatch::Find(target) || dispatch::IsContinuation(target)) {
-        char reason[80];
-        std::snprintf(reason, sizeof(reason), "direct CALL target %08X is not mapped or is a continuation", target);
+namespace {
+
+void CheckedCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
+    dispatch::CallLease lease;
+    const dispatch::ResolvedTarget resolved = lease.Resolve(target);
+    if (resolved.kind != dispatch::TargetKind::kGeneratedFunction || !resolved.function) {
+        char reason[128];
+        std::snprintf(reason, sizeof(reason), "checked CALL target %08X rejected: %s", target,
+                      dispatch::TargetKindName(resolved.kind));
         x86_checked_trap(ctx, call_pc, reason);
     }
 
@@ -121,8 +181,21 @@ void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t 
         }
     } restore{ctx, frame};
 
-    x86_icall(ctx, base, target);
+    ctx.last_icall = target;
+    resolved.function(ctx, base);
     if (!frame.returned) x86_checked_trap(ctx, call_pc, "direct CALL target returned without checked RET");
+}
+
+}  // namespace
+
+void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
+    CheckedCall(ctx, base, target, return_address, call_pc);
+}
+
+void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t return_address,
+                               uint32_t call_pc) {
+    const uint32_t target = x86_mem_read<uint32_t>(call_pc, operand_address);
+    CheckedCall(ctx, base, target, return_address, call_pc);
 }
 
 void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
@@ -141,11 +214,12 @@ void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
 }
 
 void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r) {
-    if (!g_dispatch.IsContinuation(r.target)) x86_trap(ctx, r.target, "stale or invalid continuation");
-    X86Func* function = dispatch::Find(r.target);
-    if (!function) x86_trap(ctx, r.target, "continuation has no recompiled function");
+    dispatch::CallLease lease;
+    const dispatch::ResolvedTarget resolved = lease.Resolve(r.target);
+    if (resolved.kind != dispatch::TargetKind::kContinuation) x86_trap(ctx, r.target, "stale or invalid continuation");
+    if (!resolved.function) x86_trap(ctx, r.target, "continuation has no recompiled function");
     ctx.esp = r.esp;
-    function(ctx, base);
+    resolved.function(ctx, base);
 }
 
 void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {

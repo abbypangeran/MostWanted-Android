@@ -1,4 +1,6 @@
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -6,6 +8,7 @@
 #include <bit>
 #include <exception>
 #include <string>
+#include <thread>
 
 #include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
@@ -15,6 +18,10 @@
 
 namespace kernel {
 uint8_t* g_base = nullptr;
+}
+
+namespace dispatch {
+uint32_t HostThunk(X86Func* fn);
 }
 
 namespace {
@@ -493,11 +500,11 @@ void CheckCallTests(uint32_t destination) {
     ctx.esp = top;
     traps = 0;
     try {
-        x86_checked_call(ctx, nullptr, 0x11200, 0x22222222, 0x1113F);
+        x86_checked_call(ctx, nullptr, 0x11001, 0x22222222, 0x1113F);
     } catch (const FixtureStop&) {
     }
     Check(traps == 1 && last_trap_pc == 0x1113F && ctx.esp == top &&
-              last_trap_reason.find("not mapped") != std::string::npos,
+              last_trap_reason.find("unmapped") != std::string::npos,
           "runtime checked CALL rejects a target missing from the dispatch table before stack write");
 
     const uint32_t continuation = 0x11136;
@@ -542,6 +549,351 @@ void SeedFlags(X86Context& ctx) {
     ctx.of = 1;
     ctx.pf = 0;
     ctx.af = 1;
+}
+
+void CheckIndirectCallTests() {
+    constexpr uint32_t slots = 0x12000, stack = 0x74000, top = stack + mem::kPage;
+    const uint32_t targets[] = {0x111A5, 0x111AC, 0x111B6};
+    Check(mem::Commit(slots, mem::kPage) && mem::Write(slots, targets, sizeof(targets)) == mem::AccessStatus::kOk,
+          "indirect CALL target slots initialize in committed guest memory");
+    Check(mem::Protect(slots, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
+          "indirect CALL target slots become read-only");
+
+    X86Context ctx{};
+    ctx.esp = top;
+    ctx.eax = 40;
+    SeedFlags(ctx);
+    Check(Runs(sub_0001119E, ctx) && ctx.eax == 41 && ctx.esp == top + 4 && ctx.last_icall == 0x111B2,
+          "generated indirect and nested direct CALLs dispatch mapped functions and return");
+    uint32_t returns[3]{};
+    Check(mem::Read(top - sizeof(returns), returns, sizeof(returns)) == mem::AccessStatus::kOk &&
+              returns[0] == 0x111B1 && returns[1] == 0x111AB && returns[2] == 0x111A4,
+          "nested indirect and direct CALLs place exact return addresses in LIFO stack order");
+
+    ctx = X86Context{};
+    ctx.esp = top - 8;
+    Check(Runs(sub_000111B9, ctx) && ctx.esp == top + 4 &&
+              mem::Read(top - 12, &returns[0], sizeof(returns[0])) == mem::AccessStatus::kOk &&
+              returns[0] == 0x111BF,
+          "indirect callee RET imm16 validates return address and applies eight-byte cleanup");
+    Check(mem::Protect(slots, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "indirect CALL target slots become writable again");
+
+    auto reject_target = [&](uint32_t target, const char* class_name, const char* description) {
+        Check(mem::Write(slots, &target, sizeof(target)) == mem::AccessStatus::kOk,
+              "indirect CALL rejection target initializes");
+        X86Context failed{};
+        failed.esp = top;
+        failed.eax = 0x12345678;
+        failed.last_icall = 0x87654321;
+        SeedFlags(failed);
+        const X86Context before = failed;
+        traps = 0;
+        try {
+            sub_0001119E(failed, nullptr);
+        } catch (const FixtureStop&) {
+        }
+        Check(traps == 1 && last_trap_pc == 0x1119E &&
+                  last_trap_reason.find(class_name) != std::string::npos && SameCoreState(failed, before) &&
+                  failed.last_icall == before.last_icall && failed.checked_call == before.checked_call,
+              description);
+    };
+
+    reject_target(0, "null", "checked indirect CALL rejects null target before stack mutation");
+    reject_target(0x11001, "unmapped", "checked indirect CALL rejects generated-code gap before stack mutation");
+    reject_target(0x11200, "unknown", "checked indirect CALL rejects unknown target before stack mutation");
+    reject_target(dispatch::KernelThunkAddress(255), "kernel", "checked indirect CALL rejects kernel export thunk");
+    reject_target(dispatch::HostThunk(sub_000111B2), "host", "checked indirect CALL rejects registered host thunk");
+
+    const uint32_t continuation = 0x111B2;
+    const dispatch::Metadata continuation_metadata{
+        X86CodeBase, X86CodeEnd, X86EntryPoint,
+        std::span<const X86FuncMapping>(X86FuncMappings, X86FuncMappingCount),
+        std::span<const uint32_t>(&continuation, 1)};
+    std::string error;
+    Check(dispatch::Init(continuation_metadata, error), "indirect continuation rejection metadata initializes");
+    reject_target(continuation, "continuation", "checked indirect CALL rejects generated continuation");
+    Check(dispatch::Init(error), "generated dispatch metadata restored after indirect continuation test");
+
+    Check(mem::Write(slots, &targets[0], sizeof(targets[0])) == mem::AccessStatus::kOk,
+          "indirect CALL valid target restored after classification tests");
+    uint32_t sentinel = 0;
+    Check(mem::Write(top - 4, &sentinel, sizeof(sentinel)) == mem::AccessStatus::kOk,
+          "indirect CALL corrupted-return sentinel initializes");
+    const uint32_t corruptor = 0x11128;
+    Check(mem::Write(slots, &corruptor, sizeof(corruptor)) == mem::AccessStatus::kOk,
+          "indirect CALL corrupted-return target initializes");
+    ctx = X86Context{};
+    ctx.esp = top;
+    traps = 0;
+    try {
+        sub_0001119E(ctx, nullptr);
+    } catch (const FixtureStop&) {
+    }
+    Check(traps == 1 && last_trap_pc == 0x1112F &&
+              last_trap_reason.find("expected 000111A4, found DEADBEEF") != std::string::npos &&
+              ctx.esp == top - 4 && ctx.checked_call == nullptr,
+          "indirect callee RET rejects a corrupted guest return address");
+
+    const uint32_t valid_target = 0x111B2;
+    Check(mem::Write(slots, &valid_target, sizeof(valid_target)) == mem::AccessStatus::kOk,
+          "indirect CALL valid target restored before memory-fault tests");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.last_icall = 0x87654321;
+    const X86Context before_source_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000111C0, ctx) && last_fault.instruction == 0x111C0 &&
+              last_fault.address == 0x14000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_source_fault) &&
+              ctx.last_icall == before_source_fault.last_icall && ctx.checked_call == before_source_fault.checked_call,
+          "indirect CALL source read fault reports exact PC/address/status and preserves guest state");
+
+    Check(mem::Protect(slots, mem::kPage, mem::kWrite) == mem::AccessStatus::kOk,
+          "indirect CALL source page becomes write-only");
+    ctx = X86Context{};
+    ctx.esp = top;
+    const X86Context before_permission_fault = ctx;
+    Check(ThrowsMemoryFault(sub_0001119E, ctx) && last_fault.instruction == 0x1119E &&
+              last_fault.address == slots && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              !last_fault.write && SameCoreState(ctx, before_permission_fault) &&
+              ctx.last_icall == before_permission_fault.last_icall &&
+              ctx.checked_call == before_permission_fault.checked_call,
+          "indirect CALL write-only source fault is a checked read and preserves state");
+    Check(mem::Protect(slots, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "indirect CALL source page becomes readable again");
+
+    ctx = X86Context{};
+    ctx.esp = 0x78000;
+    ctx.last_icall = 0x87654321;
+    const X86Context before_stack_fault = ctx;
+    Check(ThrowsMemoryFault(sub_0001119E, ctx) && last_fault.instruction == 0x1119E &&
+              last_fault.address == 0x77FFC && last_fault.status == mem::AccessStatus::kUncommitted &&
+              last_fault.write && SameCoreState(ctx, before_stack_fault) &&
+              ctx.last_icall == before_stack_fault.last_icall && ctx.checked_call == before_stack_fault.checked_call,
+          "indirect CALL stack write fault preserves ESP, dispatch state, and return metadata");
+
+    constexpr uint32_t read_only_stack = 0x76000;
+    Check(mem::Commit(read_only_stack, mem::kPage) &&
+              mem::Protect(read_only_stack, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
+          "indirect CALL stack-fault page becomes read-only");
+    ctx = X86Context{};
+    ctx.esp = read_only_stack + mem::kPage;
+    const X86Context before_read_only_stack = ctx;
+    Check(ThrowsMemoryFault(sub_0001119E, ctx) && last_fault.instruction == 0x1119E &&
+              last_fault.address == ctx.esp - 4 && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              last_fault.write && SameCoreState(ctx, before_read_only_stack),
+          "indirect CALL read-only stack fault preserves ESP");
+    Check(mem::Protect(read_only_stack, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "indirect CALL stack-fault page becomes writable again");
+
+    constexpr uint32_t stack_prefix = 0x85FFE;
+    Check(mem::Commit(0x85000, mem::kPage), "indirect CALL stack cross-page prefix commits");
+    const uint16_t prefix = 0xBEEF;
+    Check(mem::Write(stack_prefix, &prefix, sizeof(prefix)) == mem::AccessStatus::kOk,
+          "indirect CALL stack cross-page sentinel initializes");
+    ctx = X86Context{};
+    ctx.esp = 0x86002;
+    Check(ThrowsMemoryFault(sub_0001119E, ctx) && last_fault.instruction == 0x1119E &&
+              last_fault.address == stack_prefix && last_fault.status == mem::AccessStatus::kUncommitted &&
+              last_fault.write && ctx.esp == 0x86002 &&
+              mem::Read(stack_prefix, &sentinel, sizeof(prefix)) == mem::AccessStatus::kOk && sentinel == prefix,
+          "indirect CALL cross-page stack fault writes no partial return address");
+
+    ctx = X86Context{};
+    ctx.esp = 2;
+    Check(ThrowsMemoryFault(sub_0001119E, ctx) && last_fault.instruction == 0x1119E &&
+              last_fault.address == UINT32_MAX - 1 && last_fault.status == mem::AccessStatus::kInvalidAddress &&
+              last_fault.write && ctx.esp == 2,
+          "indirect CALL stack underflow is rejected as an overflowing checked write");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    Check(ThrowsMemoryFault(sub_000111CE, ctx) && last_fault.instruction == 0x111CE &&
+              last_fault.address == UINT32_MAX - 1 && last_fault.status == mem::AccessStatus::kInvalidAddress &&
+              !last_fault.write && ctx.esp == top,
+          "indirect CALL target read rejects a 32-bit address overflow");
+
+    constexpr uint32_t cross_page_slot = 0x15FFE;
+    Check(mem::Commit(0x15000, 2 * mem::kPage), "indirect CALL cross-page source commits both guest pages");
+    Check(mem::Write(cross_page_slot, &valid_target, sizeof(valid_target)) == mem::AccessStatus::kOk,
+          "indirect CALL cross-page target initializes");
+    ctx = X86Context{};
+    ctx.esp = top;
+    Check(Runs(sub_000111C7, ctx) && ctx.eax == 1 && ctx.esp == top + 4,
+          "indirect CALL target dword reads correctly across guest pages");
+    Check(mem::Decommit(0x16000, mem::kPage), "indirect CALL cross-page source tail decommits");
+    ctx = X86Context{};
+    ctx.esp = top;
+    const X86Context before_cross_page_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000111C7, ctx) && last_fault.instruction == 0x111C7 &&
+              last_fault.address == cross_page_slot && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_cross_page_fault),
+          "indirect CALL cross-page source fault reports full read span and preserves state");
+    Check(mem::Commit(0x16000, mem::kPage), "indirect CALL cross-page source tail recommits");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    const X86Context before_overflow_source = ctx;
+    Check(ThrowsMemoryFault(sub_000111CE, ctx) && last_fault.instruction == 0x111CE &&
+              last_fault.address == UINT32_MAX - 1 && last_fault.status == mem::AccessStatus::kInvalidAddress &&
+              !last_fault.write && SameCoreState(ctx, before_overflow_source),
+          "indirect CALL overflowing target read preserves guest state");
+
+    Check(ThrowsTrap(sub_000111D5, ctx) && last_trap_pc == 0x111D5 &&
+              last_trap_reason.find("unimplemented: call") != std::string::npos,
+          "checked indirect CALL rejects non-absolute memory operand shape");
+
+    Check(mem::Protect(slots, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              mem::Write(slots, &valid_target, sizeof(valid_target)) == mem::AccessStatus::kOk,
+          "indirect CALL source restored before concurrent protection test");
+    std::barrier start(2);
+    std::atomic<mem::AccessStatus> protect_status{mem::AccessStatus::kHostError};
+    std::thread protector([&] {
+        start.arrive_and_wait();
+        protect_status = mem::Protect(slots, mem::kPage, mem::kWrite);
+    });
+    ctx = X86Context{};
+    ctx.esp = top;
+    const X86Context before_race = ctx;
+    start.arrive_and_wait();
+    bool completed = false;
+    faults = traps = 0;
+    try {
+        sub_0001119E(ctx, nullptr);
+        completed = true;
+    } catch (const FixtureStop&) {
+    }
+    protector.join();
+    const bool race_fault = faults == 1 && traps == 0 && last_fault.instruction == 0x1119E &&
+                            last_fault.address == slots && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+                            !last_fault.write && SameCoreState(ctx, before_race);
+    Check(protect_status == mem::AccessStatus::kOk && (completed || race_fault),
+          "concurrent indirect source protection yields complete CALL or precise checked read fault");
+    Check(mem::Protect(slots, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "indirect CALL concurrent protection test restores source page");
+
+    Check(mem::Write(slots, &valid_target, sizeof(valid_target)) == mem::AccessStatus::kOk,
+          "indirect CALL valid target restored before uninitialized dispatch test");
+    dispatch::Reset();
+    ctx = X86Context{};
+    ctx.esp = top;
+    const X86Context before_uninitialized = ctx;
+    traps = 0;
+    try {
+        sub_0001119E(ctx, nullptr);
+    } catch (const FixtureStop&) {
+    }
+    Check(traps == 1 && last_trap_pc == 0x1119E &&
+              last_trap_reason.find("uninitialized") != std::string::npos &&
+              SameCoreState(ctx, before_uninitialized),
+          "checked indirect CALL rejects valid-looking target while dispatch table is uninitialized");
+    Check(dispatch::Init(error), "generated dispatch table restored after uninitialized-table test");
+
+    std::barrier dispatch_start(2);
+    std::atomic<bool> dispatch_results_valid{true};
+    std::thread dispatch_mutator([&] {
+        dispatch_start.arrive_and_wait();
+        std::string init_error;
+        for (int i = 0; i < 64; ++i) {
+            dispatch::Reset();
+            if (!dispatch::Init(init_error)) dispatch_results_valid = false;
+        }
+    });
+    dispatch_start.arrive_and_wait();
+    for (int i = 0; i < 512; ++i) {
+        const dispatch::ResolvedTarget resolved = dispatch::ResolveTarget(valid_target);
+        if ((resolved.kind == dispatch::TargetKind::kGeneratedFunction && resolved.function != sub_000111B2) ||
+            (resolved.kind != dispatch::TargetKind::kGeneratedFunction &&
+             resolved.kind != dispatch::TargetKind::kUninitialized))
+            dispatch_results_valid = false;
+    }
+    dispatch_mutator.join();
+    Check(dispatch_results_valid,
+          "concurrent dispatch reset yields stable generated target or explicit uninitialized result");
+}
+
+void CheckPostCallInstructionTests() {
+    X86Context ctx{};
+    ctx.esp = 0x74000;
+    ctx.ecx = 0x80000000;
+    SeedFlags(ctx);
+    Check(Runs(sub_000111D8, ctx) && ctx.cf == 0 && ctx.of == 0 && ctx.sf == 1 && ctx.zf == 0 &&
+              ctx.pf == 1 && ctx.af == 1,
+          "checked TEST ECX,ECX sets defined flags and preserves undefined AF");
+
+    constexpr uint32_t top = 0x75000;
+    const uint32_t saved_ebp = 0xAABBCCDD;
+    Check(mem::Write(top - 4, &saved_ebp, sizeof(saved_ebp)) == mem::AccessStatus::kOk,
+          "POP EBP fixture stack word initializes");
+    ctx = X86Context{};
+    ctx.esp = top - 4;
+    ctx.ebp = 0x12345678;
+    SeedFlags(ctx);
+    Check(Runs(sub_000111DB, ctx) && ctx.ebp == saved_ebp && ctx.esp == top + 4 && ctx.cf == 1 && ctx.af == 1,
+          "checked POP EBP reads before register and ESP updates");
+
+    ctx = X86Context{};
+    ctx.esp = 0x78000;
+    ctx.ebp = 0x12345678;
+    SeedFlags(ctx);
+    const X86Context before_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000111DB, ctx) && last_fault.instruction == 0x111DB &&
+              last_fault.address == 0x78000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_fault),
+          "checked POP EBP read fault preserves EBP, ESP, and flags");
+
+    ctx = X86Context{};
+    ctx.esp = 0x79000;
+    Check(Runs(sub_000111DD, ctx) && ctx.eax == 42,
+          "checked short JMP follows its generated in-function target and skips fallthrough bytes");
+
+    constexpr uint32_t pop_stack = 0x7B000;
+    const uint32_t values[] = {0x11223344, 0x55667788, 0x99AABBCC};
+    Check(mem::Write(pop_stack - sizeof(values), values, sizeof(values)) == mem::AccessStatus::kOk,
+          "POP EDI and POP ESI stack fixture initializes");
+    ctx = X86Context{};
+    ctx.esp = pop_stack - sizeof(values);
+    Check(Runs(sub_000111EA, ctx) && ctx.edi == values[0] && ctx.esi == values[1] && ctx.esp == pop_stack,
+          "checked POP EDI and POP ESI read stack before advancing ESP");
+
+    ctx = X86Context{};
+    ctx.esp = 0x7C000;
+    ctx.edi = 0x12345678;
+    ctx.esi = 0x87654321;
+    SeedFlags(ctx);
+    const X86Context before_pop_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000111EA, ctx) && last_fault.instruction == 0x111EA &&
+              last_fault.address == 0x7C000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_pop_fault),
+          "checked POP EDI read fault preserves EDI, ESI, ESP, and flags");
+}
+
+void CheckDispatchLeaseTests() {
+    std::barrier lease_started(2), release_lease(2);
+    std::atomic<bool> resolved{false}, reset_started{false}, reset_finished{false};
+    std::thread active_call([&] {
+        dispatch::CallLease lease;
+        resolved.store(lease.Resolve(0x111B2).kind == dispatch::TargetKind::kGeneratedFunction);
+        lease_started.arrive_and_wait();
+        release_lease.arrive_and_wait();
+    });
+    lease_started.arrive_and_wait();
+    std::thread resetter([&] {
+        reset_started.store(true);
+        dispatch::Reset();
+        reset_finished.store(true);
+    });
+    while (!reset_started.load()) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool reset_waited = !reset_finished.load();
+    release_lease.arrive_and_wait();
+    active_call.join();
+    resetter.join();
+    std::string error;
+    Check(resolved.load() && reset_waited && reset_finished.load(),
+          "dispatch reset waits until an active checked-call lease releases its resolved target");
+    Check(dispatch::Init(error), "generated dispatch metadata restores after checked-call lease test");
 }
 
 void CheckEntryChainTests() {
@@ -1173,6 +1525,9 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckCallTests(destination);
     CheckEntryChainTests();
     CheckCalleeInstructionTests();
+    CheckIndirectCallTests();
+    CheckPostCallInstructionTests();
+    CheckDispatchLeaseTests();
 
     ctx = X86Context{};
     ctx.edi = destination;

@@ -474,7 +474,9 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             return true;
         case ZYDIS_MNEMONIC_POP:
             if (an_.cfg.checked_memory) {
-                Line(F("\t{ X86_SAVE_FLAGS(); uint32_t v = x86_mem_read<uint32_t>(0x%Xu, ctx.esp); ctx.ecx = v; ctx.esp += 4; }", va));
+                std::string destination = RegWrite(ops[0].reg.value, "v");
+                Line(F("\t{ X86_SAVE_FLAGS(); uint32_t v = x86_mem_read<uint32_t>(0x%Xu, ctx.esp); %s ctx.esp += 4; }",
+                       va, destination.c_str()));
                 return true;
             }
             if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[0].reg.value >= ZYDIS_REGISTER_ES && ops[0].reg.value <= ZYDIS_REGISTER_GS) {

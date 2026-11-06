@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -12,6 +13,31 @@ namespace dispatch {
 bool Init(std::string& error);
 void Reset();
 uint32_t KernelThunkAddress(uint32_t ordinal);
+uint32_t HostThunk(X86Func* fn);
+
+enum class TargetKind {
+    kGeneratedFunction, kContinuation, kKernelThunk, kHostThunk, kNull, kUninitialized, kUnmapped, kUnknown
+};
+struct ResolvedTarget {
+    TargetKind kind;
+    X86Func* function;
+};
+
+ResolvedTarget ResolveTarget(uint32_t guest);
+const char* TargetKindName(TargetKind kind);
+
+class CallLease {
+public:
+    CallLease();
+    ~CallLease();
+    CallLease(const CallLease&) = delete;
+    CallLease& operator=(const CallLease&) = delete;
+    ResolvedTarget Resolve(uint32_t guest) const;
+
+private:
+    std::shared_lock<std::shared_mutex> lock_;
+    bool outer_ = false;
+};
 
 struct Metadata {
     uint32_t code_base;
@@ -28,6 +54,7 @@ class Table {
 public:
     bool Initialize(const Metadata& metadata, std::string& error);
     void Reset();
+    bool Ready() const { return !functions_.empty(); }
     X86Func* Find(uint32_t guest) const;
     bool IsContinuation(uint32_t guest) const;
     uint32_t CodeBase() const { return code_base_; }
