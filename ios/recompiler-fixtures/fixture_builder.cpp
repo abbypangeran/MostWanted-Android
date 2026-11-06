@@ -101,7 +101,14 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xE8, 0xBC, 0x00, 0x00, 0x00, 0xC3, // direct CALL to unmapped target remains blocked
         0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3, // CALL $+5 remains blocked in checked mode
         0x89, 0xDC, 0xC3,                   // RET read-fault callee: mov esp, ebx; ret
-        0xE8, 0xF8, 0xFF, 0xFF, 0xFF, 0xC3 // RET read-fault caller
+        0xE8, 0xF8, 0xFF, 0xFF, 0xFF, 0xC3, // RET read-fault caller
+        0x59, 0xC3,                         // checked POP ECX
+        0x58, 0xC3,                         // POP EAX remains unsupported
+        0x99, 0xC3,                         // checked CDQ
+        0xF7, 0xF9, 0xC3,                   // checked IDIV ECX
+        0x31, 0xF6, 0xC3,                   // checked XOR ESI, ESI
+        0x66, 0x99, 0xC3,                   // CWD remains unsupported
+        0xF7, 0x3E, 0xC3                    // IDIV dword [ESI] remains unsupported
     };
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
@@ -306,7 +313,28 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "end = 0x1114E\n\n"
               "[[function]]\n"
               "at = 0x1114E\n"
-              "end = 0x11154\n";
+              "end = 0x11154\n\n"
+              "[[function]]\n"
+              "at = 0x11154\n"
+              "end = 0x11156\n\n"
+              "[[function]]\n"
+              "at = 0x11156\n"
+              "end = 0x11158\n\n"
+              "[[function]]\n"
+              "at = 0x11158\n"
+              "end = 0x1115A\n\n"
+              "[[function]]\n"
+              "at = 0x1115A\n"
+              "end = 0x1115D\n\n"
+              "[[function]]\n"
+              "at = 0x1115D\n"
+              "end = 0x11160\n\n"
+              "[[function]]\n"
+              "at = 0x11160\n"
+              "end = 0x11163\n\n"
+              "[[function]]\n"
+              "at = 0x11163\n"
+              "end = 0x11166\n";
     return bool(config);
 }
 

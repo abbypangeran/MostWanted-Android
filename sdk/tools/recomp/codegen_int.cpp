@@ -302,6 +302,19 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
         case ZYDIS_MNEMONIC_IDIV: {
             bool sgn = m == ZYDIS_MNEMONIC_IDIV;
             unsigned w = ops[0].size;
+            if (an_.cfg.checked_memory && sgn) {
+                emit(F("int64_t n = std::bit_cast<int64_t>((uint64_t(ctx.edx) << 32) | ctx.eax); "
+                       "int32_t d = std::bit_cast<int32_t>(ctx.ecx); "
+                       "if (!d) { X86_SAVE_FLAGS(); x86_checked_trap(ctx, 0x%Xu, \"IDIV division by zero; checked stop does not deliver #DE\"); } "
+                       "if (n == (-9223372036854775807ll - 1) && d == -1) { X86_SAVE_FLAGS(); "
+                       "x86_checked_trap(ctx, 0x%Xu, \"IDIV quotient overflow\"); } "
+                       "int64_t q = n / d, r = n %% d; "
+                       "if (q < -2147483648ll || q > 2147483647ll) { X86_SAVE_FLAGS(); "
+                       "x86_checked_trap(ctx, 0x%Xu, \"IDIV quotient overflow\"); } "
+                       "ctx.eax = (uint32_t)(int32_t)q; ctx.edx = (uint32_t)(int32_t)r;",
+                       va, va, va));
+                return true;
+            }
             std::string trap = F("x86_trap(ctx, 0x%X, \"divide error\");", va);
             if (w == 8) {
                 if (sgn)
@@ -422,7 +435,7 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             Line("\tctx.edx = (ctx.edx & 0xFFFF0000u) | ((ctx.eax & 0x8000u) ? 0xFFFFu : 0u);");
             return true;
         case ZYDIS_MNEMONIC_CDQ:
-            Line("\tctx.edx = (uint32_t)((int32_t)ctx.eax >> 31);");
+            Line("\tctx.edx = (ctx.eax & 0x80000000u) ? UINT32_MAX : 0u;");
             return true;
         case ZYDIS_MNEMONIC_LAHF:
             Line("\tctx.eax = (ctx.eax & 0xFFFF00FFu) | ((sf << 7 | zf << 6 | pf << 2 | 2u | cf) << 8);");
@@ -453,6 +466,10 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             }
             return true;
         case ZYDIS_MNEMONIC_POP:
+            if (an_.cfg.checked_memory) {
+                Line(F("\t{ X86_SAVE_FLAGS(); uint32_t v = x86_mem_read<uint32_t>(0x%Xu, ctx.esp); ctx.ecx = v; ctx.esp += 4; }", va));
+                return true;
+            }
             if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[0].reg.value >= ZYDIS_REGISTER_ES && ops[0].reg.value <= ZYDIS_REGISTER_GS) {
                 Line("\tctx.esp += 4;");
                 return true;

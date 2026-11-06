@@ -544,6 +544,123 @@ void SeedFlags(X86Context& ctx) {
     ctx.af = 1;
 }
 
+void CheckEntryChainTests() {
+    constexpr uint32_t stack = 0x7A000;
+    Check(mem::Commit(stack, mem::kPage), "entry-chain fixture stack commits");
+
+    X86Context ctx{};
+    ctx.esp = stack + 0x100;
+    ctx.eax = 0x11223344;
+    ctx.ecx = 0x55667788;
+    ctx.esi = 0x99AABBCC;
+    SeedFlags(ctx);
+    const uint32_t popped = 0xA1B2C3D4;
+    Check(mem::Write(ctx.esp, &popped, sizeof(popped)) == mem::AccessStatus::kOk,
+          "POP ECX stack input initializes");
+    Check(Runs(sub_00011154, ctx) && ctx.ecx == popped && ctx.esp == stack + 0x108 && ctx.eax == 0x11223344 &&
+              ctx.esi == 0x99AABBCC && ctx.cf == 1 && ctx.zf == 0 && ctx.sf == 1 && ctx.of == 1 && ctx.pf == 0 &&
+              ctx.af == 1,
+          "checked POP ECX reads dword, advances ESP after success, preserves other registers and flags");
+
+    constexpr uint32_t pop_guard = 0x7C000;
+    Check(mem::Commit(pop_guard + mem::kPage, mem::kPage), "POP fixture leaves lower guard page uncommitted");
+    ctx = X86Context{};
+    ctx.esp = pop_guard;
+    ctx.ecx = 0xCAFEBABE;
+    SeedFlags(ctx);
+    const X86Context before_pop_fault = ctx;
+    Check(ThrowsMemoryFault(sub_00011154, ctx) && last_fault.instruction == 0x11154 &&
+              last_fault.address == pop_guard && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_pop_fault),
+          "POP guard-page read fault reports guest PC and preserves ECX, ESP, and flags");
+
+    constexpr uint32_t pop_cross = 0x7E000;
+    Check(mem::Commit(pop_cross, mem::kPage), "POP fixture commits page below unreadable boundary");
+    ctx = X86Context{};
+    ctx.esp = pop_cross + mem::kPage - 2;
+    ctx.ecx = 0x13579BDF;
+    SeedFlags(ctx);
+    const X86Context before_pop_cross_fault = ctx;
+    Check(ThrowsMemoryFault(sub_00011154, ctx) && last_fault.instruction == 0x11154 &&
+              last_fault.address == ctx.esp && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_pop_cross_fault),
+          "POP cross-page read fault validates full dword before changing guest state");
+
+    ctx = X86Context{};
+    ctx.esp = stack + 0x180;
+    ctx.eax = 0x12345678;
+    Check(ThrowsTrap(sub_00011156, ctx) && last_trap_pc == 0x11156 && ctx.esp == stack + 0x180 &&
+              ctx.eax == 0x12345678,
+          "unsupported POP EAX stays blocked before stack access");
+
+    struct CdqCase { uint32_t eax, edx; };
+    for (const CdqCase test : {CdqCase{0, 0}, CdqCase{0x7FFFFFFF, 0}, CdqCase{0x80000000, UINT32_MAX}}) {
+        ctx = X86Context{};
+        ctx.eax = test.eax;
+        ctx.edx = 0x12345678;
+        SeedFlags(ctx);
+        Check(Runs(sub_00011158, ctx) && ctx.eax == test.eax && ctx.edx == test.edx && ctx.cf == 1 && ctx.zf == 0 &&
+                  ctx.sf == 1 && ctx.of == 1 && ctx.pf == 0 && ctx.af == 1,
+              "checked CDQ sign-extends EAX into EDX without changing flags");
+    }
+    ctx = X86Context{};
+    Check(ThrowsTrap(sub_00011160, ctx) && last_trap_pc == 0x11160,
+          "CWD remains unsupported while checked CDQ is enabled");
+
+    const auto set_dividend = [](X86Context& state, int64_t dividend) {
+        const uint64_t bits = std::bit_cast<uint64_t>(dividend);
+        state.eax = uint32_t(bits);
+        state.edx = uint32_t(bits >> 32);
+    };
+    const auto divide = [&](int64_t dividend, int32_t divisor, uint32_t quotient, uint32_t remainder,
+                            const char* message) {
+        ctx = X86Context{};
+        ctx.esp = stack + 0x200;
+        set_dividend(ctx, dividend);
+        ctx.ecx = std::bit_cast<uint32_t>(divisor);
+        SeedFlags(ctx);
+        Check(Runs(sub_0001115A, ctx) && ctx.eax == quotient && ctx.edx == remainder && ctx.ecx == std::bit_cast<uint32_t>(divisor) &&
+                  ctx.esp == stack + 0x204 && ctx.cf == 1 && ctx.zf == 0 && ctx.sf == 1 && ctx.of == 1 && ctx.pf == 0 &&
+                  ctx.af == 1,
+              message);
+    };
+    divide(17, 5, 3, 2, "checked IDIV computes positive quotient and remainder");
+    divide(-17, 5, std::bit_cast<uint32_t>(int32_t(-3)), std::bit_cast<uint32_t>(int32_t(-2)),
+           "checked IDIV truncates negative dividend toward zero with signed remainder");
+    divide(17, -5, std::bit_cast<uint32_t>(int32_t(-3)), 2,
+           "checked IDIV handles negative divisor with signed quotient");
+    divide(INT32_MIN, 1, std::bit_cast<uint32_t>(INT32_MIN), 0,
+           "checked IDIV accepts exact INT32_MIN quotient");
+
+    const auto divide_trap = [&](int64_t dividend, int32_t divisor, const char* reason_fragment, const char* message) {
+        ctx = X86Context{};
+        ctx.esp = stack + 0x280;
+        set_dividend(ctx, dividend);
+        ctx.ecx = std::bit_cast<uint32_t>(divisor);
+        SeedFlags(ctx);
+        const X86Context before = ctx;
+        Check(ThrowsTrap(sub_0001115A, ctx) && last_trap_pc == 0x1115A &&
+                  last_trap_reason.find(reason_fragment) != std::string::npos && SameCoreState(ctx, before),
+              message);
+    };
+    divide_trap(1, 0, "division by zero", "checked IDIV zero divisor stops at guest PC and preserves guest state");
+    divide_trap(INT32_MIN, -1, "quotient overflow", "checked IDIV detects INT32_MIN divided by -1 overflow");
+    divide_trap(int64_t(INT32_MIN) - 1, 1, "quotient overflow", "checked IDIV rejects negative quotient outside int32 range");
+    divide_trap(int64_t(INT32_MAX) + 1, 1, "quotient overflow", "checked IDIV rejects positive quotient outside int32 range");
+    divide_trap(INT64_MIN, -1, "quotient overflow", "checked IDIV guards signed 64-bit host division overflow");
+    Check(ThrowsTrap(sub_00011163, ctx) && last_trap_pc == 0x11163,
+          "memory-source IDIV remains rejected in checked mode");
+
+    ctx = X86Context{};
+    ctx.esp = stack + 0x300;
+    ctx.eax = 0x12345678;
+    ctx.esi = 0xCAFEBABE;
+    SeedFlags(ctx);
+    Check(Runs(sub_0001115D, ctx) && ctx.esi == 0 && ctx.eax == 0x12345678 && ctx.esp == stack + 0x304 && ctx.cf == 0 &&
+              ctx.of == 0 && ctx.zf == 1 && ctx.sf == 0 && ctx.pf == 1 && ctx.af == 1,
+          "checked XOR ESI,ESI sets defined flags and preserves undefined AF");
+}
+
 void CheckPushLeaAndTests() {
     constexpr uint32_t stack = 0x60000;
     Check(mem::Commit(stack, mem::kPage), "checked PUSH fixture stack page commits");
@@ -930,6 +1047,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckCmpTests(destination);
     CheckPushLeaAndTests();
     CheckCallTests(destination);
+    CheckEntryChainTests();
 
     ctx = X86Context{};
     ctx.edi = destination;
