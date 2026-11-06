@@ -7,9 +7,15 @@
 #include <exception>
 #include <string>
 
+#include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
+#include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "x86_recomp_shared.h"
+
+namespace kernel {
+uint8_t* g_base = nullptr;
+}
 
 namespace {
 
@@ -357,6 +363,178 @@ bool SameCoreState(const X86Context& left, const X86Context& right) {
            left.pf == right.pf && left.af == right.af && left.df == right.df && left.xflags == right.xflags;
 }
 
+void SeedFlags(X86Context& ctx);
+
+void CheckCallTests(uint32_t destination) {
+    constexpr uint32_t stack = 0x74000, top = stack + mem::kPage;
+    Check(mem::Commit(stack, mem::kPage), "CALL fixture stack page commits");
+
+    X86Context ctx{};
+    ctx.esp = top;
+    SeedFlags(ctx);
+    Check(Runs(sub_000110F5, ctx) && ctx.eax == 0x12345678 && ctx.ebx == 0x55667788 && ctx.esp == top + 4 &&
+              ctx.last_icall == 0x110EF && ctx.cf == 1 && ctx.zf == 0 && ctx.sf == 1 && ctx.of == 1 && ctx.pf == 0 &&
+              ctx.af == 1,
+          "direct CALL dispatches generated target and returns to guest continuation");
+    uint32_t return_address = 0;
+    Check(mem::Read(top - 4, &return_address, sizeof(return_address)) == mem::AccessStatus::kOk &&
+              return_address == 0x110FA,
+          "direct CALL stores exact guest return address at ESP minus four");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    Check(Runs(sub_0001110D, ctx) && ctx.eax == 3 && ctx.ebx == 0x44332211 && ctx.esp == top + 4 && ctx.cf == 0 &&
+              ctx.zf == 0 && ctx.sf == 0 && ctx.of == 0 && ctx.pf == 1 && ctx.af == 0,
+          "nested direct CALLs return in LIFO order through generated continuations");
+    uint32_t returns[2]{};
+    Check(mem::Read(top - 8, returns, sizeof(returns)) == mem::AccessStatus::kOk && returns[0] == 0x11109 &&
+              returns[1] == 0x11117,
+          "nested CALLs preserve inner and outer guest return addresses");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.edi = destination;
+    SeedFlags(ctx);
+    Check(Runs(sub_00011120, ctx) && ctx.esp == top + 12,
+          "checked RET imm16 applies guest callee stack cleanup");
+    uint32_t post_call_esp = 0;
+    Check(mem::Read(destination, &post_call_esp, sizeof(post_call_esp)) == mem::AccessStatus::kOk &&
+              post_call_esp == top + 8 && ctx.cf == 1 && ctx.zf == 0 && ctx.sf == 1 && ctx.of == 1 && ctx.pf == 0 &&
+              ctx.af == 1,
+          "RET imm16 continuation observes ESP after return address and immediate cleanup");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    Check(ThrowsTrap(sub_00011130, ctx) && last_trap_pc == 0x1112F &&
+              last_trap_reason.find("return address") != std::string::npos && ctx.esp == top - 4,
+          "checked RET traps corrupted guest return address before changing ESP");
+
+    ctx = X86Context{};
+    ctx.esp = 0x78000;
+    const X86Context before_write_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000110F5, ctx) && last_fault.instruction == 0x110F5 &&
+              last_fault.address == 0x77FFC && last_fault.status == mem::AccessStatus::kUncommitted && last_fault.write &&
+              SameCoreState(ctx, before_write_fault),
+          "CALL stack write fault reports CALL PC and leaves ESP unchanged");
+
+    constexpr uint32_t read_only_stack = 0x76000;
+    Check(mem::Commit(read_only_stack, mem::kPage) &&
+              mem::Protect(read_only_stack, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
+          "CALL denied-write fixture page becomes read-only");
+    ctx = X86Context{};
+    ctx.esp = read_only_stack + mem::kPage;
+    const X86Context before_denied_write = ctx;
+    Check(ThrowsMemoryFault(sub_000110F5, ctx) && last_fault.instruction == 0x110F5 &&
+              last_fault.address == ctx.esp - 4 && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              last_fault.write && SameCoreState(ctx, before_denied_write),
+          "CALL denied stack write preserves ESP and reports permission failure");
+    Check(mem::Protect(read_only_stack, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "CALL denied-write fixture page becomes writable again");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.ebx = 0x78000;
+    Check(ThrowsMemoryFault(sub_0001114E, ctx) && last_fault.instruction == 0x1114D &&
+              last_fault.address == 0x78000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && ctx.esp == 0x78000 && ctx.checked_call == nullptr,
+          "RET stack read fault reports RET PC and address without advancing ESP");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    const uint32_t no_args = 0;
+    const uint32_t host_result = kernel::CallGuest(ctx, 0x110EF, &no_args, 0);
+    Check(host_result == 0x12345678 && ctx.esp == top && ctx.checked_call == nullptr &&
+              mem::Read(top - 4, &return_address, sizeof(return_address)) == mem::AccessStatus::kOk &&
+              return_address == 0xFFFFFFF0,
+          "host CallGuest validates its explicit sentinel return without a guest continuation");
+
+    X86CheckedCallFrame outer_frame{nullptr, 0xCAFEBABE, false};
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.checked_call = &outer_frame;
+    const uint32_t nested_host_result = kernel::CallGuest(ctx, 0x110EF, &no_args, 0);
+    Check(nested_host_result == 0x12345678 && ctx.esp == top && ctx.checked_call == &outer_frame &&
+              !outer_frame.returned,
+          "host CallGuest sentinel frame shadows and restores an enclosing checked CALL frame");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.checked_call = &outer_frame;
+    traps = 0;
+    try {
+        kernel::CallGuest(ctx, 0x11128, &no_args, 0);
+    } catch (const FixtureStop&) {
+    }
+    Check(traps == 1 && last_trap_pc == 0x1112F &&
+              last_trap_reason.find("expected FFFFFFF0, found DEADBEEF") != std::string::npos &&
+              ctx.esp == top - 4 && ctx.checked_call == &outer_frame && !outer_frame.returned,
+          "host CallGuest rejects a corrupted sentinel and restores the enclosing checked frame");
+    ctx.checked_call = nullptr;
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    Check(ThrowsTrap(sub_0001113C, ctx) && last_trap_pc == 0x1113C &&
+              last_trap_reason.find("unimplemented: call") != std::string::npos && ctx.esp == top,
+          "indirect CALL remains trapped without changing guest stack");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    Check(ThrowsTrap(sub_0001113F, ctx) && last_trap_pc == 0x1113F &&
+              last_trap_reason.find("unimplemented: call") != std::string::npos && ctx.esp == top,
+          "direct CALL to a target absent from generated metadata remains trapped");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    Check(ThrowsTrap(sub_00011145, ctx) && last_trap_pc == 0x11145 &&
+              last_trap_reason.find("unimplemented: call") != std::string::npos && ctx.esp == top,
+          "CALL $+5 remains trapped because fallthrough is not an audited target");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    traps = 0;
+    try {
+        x86_checked_call(ctx, nullptr, 0x11200, 0x22222222, 0x1113F);
+    } catch (const FixtureStop&) {
+    }
+    Check(traps == 1 && last_trap_pc == 0x1113F && ctx.esp == top &&
+              last_trap_reason.find("not mapped") != std::string::npos,
+          "runtime checked CALL rejects a target missing from the dispatch table before stack write");
+
+    const uint32_t continuation = 0x11136;
+    const dispatch::Metadata metadata{X86CodeBase, X86CodeEnd, X86EntryPoint,
+                                      std::span<const X86FuncMapping>(X86FuncMappings, X86FuncMappingCount),
+                                      std::span<const uint32_t>(&continuation, 1)};
+    std::string error;
+    Check(dispatch::Init(metadata, error), "dispatch table accepts generated fixture continuation metadata");
+
+    X86CheckedCallFrame resumed_frame{nullptr, 0x22222222, false};
+    ctx = X86Context{};
+    ctx.esp = top - 4;
+    ctx.checked_call = &resumed_frame;
+    return_address = resumed_frame.return_address;
+    Check(mem::Write(ctx.esp, &return_address, sizeof(return_address)) == mem::AccessStatus::kOk,
+          "valid-resume stack return address initializes");
+    x86_resume(ctx, nullptr, X86Resume{continuation, ctx.esp});
+    Check(ctx.ecx == 0x12345678 && ctx.esp == top && ctx.checked_call == nullptr && resumed_frame.returned,
+          "valid X86Resume continuation dispatches generated code and validates its RET");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    traps = 0;
+    bool continuation_rejected = false;
+    try {
+        x86_checked_call(ctx, nullptr, continuation, 0x22222222, 0x11145);
+    } catch (const FixtureStop&) {
+        continuation_rejected = true;
+    } catch (...) {
+    }
+    Check(continuation_rejected && traps == 1 && ctx.esp == top && ctx.checked_call == nullptr &&
+              last_trap_reason.find("continuation") != std::string::npos,
+          "direct CALL rejects a generated continuation before changing the guest stack");
+
+    Check(dispatch::Init(error), "dispatch table restores generated fixture metadata after continuation test");
+}
+
 void SeedFlags(X86Context& ctx) {
     ctx.cf = 1;
     ctx.zf = 0;
@@ -593,6 +771,8 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     static_assert(sizeof(uint64_t) == 8);
     Check(mem::Init(), "production guest memory initializes");
     if (!mem::IsInitialized()) return 1;
+    std::string dispatch_error;
+    Check(dispatch::Init(dispatch_error), "generated function map initializes production dispatch table");
 
     constexpr uint32_t source = 0x20FFE, destination = 0x30000;
     Check(mem::Commit(0x20000, 0x2000), "source pages commit independently at 4 KB granularity");
@@ -749,6 +929,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
 
     CheckCmpTests(destination);
     CheckPushLeaAndTests();
+    CheckCallTests(destination);
 
     ctx = X86Context{};
     ctx.edi = destination;

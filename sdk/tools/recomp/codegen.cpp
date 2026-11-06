@@ -238,6 +238,7 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
     auto m = in.mnemonic;
     uint32_t next = va + in.length;
 
+    bool checked_call = false;
     if (an_.cfg.checked_memory) {
         auto is_scalar_register = [](const ZydisDecodedOperand& op) {
             return op.type == ZYDIS_OPERAND_TYPE_REGISTER && Reg32Name(op.reg.value) != nullptr;
@@ -295,11 +296,20 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                            (ops[1].mem.index == ZYDIS_REGISTER_NONE || is_address_register(ops[1].mem.index));
         bool checked_branch = in.meta.category == ZYDIS_CATEGORY_COND_BR && in.operand_count_visible == 1 &&
                               ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+        uint32_t call_target = m == ZYDIS_MNEMONIC_CALL && in.operand_count_visible == 1 &&
+                                       ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE
+                                   ? uint32_t(next + ops[0].imm.value.s)
+                                   : 0;
+        checked_call = m == ZYDIS_MNEMONIC_CALL && in.operand_count_visible == 1 && in.operand_width == 32 &&
+                       in.stack_width == 32 && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[0].size == 32 &&
+                       call_target != next && an_.functions.count(call_target) && !an_.continuations.count(call_target);
         bool checked_ret = m == ZYDIS_MNEMONIC_RET && in.operand_count_visible <= 1 &&
-                           (!in.operand_count_visible || ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE);
+                           in.operand_width == 32 && in.stack_width == 32 &&
+                           (!in.operand_count_visible || (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                                                          ops[0].imm.value.u <= 0xFFFF));
         bool locked = in.attributes & ZYDIS_ATTRIB_HAS_LOCK;
         if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_cmp || checked_and || checked_push ||
-              checked_lea || checked_branch || checked_ret) || locked) {
+              checked_lea || checked_branch || checked_call || checked_ret) || locked) {
             Unimpl(va, in, ops);
             pending_.valid = false;
             return;
@@ -309,7 +319,12 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
     // control flow first
     switch (m) {
         case ZYDIS_MNEMONIC_CALL: {
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            if (an_.cfg.checked_memory) {
+                const uint32_t target = uint32_t(next + ops[0].imm.value.s);
+                Line(Fmt("\t{ X86_SAVE_FLAGS(); x86_checked_call(ctx, base, 0x%Xu, 0x%Xu, 0x%Xu); ", target,
+                         next, va));
+                Line("\t  cf = ctx.cf; zf = ctx.zf; sf = ctx.sf; of = ctx.of; pf = ctx.pf; af = ctx.af; }");
+            } else if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 uint32_t t = uint32_t(next + ops[0].imm.value.s);
                 if (t == next) {  // call $+5 only pushes eip
                     Line(Fmt("\tX86_PUSH32(0x%Xu);", next));
@@ -366,8 +381,12 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         }
         case ZYDIS_MNEMONIC_RET: {
             uint32_t n = in.operand_count_visible && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE ? uint32_t(ops[0].imm.value.u) : 0;
-            if (an_.cfg.checked_memory) Line("\tX86_SAVE_FLAGS();");
-            Line(Fmt("\tctx.esp += %u; return;", 4 + n));
+            if (an_.cfg.checked_memory) {
+                Line("\tX86_SAVE_FLAGS();");
+                Line(Fmt("\tx86_checked_ret(ctx, 0x%Xu, %u); return;", va, n));
+            } else {
+                Line(Fmt("\tctx.esp += %u; return;", 4 + n));
+            }
             pending_.valid = false;
             return;
         }

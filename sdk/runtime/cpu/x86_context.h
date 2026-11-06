@@ -9,6 +9,8 @@ union X86Xmm {
     uint64_t q[2];
 };
 
+struct X86CheckedCallFrame;
+
 struct alignas(64) X86Context {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
     uint32_t cf, zf, sf, of, pf, af;  // only live across tail calls, functions keep flags in locals
@@ -25,6 +27,7 @@ struct alignas(64) X86Context {
     uint32_t thread_handle;
     uint32_t last_icall;
     void* host;
+    X86CheckedCallFrame* checked_call = nullptr;
 };
 
 using X86Func = void(X86Context& __restrict ctx, uint8_t* base);

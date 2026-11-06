@@ -35,6 +35,7 @@ add_custom_command(
 
 set(GENERATED_DIR ${FIXTURE_DIR}/generated)
 set(GENERATED_SOURCE ${GENERATED_DIR}/x86_recomp.0.cpp)
+set(GENERATED_MAPPING ${GENERATED_DIR}/x86_func_mapping.cpp)
 add_custom_command(
     OUTPUT ${GENERATED_SOURCE} ${GENERATED_DIR}/x86_recomp_shared.h ${GENERATED_DIR}/x86_func_mapping.cpp
     COMMAND $<TARGET_FILE:xbe_recomp> ${FIXTURE_CONFIG} ${FIXTURE_XBE} ${GENERATED_DIR}
@@ -45,20 +46,28 @@ add_custom_target(generate_checked_fixture DEPENDS ${GENERATED_SOURCE})
 
 add_executable(checked_recompiler_tests
     fixture_runner.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
     ${XBE_SDK}/runtime/core/log.cpp
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
     ${GENERATED_SOURCE}
+    ${GENERATED_MAPPING}
 )
 add_executable(checked_fault_handler_tests
     fault_handler_test.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
     ${XBE_SDK}/runtime/core/log.cpp
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
     ${XBE_SDK}/runtime/kernel/guest_strings.cpp
     ${XBE_SDK}/runtime/kernel/rtl.cpp
     ${XBE_SDK}/runtime/cpu/memory_fault.cpp
     ${GENERATED_SOURCE}
+    ${GENERATED_MAPPING}
 )
 add_dependencies(checked_fault_handler_tests generate_checked_fixture)
 target_compile_features(checked_fault_handler_tests PRIVATE cxx_std_20)

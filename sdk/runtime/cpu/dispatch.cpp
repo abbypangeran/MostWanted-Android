@@ -11,12 +11,6 @@
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
 
-#ifdef _WIN32
-#include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
-
 namespace {
 
 dispatch::Table g_dispatch;
@@ -35,17 +29,21 @@ constexpr uint32_t kKernelThunkBase = 0xFE000000;
 
 namespace dispatch {
 
-bool Init(std::string& error) {
-    const Metadata metadata{X86CodeBase, X86CodeEnd, X86EntryPoint,
-                            std::span<const X86FuncMapping>(X86FuncMappings, X86FuncMappingCount),
-                            std::span<const uint32_t>(X86Continuations, X86ContinuationCount)};
+bool Init(const Metadata& metadata, std::string& error) {
     if (!g_dispatch.Initialize(metadata, error)) {
         LOGE("dispatch: %s", error.c_str());
         g_dispatch.Reset();
         return false;
     }
-    LOGI("dispatch: %zu functions over %08X..%08X", metadata.functions.size(), X86CodeBase, X86CodeEnd);
+    LOGI("dispatch: %zu functions over %08X..%08X", metadata.functions.size(), metadata.code_base, metadata.code_end);
     return true;
+}
+
+bool Init(std::string& error) {
+    const Metadata metadata{X86CodeBase, X86CodeEnd, X86EntryPoint,
+                            std::span<const X86FuncMapping>(X86FuncMappings, X86FuncMappingCount),
+                            std::span<const uint32_t>(X86Continuations, X86ContinuationCount)};
+    return Init(metadata, error);
 }
 
 void Reset() { g_dispatch.Reset(); }
@@ -53,6 +51,8 @@ void Reset() { g_dispatch.Reset(); }
 X86Func* Find(uint32_t guest) {
     return g_dispatch.Find(guest);
 }
+
+bool IsContinuation(uint32_t guest) { return g_dispatch.IsContinuation(guest); }
 
 // host code the guest may call through a pointer gets an address in this range
 constexpr uint32_t kHostThunkBase = 0xFD000000;
@@ -100,10 +100,51 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
     x86_trap(ctx, ret, "indirect call to unknown code");
 }
 
+void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
+    if (!dispatch::Find(target) || dispatch::IsContinuation(target)) {
+        char reason[80];
+        std::snprintf(reason, sizeof(reason), "direct CALL target %08X is not mapped or is a continuation", target);
+        x86_checked_trap(ctx, call_pc, reason);
+    }
+
+    const uint32_t stack_address = ctx.esp - 4;
+    x86_mem_write<uint32_t>(call_pc, stack_address, return_address);
+    ctx.esp = stack_address;
+
+    X86CheckedCallFrame frame{ctx.checked_call, return_address, false};
+    ctx.checked_call = &frame;
+    struct RestoreFrame {
+        X86Context& ctx;
+        X86CheckedCallFrame& frame;
+        ~RestoreFrame() {
+            if (ctx.checked_call == &frame) ctx.checked_call = frame.previous;
+        }
+    } restore{ctx, frame};
+
+    x86_icall(ctx, base, target);
+    if (!frame.returned) x86_checked_trap(ctx, call_pc, "direct CALL target returned without checked RET");
+}
+
+void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
+    if (X86CheckedCallFrame* frame = ctx.checked_call) {
+        const uint32_t actual = x86_mem_read<uint32_t>(pc, ctx.esp);
+        if (frame->returned || actual != frame->return_address) {
+            char reason[112];
+            std::snprintf(reason, sizeof(reason), "invalid guest return address: expected %08X, found %08X",
+                          frame->return_address, actual);
+            x86_checked_trap(ctx, pc, reason);
+        }
+        ctx.checked_call = frame->previous;
+        frame->returned = true;
+    }
+    ctx.esp += 4 + pop_bytes;
+}
+
 void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r) {
-    ctx.esp = r.esp;
+    if (!g_dispatch.IsContinuation(r.target)) x86_trap(ctx, r.target, "stale or invalid continuation");
     X86Func* function = dispatch::Find(r.target);
     if (!function) x86_trap(ctx, r.target, "continuation has no recompiled function");
+    ctx.esp = r.esp;
     function(ctx, base);
 }
 
@@ -152,7 +193,17 @@ uint32_t CallGuest(X86Context& ctx, uint32_t fn, const uint32_t* args, size_t co
         W32(ctx.esp, *--p);
     }
     ctx.esp -= 4;
-    W32(ctx.esp, 0xFFFFFFF0u);  // never used as a target, calls return through the host stack
+    constexpr uint32_t host_return = 0xFFFFFFF0u;  // never used as a target, returns through the host stack
+    W32(ctx.esp, host_return);
+    X86CheckedCallFrame call_frame{ctx.checked_call, host_return, false};
+    ctx.checked_call = &call_frame;
+    struct RestoreCallFrame {
+        X86Context& ctx;
+        X86CheckedCallFrame& frame;
+        ~RestoreCallFrame() {
+            if (ctx.checked_call == &frame) ctx.checked_call = frame.previous;
+        }
+    } restore{ctx, call_frame};
     x86_icall(ctx, g_base, fn);
     uint32_t result = ctx.eax;
     ctx.eax = saved.eax;

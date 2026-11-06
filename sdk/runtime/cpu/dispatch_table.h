@@ -21,6 +21,9 @@ struct Metadata {
     std::span<const uint32_t> continuations;
 };
 
+bool Init(const Metadata& metadata, std::string& error);
+bool IsContinuation(uint32_t guest);
+
 class Table {
 public:
     bool Initialize(const Metadata& metadata, std::string& error);

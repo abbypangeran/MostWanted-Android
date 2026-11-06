@@ -81,7 +81,27 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0x66, 0x21, 0xD8, 0xC3,             // and ax, bx; ret
         0x83, 0x26, 0x0F, 0xC3,             // and dword [esi], 0x0F; ret
         0x21, 0xD8, 0x23, 0x0E, 0xC3,       // and eax, ebx; and ecx, [esi]; ret
-        0x21, 0xD8, 0x56, 0xC3              // and eax, ebx; push esi; ret
+        0x21, 0xD8, 0x56, 0xC3,             // and eax, ebx; push esi; ret
+        0xB8, 0x78, 0x56, 0x34, 0x12, 0xC3, // call target: mov eax, 0x12345678; ret
+        0xE8, 0xF5, 0xFF, 0xFF, 0xFF,       // direct caller: call 0x110EF
+        0xBB, 0x88, 0x77, 0x66, 0x55, 0xC3, // caller continuation; ret
+        0x83, 0xC0, 0x01, 0xC3,             // nested leaf: add eax, 1; ret
+        0xE8, 0xF7, 0xFF, 0xFF, 0xFF,       // nested middle: call 0x11100
+        0x83, 0xC0, 0x02, 0xC3,             // add eax, 2; ret
+        0xB8, 0, 0, 0, 0,                   // nested outer: mov eax, 0
+        0xE8, 0xED, 0xFF, 0xFF, 0xFF,       // call 0x11104
+        0xBB, 0x11, 0x22, 0x33, 0x44, 0xC3, // continuation marker; ret
+        0xC2, 0x08, 0x00,                   // callee cleanup: ret 8
+        0xE8, 0xF8, 0xFF, 0xFF, 0xFF,       // caller: call ret 8
+        0x89, 0x27, 0xC3,                   // save post-call ESP; ret
+        0xC7, 0x04, 0x24, 0xEF, 0xBE, 0xAD, 0xDE, 0xC3, // corrupt return address; ret
+        0xE8, 0xF3, 0xFF, 0xFF, 0xFF, 0xC3, // call corrupting callee; ret
+        0xB9, 0x78, 0x56, 0x34, 0x12, 0xC3, // continuation target for dispatch tests
+        0xFF, 0xD0, 0xC3,                   // indirect CALL remains unsupported
+        0xE8, 0xBC, 0x00, 0x00, 0x00, 0xC3, // direct CALL to unmapped target remains blocked
+        0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3, // CALL $+5 remains blocked in checked mode
+        0x89, 0xDC, 0xC3,                   // RET read-fault callee: mov esp, ebx; ret
+        0xE8, 0xF8, 0xFF, 0xFF, 0xFF, 0xC3 // RET read-fault caller
     };
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
@@ -241,7 +261,52 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "end = 0x110EB\n\n"
               "[[function]]\n"
               "at = 0x110EB\n"
-              "end = 0x110EF\n";
+              "end = 0x110EF\n\n"
+              "[[function]]\n"
+              "at = 0x110EF\n"
+              "end = 0x110F5\n\n"
+              "[[function]]\n"
+              "at = 0x110F5\n"
+              "end = 0x11100\n\n"
+              "[[function]]\n"
+              "at = 0x11100\n"
+              "end = 0x11104\n\n"
+              "[[function]]\n"
+              "at = 0x11104\n"
+              "end = 0x1110D\n\n"
+              "[[function]]\n"
+              "at = 0x1110D\n"
+              "end = 0x1111D\n\n"
+              "[[function]]\n"
+              "at = 0x1111D\n"
+              "end = 0x11120\n\n"
+              "[[function]]\n"
+              "at = 0x11120\n"
+              "end = 0x11128\n\n"
+              "[[function]]\n"
+              "at = 0x11128\n"
+              "end = 0x11130\n\n"
+              "[[function]]\n"
+              "at = 0x11130\n"
+              "end = 0x11136\n\n"
+              "[[function]]\n"
+              "at = 0x11136\n"
+              "end = 0x1113C\n\n"
+              "[[function]]\n"
+              "at = 0x1113C\n"
+              "end = 0x1113F\n\n"
+              "[[function]]\n"
+              "at = 0x1113F\n"
+              "end = 0x11145\n\n"
+              "[[function]]\n"
+              "at = 0x11145\n"
+              "end = 0x1114B\n\n"
+              "[[function]]\n"
+              "at = 0x1114B\n"
+              "end = 0x1114E\n\n"
+              "[[function]]\n"
+              "at = 0x1114E\n"
+              "end = 0x11154\n";
     return bool(config);
 }
 
