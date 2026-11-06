@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -114,7 +115,58 @@ extern "C" int RunCheckedFileTransferTests() {
     Check(read.status == kernel::checked_file_transfer::Status::kGuestMemory && invalid_range.calls == 0 &&
               GuestRead(crossing, prefix) && prefix == sentinel,
           "invalid full destination is rejected before host read without a guest prefix write");
+    const uint32_t initial_status[] = {0xAAAAAAAA, 0xBBBBBBBB};
+    const uint32_t next_status[] = {0x12345678, 0x87654321};
+    Check(mem::Write(crossing, initial_status, sizeof(uint32_t)) == mem::AccessStatus::kOk,
+          "cross-page I/O status block sentinel initializes");
+    Check(kernel::checked_file_transfer::WriteStatusBlock(crossing, next_status[0], next_status[1]) ==
+              mem::AccessStatus::kUncommitted &&
+              GuestRead(crossing, prefix) && prefix == std::vector<uint8_t>(
+                  reinterpret_cast<const uint8_t*>(initial_status),
+                  reinterpret_cast<const uint8_t*>(initial_status) + sizeof(uint32_t)),
+          "cross-page I/O status publication fails without changing its committed prefix");
     Check(mem::Commit(kBase + mem::kPage, mem::kPage), "second guest page recommits for transfer race check");
+
+    Check(mem::Write(crossing, initial_status, sizeof(initial_status)) == mem::AccessStatus::kOk,
+          "complete I/O status sentinel initializes after recommit");
+    Check(kernel::checked_file_transfer::WriteStatusBlock(crossing, next_status[0], next_status[1]) ==
+              mem::AccessStatus::kOk,
+          "checked I/O status block publishes both fields in one guest-memory write");
+    std::vector<uint8_t> status_bytes(sizeof(next_status));
+    Check(GuestRead(crossing, status_bytes) &&
+              std::memcmp(status_bytes.data(), next_status, sizeof(next_status)) == 0,
+          "checked I/O status publication preserves status and information field order");
+
+    Check(mem::Write(crossing, initial_status, sizeof(initial_status)) == mem::AccessStatus::kOk,
+          "concurrent status block sentinel initializes");
+    std::atomic<bool> protect_ok{true};
+    std::barrier status_start(2);
+    std::thread status_protector([&] {
+        status_start.arrive_and_wait();
+        for (int i = 0; i < 500; ++i) {
+            const auto permission = i & 1 ? mem::kRead : mem::kReadWrite;
+            if (mem::Protect(kBase + mem::kPage, mem::kPage, permission) != mem::AccessStatus::kOk)
+                protect_ok.store(false);
+        }
+        if (mem::Protect(kBase + mem::kPage, mem::kPage, mem::kReadWrite) != mem::AccessStatus::kOk)
+            protect_ok.store(false);
+    });
+    bool status_atomic = true;
+    status_start.arrive_and_wait();
+    for (int i = 0; i < 500; ++i) {
+        const auto result = kernel::checked_file_transfer::WriteStatusBlock(crossing, next_status[0], next_status[1]);
+        if (result != mem::AccessStatus::kOk && result != mem::AccessStatus::kPermissionDenied) status_atomic = false;
+        if (GuestRead(crossing, status_bytes)) {
+            const bool unchanged = std::memcmp(status_bytes.data(), initial_status, sizeof(initial_status)) == 0;
+            const bool complete = std::memcmp(status_bytes.data(), next_status, sizeof(next_status)) == 0;
+            status_atomic &= unchanged || complete;
+        } else {
+            status_atomic = false;
+        }
+    }
+    status_protector.join();
+    Check(protect_ok.load() && status_atomic,
+          "concurrent protection leaves the I/O status block wholly old or wholly published");
 
     const std::vector<uint8_t> race_sentinel(8, 0x5A);
     Check(GuestWrite(crossing, race_sentinel), "race destination is seeded across both guest pages");

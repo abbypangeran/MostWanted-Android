@@ -362,8 +362,14 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
 
 // I/O completes before the call returns: the status block is written, then the file object, the event and the
 // APC are signalled (GetOverlappedResult without an event waits on the file handle)
-static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
-    IoStatus(iosb, status, n);
+static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uint32_t apc, uint32_t apc_ctx,
+                       uint32_t iosb, bool checked_iosb) {
+    if (checked_iosb) {
+        if (checked_file_transfer::WriteStatusBlock(iosb, status, n) != mem::AccessStatus::kOk)
+            return 0xC0000005;  // STATUS_ACCESS_VIOLATION; do not signal completion after failed publication
+    } else {
+        IoStatus(iosb, status, n);
+    }
     SetEvent(f);
     Complete(event, apc, apc_ctx, iosb);
     return status;
@@ -407,6 +413,8 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages, bool contigu
     auto f = FileFromHandle(h);
     if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
     if (write && f->entry) return kAccessDenied;
+    if (contiguous && iosb && mem::CheckAccess(iosb, 8, mem::kWrite) != mem::AccessStatus::kOk)
+        return 0xC0000005;  // STATUS_ACCESS_VIOLATION
     ResetEvent(*f);
     std::lock_guard<std::mutex> lock(f->io);
     uint64_t pos = Offset(*f, off);
@@ -419,7 +427,7 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages, bool contigu
         if (result.status != checked_file_transfer::Status::kOk) {
             // A failed read may have advanced FILE* before guest publication failed. Keep logical and host cursors at f.pos.
             if (f->fp) Seek(f->fp, f->pos);
-            return Finish(*f, FileTransferStatus(result.status), 0, event, apc, apc_ctx, iosb);
+            return Finish(*f, FileTransferStatus(result.status), 0, event, apc, apc_ctx, iosb, contiguous);
         }
         n = result.transferred;
     } else {
@@ -434,9 +442,9 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages, bool contigu
         }
     }
     f->pos = pos + n;
-    if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
-    if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
-    return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
+    if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb, contiguous);  // disk full
+    if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb, contiguous);
+    return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb, contiguous);
 }
 
 KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0, true); }

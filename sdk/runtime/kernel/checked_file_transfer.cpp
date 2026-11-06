@@ -61,4 +61,10 @@ Result WriteToHost(uint32_t guest_buffer, uint32_t length, void* context, HostWr
     return {Status::kOk, mem::AccessStatus::kOk, uint32_t(transferred)};
 }
 
+mem::AccessStatus WriteStatusBlock(uint32_t guest_address, uint32_t status, uint32_t information) {
+    if (!guest_address) return mem::AccessStatus::kOk;
+    const uint32_t values[] = {status, information};
+    return mem::Write(guest_address, values, sizeof(values));
+}
+
 }  // namespace kernel::checked_file_transfer

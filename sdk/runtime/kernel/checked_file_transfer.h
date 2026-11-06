@@ -24,5 +24,6 @@ using HostWrite = std::size_t (*)(void* context, const uint8_t* source, std::siz
 
 Result ReadFromHost(uint32_t guest_buffer, uint32_t length, void* context, HostRead read);
 Result WriteToHost(uint32_t guest_buffer, uint32_t length, void* context, HostWrite write);
+mem::AccessStatus WriteStatusBlock(uint32_t guest_address, uint32_t status, uint32_t information);
 
 }  // namespace kernel::checked_file_transfer
