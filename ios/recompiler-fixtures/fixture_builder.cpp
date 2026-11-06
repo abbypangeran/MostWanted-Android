@@ -108,7 +108,21 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xF7, 0xF9, 0xC3,                   // checked IDIV ECX
         0x31, 0xF6, 0xC3,                   // checked XOR ESI, ESI
         0x66, 0x99, 0xC3,                   // CWD remains unsupported
-        0xF7, 0x3E, 0xC3                    // IDIV dword [ESI] remains unsupported
+        0xF7, 0x3E, 0xC3,                   // IDIV dword [ESI] remains unsupported
+        0x85, 0xC0, 0xC3,                   // checked TEST EAX, EAX
+        0xC1, 0xE9, 0x02, 0xC3,             // checked SHR ECX, 2
+        0xFF, 0x75, 0x14, 0xC3,             // checked PUSH dword [EBP+0x14]
+        0xFF, 0x35, 0x00, 0x20, 0x01, 0x00, 0xC3, // checked PUSH dword [0x12000]
+        0xFF, 0x34, 0x24, 0xC3,             // checked PUSH dword [ESP]
+        0x85, 0x06, 0xC3,                   // TEST memory remains unsupported
+        0xD3, 0xE9, 0xC3,                   // SHR ECX, CL remains unsupported
+        0xC1, 0x2E, 0x02, 0xC3,             // SHR memory remains unsupported
+        0x66, 0xFF, 0x36, 0xC3,             // PUSH word [ESI] remains unsupported
+        0x64, 0xFF, 0x36, 0xC3,             // PUSH FS:[ESI] remains unsupported
+        0xC1, 0xE8, 0x01, 0xC3,             // checked SHR EAX, 1
+        0xC1, 0xEB, 0x00, 0xC3,             // checked SHR EBX, 0
+        0xC1, 0xE8, 0x1F, 0xC3,             // checked SHR EAX, 31
+        0xC1, 0xE8, 0x20, 0xC3              // checked SHR EAX, 32 masks count to zero
     };
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
@@ -334,7 +348,49 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "end = 0x11163\n\n"
               "[[function]]\n"
               "at = 0x11163\n"
-              "end = 0x11166\n";
+              "end = 0x11166\n\n"
+              "[[function]]\n"
+              "at = 0x11166\n"
+              "end = 0x11169\n\n"
+              "[[function]]\n"
+              "at = 0x11169\n"
+              "end = 0x1116D\n\n"
+              "[[function]]\n"
+              "at = 0x1116D\n"
+              "end = 0x11171\n\n"
+              "[[function]]\n"
+              "at = 0x11171\n"
+              "end = 0x11178\n\n"
+              "[[function]]\n"
+              "at = 0x11178\n"
+              "end = 0x1117C\n\n"
+              "[[function]]\n"
+              "at = 0x1117C\n"
+              "end = 0x1117F\n\n"
+              "[[function]]\n"
+              "at = 0x1117F\n"
+              "end = 0x11182\n\n"
+              "[[function]]\n"
+              "at = 0x11182\n"
+              "end = 0x11186\n\n"
+              "[[function]]\n"
+              "at = 0x11186\n"
+              "end = 0x1118A\n\n"
+              "[[function]]\n"
+              "at = 0x1118A\n"
+              "end = 0x1118E\n\n"
+              "[[function]]\n"
+              "at = 0x1118E\n"
+              "end = 0x11192\n\n"
+              "[[function]]\n"
+              "at = 0x11192\n"
+              "end = 0x11196\n\n"
+              "[[function]]\n"
+              "at = 0x11196\n"
+              "end = 0x1119A\n\n"
+              "[[function]]\n"
+              "at = 0x1119A\n"
+              "end = 0x1119E\n";
     return bool(config);
 }
 

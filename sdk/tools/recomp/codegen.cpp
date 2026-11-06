@@ -246,6 +246,17 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         auto is_register32 = [&](const ZydisDecodedOperand& op) {
             return is_scalar_register(op) && op.size == 32;
         };
+        auto is_flat_guest_memory = [&](const ZydisDecodedOperand& op) {
+            if (op.type != ZYDIS_OPERAND_TYPE_MEMORY || in.address_width != 32) return false;
+            auto address_register = [](ZydisRegister reg) {
+                return reg == ZYDIS_REGISTER_NONE ||
+                       (Reg32Name(reg) != nullptr &&
+                        ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LEGACY_32, reg) == 32);
+            };
+            const auto segment = op.mem.segment;
+            return (segment == ZYDIS_REGISTER_NONE || segment == ZYDIS_REGISTER_DS || segment == ZYDIS_REGISTER_SS) &&
+                   address_register(op.mem.base) && address_register(op.mem.index);
+        };
         auto is_scalar_memory = [](const ZydisDecodedOperand& op) {
             return op.type == ZYDIS_OPERAND_TYPE_MEMORY && (op.size == 8 || op.size == 16 || op.size == 32);
         };
@@ -286,11 +297,14 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                             (is_scalar_register(ops[0]) || is_scalar_memory(ops[0])));
         bool checked_cmp = m == ZYDIS_MNEMONIC_CMP && is_binary_rmw();
         bool checked_and = m == ZYDIS_MNEMONIC_AND && is_binary_rmw();
+        bool checked_push_memory = m == ZYDIS_MNEMONIC_PUSH && in.operand_count_visible == 1 &&
+                                   in.operand_width == 32 && in.stack_width == 32 && ops[0].size == 32 &&
+                                   is_flat_guest_memory(ops[0]);
         bool checked_push = m == ZYDIS_MNEMONIC_PUSH && in.operand_count_visible == 1 && in.operand_width == 32 &&
                             in.stack_width == 32 &&
                             ((is_scalar_register(ops[0]) && ops[0].size == 32) ||
                              (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-                              (in.raw.imm[0].size == 8 || in.raw.imm[0].size == 32)));
+                              (in.raw.imm[0].size == 8 || in.raw.imm[0].size == 32)) || checked_push_memory);
         bool checked_pop = m == ZYDIS_MNEMONIC_POP && in.operand_count_visible == 1 && in.operand_width == 32 &&
                            in.stack_width == 32 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                            ops[0].reg.value == ZYDIS_REGISTER_ECX && ops[0].size == 32;
@@ -299,6 +313,11 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                             is_register32(ops[0]) && ops[0].reg.value == ZYDIS_REGISTER_ECX;
         bool checked_xor = m == ZYDIS_MNEMONIC_XOR && in.operand_count_visible == 2 && is_register32(ops[0]) &&
                            is_register32(ops[1]);
+        bool checked_test = m == ZYDIS_MNEMONIC_TEST && in.operand_count_visible == 2 && is_register32(ops[0]) &&
+                            ops[0].reg.value == ZYDIS_REGISTER_EAX && is_register32(ops[1]) &&
+                            ops[1].reg.value == ZYDIS_REGISTER_EAX;
+        bool checked_shr = m == ZYDIS_MNEMONIC_SHR && in.operand_count_visible == 2 && in.operand_width == 32 &&
+                           is_register32(ops[0]) && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[1].size == 8;
         bool checked_lea = m == ZYDIS_MNEMONIC_LEA && in.operand_count_visible == 2 &&
                            is_scalar_register(ops[0]) && (ops[0].size == 16 || ops[0].size == 32) &&
                            ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
@@ -320,8 +339,8 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                                                           ops[0].imm.value.u <= 0xFFFF));
         bool locked = in.attributes & ZYDIS_ATTRIB_HAS_LOCK;
         if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_cmp || checked_and || checked_push ||
-              checked_pop || checked_cdq || checked_idiv || checked_xor || checked_lea || checked_branch || checked_call ||
-              checked_ret) || locked) {
+              checked_pop || checked_cdq || checked_idiv || checked_xor || checked_test || checked_shr || checked_lea ||
+              checked_branch || checked_call || checked_ret) || locked) {
             Unimpl(va, in, ops);
             pending_.valid = false;
             return;

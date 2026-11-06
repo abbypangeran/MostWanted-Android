@@ -49,7 +49,9 @@ enum class Scenario {
     kStringDescriptorOverflow,
     kUlongFillOverflow,
     kCompareCursorOverflow,
-    kUnsupportedInstruction
+    kUnsupportedInstruction,
+    kDivideByZero,
+    kDivideOverflow
 };
 
 bool AbortsWithDiagnostic(Scenario scenario, const char* expected) {
@@ -66,6 +68,16 @@ bool AbortsWithDiagnostic(Scenario scenario, const char* expected) {
         X86Context ctx{};
         if (scenario == Scenario::kUnsupportedInstruction) {
             sub_0001102D(ctx, nullptr);
+        } else if (scenario == Scenario::kDivideByZero || scenario == Scenario::kDivideOverflow) {
+            if (scenario == Scenario::kDivideByZero) {
+                ctx.eax = 1;
+                ctx.ecx = 0;
+            } else {
+                ctx.eax = 0x80000000;
+                ctx.edx = UINT32_MAX;
+                ctx.ecx = UINT32_MAX;
+            }
+            sub_0001115A(ctx, nullptr);
         } else if (!mem::Init()) {
             _exit(3);
         } else if (scenario == Scenario::kCallStackWriteFault) {
@@ -196,6 +208,11 @@ int main() {
                                                  "kernel guest read at FFFFFFFF failed: invalid-address");
     bool blocked_instruction = AbortsWithDiagnostic(Scenario::kUnsupportedInstruction,
                                                     "checked recompiler blocked instruction at 0001102D");
+    bool divide_by_zero = AbortsWithDiagnostic(
+        Scenario::kDivideByZero,
+        "checked recompiler blocked instruction at 0001115A: IDIV division by zero; checked stop does not deliver #DE");
+    bool divide_overflow = AbortsWithDiagnostic(Scenario::kDivideOverflow,
+                                                "checked recompiler blocked instruction at 0001115A: IDIV quotient overflow");
     bool rtl_success = RtlSuccessPaths();
     std::printf("%s: generated uncommitted read reaches production logger and abort handler\n", read_fault ? "PASS" : "FAIL");
     std::printf("%s: generated CMP read fault reports its PC and guest address before aborting\n",
@@ -221,10 +238,14 @@ int main() {
     std::printf("%s: memory comparison stops safely before its cursor wraps\n", compare_overflow ? "PASS" : "FAIL");
     std::printf("%s: generated blocked instruction reaches production handler without stack scan\n",
                 blocked_instruction ? "PASS" : "FAIL");
+    std::printf("%s: IDIV by zero stops with guest PC and explicit non-#DE diagnostic\n",
+                divide_by_zero ? "PASS" : "FAIL");
+    std::printf("%s: IDIV quotient overflow stops with guest PC and diagnostic\n",
+                divide_overflow ? "PASS" : "FAIL");
     std::printf("%s: checked RTL fill and compare success paths preserve guest data\n", rtl_success ? "PASS" : "FAIL");
     return read_fault && cmp_read_fault && push_write_fault && and_read_fault && and_write_fault && write_fault &&
-                   call_stack_write_fault && ret_stack_read_fault && call_missing_target && invalid_continuation && descriptor_overflow && fill_overflow &&
-                   compare_overflow && blocked_instruction && rtl_success
+                   call_stack_write_fault && ret_stack_read_fault && call_missing_target && invalid_continuation && descriptor_overflow &&
+                   fill_overflow && compare_overflow && blocked_instruction && divide_by_zero && divide_overflow && rtl_success
                ? 0
                : 1;
 }

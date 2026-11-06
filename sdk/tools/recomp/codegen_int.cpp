@@ -209,7 +209,7 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             return true;
         case ZYDIS_MNEMONIC_SHR:
             emit(F("%s a = %s; uint32_t c = (uint32_t)(%s) & 31; if (c) { %s r = (%s)((uint32_t)a >> c); "
-                   "cf = c <= %u ? ((uint32_t)a >> (c - 1)) & 1 : 0; of = (uint32_t)(a >> %u) & 1; %s %s }",
+                   "if (c <= %u) cf = ((uint32_t)a >> (c - 1)) & 1; if (c == 1) of = (uint32_t)(a >> %u) & 1; %s %s }",
                    T.c_str(), rd(0).c_str(), Read(ops[1], ea).c_str(), T.c_str(), T.c_str(), W, W - 1, Szp(W).c_str(),
                    wr(0, "r").c_str()));
             return true;
@@ -454,9 +454,16 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
                 std::string value = Read(ops[0], ea);
                 if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && in.raw.imm[0].size < in.operand_width)
                     value = "(" + CType(in.raw.imm[0].size, true) + ")(" + value + ")";
-                Line(F("\t{ uint32_t v = (uint32_t)(%s); uint32_t next_esp = ctx.esp - 4; X86_SAVE_FLAGS(); "
-                       "x86_mem_write<uint32_t>(0x%Xu, next_esp, v); ctx.esp = next_esp; }",
-                       value.c_str(), va));
+                if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                    Line("\tX86_SAVE_FLAGS();");
+                    emit(F("uint32_t v = (uint32_t)(%s); uint32_t next_esp = ctx.esp - 4; "
+                           "x86_mem_write<uint32_t>(0x%Xu, next_esp, v); ctx.esp = next_esp;",
+                           value.c_str(), va));
+                } else {
+                    Line(F("\t{ uint32_t v = (uint32_t)(%s); uint32_t next_esp = ctx.esp - 4; X86_SAVE_FLAGS(); "
+                           "x86_mem_write<uint32_t>(0x%Xu, next_esp, v); ctx.esp = next_esp; }",
+                           value.c_str(), va));
+                }
                 return true;
             }
             if (ops[0].size == 16 && ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {

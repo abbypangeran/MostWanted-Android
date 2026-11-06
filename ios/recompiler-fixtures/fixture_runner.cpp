@@ -661,6 +661,99 @@ void CheckEntryChainTests() {
           "checked XOR ESI,ESI sets defined flags and preserves undefined AF");
 }
 
+void CheckCalleeInstructionTests() {
+    constexpr uint32_t stack = 0x8A000;
+    constexpr uint32_t operands = 0x8B000;
+    Check(mem::Commit(stack, mem::kPage) && mem::Commit(operands, mem::kPage) &&
+              mem::Commit(0x12000, mem::kPage),
+          "callee instruction stack and memory operands commit");
+
+    uint32_t expected = 0x1122AABB;
+    Check(mem::Write(operands + 0x14, &expected, sizeof(expected)) == mem::AccessStatus::kOk,
+          "PUSH [EBP+displacement] source initializes");
+    X86Context ctx{};
+    ctx.esp = stack + 0x100;
+    ctx.ebp = operands;
+    SeedFlags(ctx);
+    Check(Runs(sub_0001116D, ctx) && ctx.esp == stack + 0x100 &&
+              mem::Read(stack + 0xFC, &expected, sizeof(expected)) == mem::AccessStatus::kOk && expected == 0x1122AABB &&
+              ctx.cf == 1 && ctx.af == 1,
+          "checked PUSH dword [EBP+0x14] reads before stack publication");
+
+    expected = 0xAABBCCDD;
+    Check(mem::Write(0x12000, &expected, sizeof(expected)) == mem::AccessStatus::kOk,
+          "absolute PUSH source initializes");
+    ctx = X86Context{};
+    ctx.esp = stack + 0x120;
+    SeedFlags(ctx);
+    Check(Runs(sub_00011171, ctx) && ctx.esp == stack + 0x120 &&
+              mem::Read(stack + 0x11C, &expected, sizeof(expected)) == mem::AccessStatus::kOk && expected == 0xAABBCCDD,
+          "checked PUSH dword absolute memory uses checked guest read and stack write");
+
+    expected = 0x76543210;
+    ctx = X86Context{};
+    ctx.esp = stack + 0x140;
+    Check(mem::Write(ctx.esp, &expected, sizeof(expected)) == mem::AccessStatus::kOk,
+          "PUSH [ESP] pre-decrement source initializes");
+    SeedFlags(ctx);
+    Check(Runs(sub_00011178, ctx) && ctx.esp == stack + 0x140 &&
+              mem::Read(stack + 0x13C, &expected, sizeof(expected)) == mem::AccessStatus::kOk && expected == 0x76543210,
+          "checked PUSH [ESP] reads using old ESP before decrementing stack");
+
+    struct TestCase { uint32_t value; AndFlags flags; };
+    for (const TestCase test : {TestCase{0, ReferenceAndFlags(0, 0, 32)},
+                                TestCase{0x80000001, ReferenceAndFlags(0x80000001, 0x80000001, 32)},
+                                TestCase{3, ReferenceAndFlags(3, 3, 32)}}) {
+        ctx = X86Context{};
+        ctx.eax = test.value;
+        SeedFlags(ctx);
+        Check(Runs(sub_00011166, ctx) && ctx.eax == test.value && MatchesAndFlags(ctx, test.flags) && ctx.af == 1,
+              "checked TEST EAX,EAX updates defined flags and preserves undefined AF");
+    }
+
+    struct ShiftCase {
+        X86Func* function;
+        uint32_t input, result, cf, of, zf, sf, pf;
+    };
+    const ShiftCase shifts[] = {
+        {sub_00011169, 0xD0000003, 0x34000000, 1, 1, 0, 0, 1},
+        {sub_00011169, 3, 0, 1, 1, 1, 0, 1},
+        {sub_0001118E, 0x80000003, 0x40000001, 1, 1, 0, 0, 0},
+        {sub_00011192, 0xA5, 0xA5, 1, 1, 0, 1, 0},
+        {sub_00011196, 0x80000000, 1, 0, 1, 0, 0, 0},
+        {sub_0001119A, 0x12345678, 0x12345678, 1, 1, 0, 1, 0},
+    };
+    for (const ShiftCase test : shifts) {
+        ctx = X86Context{};
+        if (test.function == sub_00011192) ctx.ebx = test.input;
+        else if (test.function == sub_00011169) ctx.ecx = test.input;
+        else ctx.eax = test.input;
+        SeedFlags(ctx);
+        Check(Runs(test.function, ctx) &&
+                  (test.function == sub_00011192 ? ctx.ebx : test.function == sub_00011169 ? ctx.ecx : ctx.eax) == test.result &&
+                  ctx.cf == test.cf && ctx.of == test.of && ctx.zf == test.zf && ctx.sf == test.sf && ctx.pf == test.pf &&
+                  ctx.af == 1,
+              "checked SHR immediate handles count, result, defined flags, and preserved undefined flags");
+    }
+
+    ctx = X86Context{};
+    ctx.eax = 0x80000000;
+    ctx.ecx = 0x12345678;
+    ctx.esp = stack + 0x180;
+    SeedFlags(ctx);
+    const X86Context before_unsupported_shift = ctx;
+    Check(ThrowsTrap(sub_0001117F, ctx) && last_trap_pc == 0x1117F && SameCoreState(ctx, before_unsupported_shift),
+          "SHR ECX,CL remains unsupported without changing guest state");
+    Check(ThrowsTrap(sub_0001117C, ctx) && last_trap_pc == 0x1117C,
+          "memory-source TEST remains unsupported in checked mode");
+    Check(ThrowsTrap(sub_00011182, ctx) && last_trap_pc == 0x11182,
+          "memory-destination SHR remains unsupported in checked mode");
+    Check(ThrowsTrap(sub_00011186, ctx) && last_trap_pc == 0x11186,
+          "16-bit memory-source PUSH remains unsupported in checked mode");
+    Check(ThrowsTrap(sub_0001118A, ctx) && last_trap_pc == 0x1118A,
+          "segment-overridden memory-source PUSH remains unsupported in checked mode");
+}
+
 void CheckPushLeaAndTests() {
     constexpr uint32_t stack = 0x60000;
     Check(mem::Commit(stack, mem::kPage), "checked PUSH fixture stack page commits");
@@ -728,10 +821,41 @@ void CheckPushLeaAndTests() {
     Check(mem::Protect(guard, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
           "PUSH stack protection restored");
 
+    constexpr uint32_t push_source = 0x63000;
+    Check(mem::Commit(push_source, mem::kPage), "memory-source PUSH operand page commits");
+    const uint32_t source_value = 0xDEADC0DE;
+    Check(mem::Write(push_source, &source_value, sizeof(source_value)) == mem::AccessStatus::kOk,
+          "memory-source PUSH operand initializes");
     ctx = X86Context{};
-    ctx.esp = guard + 4;
-    Check(ThrowsTrap(sub_000110B8, ctx) && last_trap_pc == 0x110B8 && ctx.esp == guard + 4,
-          "PUSH memory operand remains blocked until read/write ordering is supported");
+    ctx.esp = stack + 0x180;
+    ctx.esi = push_source;
+    SeedFlags(ctx);
+    Check(Runs(sub_000110B8, ctx) && ctx.esp == stack + 0x180 &&
+              mem::Read(ctx.esp - 4, &word, sizeof(word)) == mem::AccessStatus::kOk && word == source_value &&
+              ctx.cf == 1 && ctx.zf == 0 && ctx.sf == 1 && ctx.of == 1 && ctx.pf == 0 && ctx.af == 1,
+          "checked PUSH dword [ESI] reads source, writes stack, then RET restores ESP");
+
+    ctx = X86Context{};
+    ctx.esp = stack + 0x184;
+    ctx.esi = 0x24000;
+    SeedFlags(ctx);
+    const X86Context before_memory_push_read_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000110B8, ctx) && last_fault.instruction == 0x110B8 &&
+              last_fault.address == 0x24000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_memory_push_read_fault),
+          "memory-source PUSH read fault preserves stack and reports read direction");
+
+    constexpr uint32_t push_guard = 0x88000;
+    Check(mem::Commit(push_guard + mem::kPage, mem::kPage), "memory-source PUSH leaves destination guard uncommitted");
+    ctx = X86Context{};
+    ctx.esp = push_guard + 4;
+    ctx.esi = push_source;
+    SeedFlags(ctx);
+    const X86Context before_memory_push_write_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000110B8, ctx) && last_fault.instruction == 0x110B8 &&
+              last_fault.address == push_guard && last_fault.status == mem::AccessStatus::kUncommitted &&
+              last_fault.write && SameCoreState(ctx, before_memory_push_write_fault),
+          "memory-source PUSH stack-write fault preserves registers and ESP after checked source read");
 
     ctx = X86Context{};
     ctx.eax = 0xFFFFFFF0;
@@ -1048,6 +1172,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckPushLeaAndTests();
     CheckCallTests(destination);
     CheckEntryChainTests();
+    CheckCalleeInstructionTests();
 
     ctx = X86Context{};
     ctx.edi = destination;
