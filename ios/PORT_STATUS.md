@@ -909,3 +909,101 @@ The CALL target `0x002B5CA7` is a mapped generated function. If entered in isola
 Tests use process-owned temporary directories and do not create or follow attacker-controlled links. The symlink replacement race remains. App-container paths on iOS are private to the app, but Android's configured `/storage/emulated/0/MostWanted` and removable-storage game directories are shared locations when `MANAGE_EXTERNAL_STORAGE` is granted. A concurrent writer can replace a path component between validation and open/rename. A portable repair would need descriptor-relative operations for the full file lifecycle plus separate Windows reparse-point handling; that exceeds this phase, so shared-path use remains unsafe under a concurrent untrusted writer.
 
 **Future restricted execution decision: NO-GO.** The entry stops at `POP ECX` before reaching the checked CALL, and the callee stops at `TEST EAX,EAX`. The synthetic preparation harness does not invoke production `Boot()` or combine launch/display imports with later startup stages; GPU/file/object/audio/network paths also remain unconverted. Preserve the Apple `Boot()` guard. No physical-device installation, real guest execution, merge to `main`, or customer release occurred.
+
+## Phase 2C-8 checked entry-chain instructions and GPU readback
+
+Verified on 2026-11-06 on `feature/ios-port`. Phase commits: `35b6d17` (entry-chain integer instructions), `8b42dc9` (callee instruction forms), and `4f74c0f` (checked Vulkan readback). The Apple `Boot()` null-base guard remains. Current Black Edition output was regenerated under ignored `.local/ios-port/phase2c8-final-entry-audit/` with the current Debug `xbe_recomp` and inspected statically. Generated real-game functions were not executed, and no XBE, ISO, or generated game C++ was committed.
+
+| Gate | Result | Evidence and limits |
+| --- | --- | --- |
+| `CHECKED_ENTRY_CHAIN` | **PASS** | Actual recompiler-generated synthetic fixtures execute `POP ECX`, `CDQ`, signed `IDIV ECX`, and `XOR ESI,ESI` through production checked-memory helpers. Tests cover stack guard/cross-page faults, register and flag preservation, signed dividends, `INT32_MIN`, zero divisor, quotient overflow, and undefined-flag preservation. IDIV failures stop at the guest PC with diagnostics; this does not implement Xbox `#DE` delivery. |
+| `CHECKED_CALLEE_INSTRUCTIONS` | **PASS for listed forms** | Fixtures execute `TEST EAX,EAX`, 32-bit immediate `SHR`, and representative memory-source dword PUSH forms. PUSH fixtures cover `[EBP+disp]`, absolute memory, `[ESP]`, and `[ESI]`, including source-read and stack-write faults. Memory TEST, `SHR r32,CL`, memory-destination SHR, 16-bit PUSH, and segment-overridden PUSH remain rejected. |
+| `GPU_GUEST_READBACK` | **PASS for helper; Vulkan runtime unverified** | The isolated helper tests completed/padded rows, destination-padding preservation, partial output, invalid/oversized/overflowing layouts, injected `std::bad_alloc`, read-only/uncommitted pages, and concurrent decommit. Vulkan `Sync` and `DeliverLate` now use this boundary; Android `assembleDebug` compiled it. No real Vulkan GPU readback was run. |
+| `STARTUP_RUNTIME_SAFETY` | **NO-GO** | Static output now emits checked code through the direct call at `0x002B396A`. The called function's next unsupported instruction is indirect `CALL [0x003C9E68]` at `0x002B5CE0`; callback target and reachable kernel/HLE access graph remain unresolved. The `Boot()` guard stays. |
+| macOS ARM64 memory tests | **PASS** | Debug and Release CTests passed `1/1` each after the deterministic decommit-test fix. |
+| Generated recompiler/fault fixtures | **PASS** | Debug and Release CTests passed `2/2` each, executing synthetic generated code only. |
+| iOS Simulator ARM64 | **PASS** | Fresh memory-test app build and iPhone 18 Pro simulator run passed 372 assertions with no `FAIL`; generated instruction fixtures were excluded from the app. |
+| iPhoneOS ARM64 | **PASS (unsigned compile/link)** | The `mostwanted_memory_tests` target built with signing disabled. It was not installed on a physical iPhone. |
+| Android | **PASS (build)** | `:app:assembleDebug` passed with Java 21 and NDK 28.2.13676358, compiling `native/vulkan.cpp` and `checked_gpu_transfer.cpp`. The APK was not installed or run. SDK XML v4 and SDL sensor deprecation warnings were nonfatal. |
+
+### Checked entry and callee scope
+
+The regenerated entry block at `0x002B3916` now has checked `POP ECX` at `0x002B394A`, `CDQ` at `0x002B3953`, `IDIV ECX` at `0x002B3954`, and `XOR ESI,ESI` at `0x002B395C`, followed by the checked direct CALL at `0x002B396A` to mapped function `0x002B5CA7`. POP reads the full stack dword before changing ECX or ESP. CDQ sign-extends EAX into EDX. IDIV forms the signed EDX:EAX dividend, uses truncation toward zero, and checks divide-by-zero and signed quotient range before updating EAX/EDX. Its fatal diagnostic is not Xbox exception delivery. XOR updates CF/OF/SF/ZF/PF and preserves undefined AF.
+
+The isolated callee fixture validates `TEST EAX,EAX` defined flags while preserving undefined AF; immediate 32-bit SHR count masking, result, CF/SF/ZF/PF, OF handling, and count-zero preservation; and read-before-write ordering for memory-source dword PUSH. The supported PUSH forms use flat guest memory and default/DS/SS addressing. Read or stack-write faults preserve guest state and report guest PC, address, direction, and access status. Unsupported instruction shapes remain traps.
+
+Static inspection of the regenerated callee shows checked `TEST EAX,EAX` at `0x002B5CAD`, `SHR ECX,2` at `0x002B5CC0`, and memory pushes at `0x002B5CCA`, `0x002B5CCD`, `0x002B5CD0`, and `0x002B5CD3`. The next blocker is indirect `CALL [0x003C9E68]` at `0x002B5CE0`. Later blocked instructions include `TEST ECX,ECX` at `0x002B5CE8` and `POP EBP` at `0x002B5D11`; checked `RET 0x18` at `0x002B5D12` is not statically reachable through this path. After a hypothetical return, caller direct calls at `0x002B397A` and `0x002B3980`, then POPs at `0x002B3985–0x002B3986`, are additional blockers. These are code-generation observations, not runtime reachability evidence.
+
+### GPU transfer boundary and remaining raw access
+
+`kernel::checked_gpu_transfer::MakeLayout` validates nonzero dimensions, source pitch, destination capacity, guest address range, checked row/total arithmetic, and a 64 MiB per-span staging bound. `Transfer` first validates the entire guest destination, invokes the synchronous readback callback into host-owned storage, rejects short output, then reacquires the memory lock and revalidates the complete write span before copying rows with `mem::Write`. Guest row padding remains untouched. No guest pointer crosses GPU work; retained packed pixels publish only after all guest rows succeed. The decommit fixture completes decommit before the callback returns, then verifies the second full-span check prevents any row publication.
+
+`VulkanBackend::Sync` waits for GPU submission completion before using the helper. `DeliverLate` copies only after its fence is complete. On submission failure, the readback buffer is retired so it is not destroyed while an already-submitted command may still be in flight. Checked signatures are used by `Sync` and `RecordLate`, but broader Vulkan input paths such as `MemSig`, `Changed`, `LatchCpuChanges`, texture/vertex uploads, and other rendering buffers still use raw or retained pointers. Windows D3D12 readback in `sdk/runtime/gpu/d3d12.cpp` remains unchanged and raw. The Vulkan integration is compile-verified only; simulator helper tests are not GPU-driver readback tests.
+
+| Runtime path | Phase 2C-8 status |
+| --- | --- |
+| Apple `Boot()` and real-game entry | Guarded; no game instruction was run. Checked fixture support is limited to the tested instruction forms. |
+| Contiguous synchronous `NtReadFile`/`NtWriteFile` data | Checked staging and memory transfer remain covered by Phase 2C-7 tests. IOSB/status, event, APC metadata and related exports still contain raw accesses. |
+| `NtReadFileScatter`/`NtWriteFileGather` | Raw scatter/gather path remains blocked. |
+| Guest objects, critical sections, and waits | Raw guest structure access remains in object and kernel exports; not converted or invoked by the preparation harness. |
+| Thread, APC, and DPC callbacks | `StartThread`, `RunApcs`, DPC dispatch, and callback exports can reach `CallGuest`; callback targets and lifetimes are not bounded by this phase. |
+| Vulkan output readback | Checked transfer helper is tested and Vulkan call sites compile; actual GPU runtime remains unverified. |
+| Vulkan input, D3D12, audio, network, and other deferred buffers | Raw or retained guest pointers remain; not converted here. |
+| Filesystem paths | Tests remain in owned temporary roots. The documented symlink-replacement time-of-check/time-of-use race remains for shared paths with concurrent writers. |
+
+### Restricted-execution prerequisites
+
+**NO-GO for restricted or real guest execution.** A future restricted experiment requires, at minimum: (1) a complete static instruction and call graph for the exact entry route, with the indirect call target resolved and checked or rejected before side effects; (2) checked or lifetime-pinned access for every reachable file status/event/APC, object, critical-section, wait, scatter/gather, graphics, and audio buffer, or a validated pre-access guard proving a path cannot run; (3) scoped guest callback dispatch and no guest thread start before all gates pass; (4) failure-injected rollback and decommit/lifetime tests for the combined startup preparation; and (5) target-platform compile and simulator verification for that exact bounded route. Separate authorization would still be required for any later execution experiment. Passing synthetic instruction fixtures alone is insufficient. Keep the Apple `Boot()` guard.
+
+### Phase 2C-8 verification commands
+
+From the repository root. All generated XBE outputs and build directories below are ignored local artifacts. The simulator memory-test build used an empty `MOSTWANTED_CHECKED_FIXTURE_DIR`; it did not include generated game functions.
+
+```sh
+# Production memory tests, Debug and Release
+cmake --build .local/ios-port/memory-macos --config Debug --target mostwanted_memory_tests --parallel 8
+ctest --test-dir .local/ios-port/memory-macos -C Debug --output-on-failure
+cmake --build .local/ios-port/memory-macos --config Release --target mostwanted_memory_tests --parallel 8
+ctest --test-dir .local/ios-port/memory-macos -C Release --output-on-failure
+
+# Synthetic generated instruction and fault-handler fixtures
+cmake --build .local/ios-port/recompiler-fixtures-tracka --config Debug --target checked_recompiler_tests checked_fault_handler_tests --parallel 8
+ctest --test-dir .local/ios-port/recompiler-fixtures-tracka -C Debug --output-on-failure
+cmake --build .local/ios-port/recompiler-fixtures-tracka-release --config Release --target checked_recompiler_tests checked_fault_handler_tests --parallel 8
+ctest --test-dir .local/ios-port/recompiler-fixtures-tracka-release -C Release --output-on-failure
+
+# Regenerate actual Black Edition output for inspection only
+.local/ios-port/recompiler-fixtures-xcode/Debug/xbe_recomp \
+  .local/ios-port/checked-game.toml "$PWD/.local/ios-port/default.xbe" \
+  "$PWD/.local/ios-port/phase2c8-final-entry-audit" --xdk "$PWD/sdk/xdk" \
+  > .local/ios-port/phase2c8-final-entry-audit.log 2>&1
+
+# Simulator memory/preparation app; no generated fixture or game execution
+cmake -S ios -B .local/ios-port/phase2c8-sim -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.2.sdk \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DMOSTWANTED_CHECKED_FIXTURE_DIR= \
+  -DFETCHCONTENT_SOURCE_DIR_SDL3="$PWD/.local/ios-port/ios-sim/_deps/sdl3-src"
+cmake --build .local/ios-port/phase2c8-sim --config Debug --target mostwanted_memory_tests --parallel 8
+xcrun simctl install 43A6197F-AD68-48D4-84DB-6A147D89B8DC \
+  .local/ios-port/phase2c8-sim/Debug-iphonesimulator/mostwanted_memory_tests.app
+xcrun simctl launch --console-pty --terminate-running-process \
+  43A6197F-AD68-48D4-84DB-6A147D89B8DC com.racas.mostwanted.memorytests
+
+# Unsigned iPhoneOS ARM64 compile/link; no physical install
+cmake -S ios -B .local/ios-port/ios-device -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DMOSTWANTED_CHECKED_FIXTURE_DIR= \
+  -DFETCHCONTENT_SOURCE_DIR_SDL3="$PWD/.local/ios-port/ios-sim/_deps/sdl3-src"
+cmake --build .local/ios-port/ios-device --config Debug --target mostwanted_memory_tests --parallel 8 -- CODE_SIGNING_ALLOWED=NO
+
+# Android ARM64 build only
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+PATH=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin:$PATH \
+bash ./gradlew --no-daemon -PxbeGenerated="$PWD/.local/ios-port/phase2c8-final-entry-audit" :app:assembleDebug
+```
+
+Phase integration is limited to the pushed `feature/ios-port` branch; no merge to `main`, physical-device install, real guest execution, IPA, sideload, or customer release occurred.
