@@ -260,6 +260,13 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
             if (!is_scalar_register(ops[0]) && !is_scalar_memory(ops[0])) return false;
             return is_scalar_memory(ops[0]) ? !is_scalar_memory(ops[1]) && is_scalar_source(ops[1]) : is_scalar_source(ops[1]);
         };
+        auto is_address_register = [&](ZydisRegister reg) {
+            if (Reg32Name(reg) == nullptr || ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LEGACY_32, reg) != in.address_width)
+                return false;
+            if (in.address_width != 16) return true;
+            return reg == ZYDIS_REGISTER_BX || reg == ZYDIS_REGISTER_BP || reg == ZYDIS_REGISTER_SI ||
+                   reg == ZYDIS_REGISTER_DI;
+        };
         bool checked_mov = m == ZYDIS_MNEMONIC_MOV && in.operand_count_visible == 2 &&
                            (is_scalar_register(ops[0]) || is_scalar_memory(ops[0])) && is_scalar_source(ops[1]) &&
                            !(is_scalar_memory(ops[0]) && is_scalar_memory(ops[1]));
@@ -274,13 +281,25 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                            (m == ZYDIS_MNEMONIC_INC && in.operand_count_visible == 1 &&
                             (is_scalar_register(ops[0]) || is_scalar_memory(ops[0])));
         bool checked_cmp = m == ZYDIS_MNEMONIC_CMP && is_binary_rmw();
+        bool checked_and = m == ZYDIS_MNEMONIC_AND && is_binary_rmw();
+        bool checked_push = m == ZYDIS_MNEMONIC_PUSH && in.operand_count_visible == 1 && in.operand_width == 32 &&
+                            in.stack_width == 32 &&
+                            ((is_scalar_register(ops[0]) && ops[0].size == 32) ||
+                             (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                              (in.raw.imm[0].size == 8 || in.raw.imm[0].size == 32)));
+        bool checked_lea = m == ZYDIS_MNEMONIC_LEA && in.operand_count_visible == 2 &&
+                           is_scalar_register(ops[0]) && (ops[0].size == 16 || ops[0].size == 32) &&
+                           ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                           (in.address_width == 16 || in.address_width == 32) &&
+                           (ops[1].mem.base == ZYDIS_REGISTER_NONE || is_address_register(ops[1].mem.base)) &&
+                           (ops[1].mem.index == ZYDIS_REGISTER_NONE || is_address_register(ops[1].mem.index));
         bool checked_branch = in.meta.category == ZYDIS_CATEGORY_COND_BR && in.operand_count_visible == 1 &&
                               ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
         bool checked_ret = m == ZYDIS_MNEMONIC_RET && in.operand_count_visible <= 1 &&
                            (!in.operand_count_visible || ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE);
         bool locked = in.attributes & ZYDIS_ATTRIB_HAS_LOCK;
-        if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_cmp || checked_branch || checked_ret) ||
-            locked) {
+        if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_cmp || checked_and || checked_push ||
+              checked_lea || checked_branch || checked_ret) || locked) {
             Unimpl(va, in, ops);
             pending_.valid = false;
             return;

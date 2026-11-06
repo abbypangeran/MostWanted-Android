@@ -46,12 +46,14 @@ add_custom_target(generate_checked_fixture DEPENDS ${GENERATED_SOURCE})
 add_executable(checked_recompiler_tests
     fixture_runner.cpp
     ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
     ${GENERATED_SOURCE}
 )
 add_executable(checked_fault_handler_tests
     fault_handler_test.cpp
     ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
     ${XBE_SDK}/runtime/kernel/guest_strings.cpp
     ${XBE_SDK}/runtime/kernel/rtl.cpp

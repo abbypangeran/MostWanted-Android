@@ -114,9 +114,12 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
         case ZYDIS_MNEMONIC_MOVSX:
             emit(wr(0, "(" + T + ")(" + CType(ops[1].size, true) + ")(" + Read(ops[1], ea) + ")"));
             return true;
-        case ZYDIS_MNEMONIC_LEA:
-            Line("\t" + RegWrite(ops[0].reg.value, AddrExpr(ops[1], false)));
+        case ZYDIS_MNEMONIC_LEA: {
+            std::string address = AddrExpr(ops[1], false);
+            if (an_.cfg.checked_memory && in.address_width == 16) address = "(uint16_t)(" + address + ")";
+            Line("\t" + RegWrite(ops[0].reg.value, address));
             return true;
+        }
         case ZYDIS_MNEMONIC_XCHG:
             if (mem) {
                 int r = mi == 0 ? 1 : 0;
@@ -139,7 +142,13 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             rmw(F("%s b = %s;", T.c_str(), rd(1).c_str()), "a | b", "cf = 0; of = 0; " + Szp(W));
             return true;
         case ZYDIS_MNEMONIC_AND:
-            rmw(F("%s b = %s;", T.c_str(), rd(1).c_str()), "a & b", "cf = 0; of = 0; " + Szp(W));
+            if (an_.cfg.checked_memory && mem) Line("\tX86_SAVE_FLAGS();");
+            {
+                std::string source = rd(1);
+                if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[1].imm.is_signed && ops[1].size < W)
+                    source = "(" + T + ")(" + CType(ops[1].size, true) + ")(" + Read(ops[1], ea) + ")";
+                rmw(F("%s b = %s;", T.c_str(), source.c_str()), "a & b", "cf = 0; of = 0; " + Szp(W));
+            }
             return true;
         case ZYDIS_MNEMONIC_XOR:
             rmw(F("%s b = %s;", T.c_str(), rd(1).c_str()), "a ^ b", "cf = 0; of = 0; " + Szp(W));
@@ -428,6 +437,15 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
         case ZYDIS_MNEMONIC_STD: Line("\tctx.df = 1;"); return true;
 
         case ZYDIS_MNEMONIC_PUSH:
+            if (an_.cfg.checked_memory) {
+                std::string value = Read(ops[0], ea);
+                if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && in.raw.imm[0].size < in.operand_width)
+                    value = "(" + CType(in.raw.imm[0].size, true) + ")(" + value + ")";
+                Line(F("\t{ uint32_t v = (uint32_t)(%s); uint32_t next_esp = ctx.esp - 4; X86_SAVE_FLAGS(); "
+                       "x86_mem_write<uint32_t>(0x%Xu, next_esp, v); ctx.esp = next_esp; }",
+                       value.c_str(), va));
+                return true;
+            }
             if (ops[0].size == 16 && ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 emit(F("uint16_t v = (uint16_t)(%s); ctx.esp -= 2; X86_MEM16(ctx.esp) = v;", Read(ops[0], ea).c_str()));
             } else {

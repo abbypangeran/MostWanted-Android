@@ -63,7 +63,25 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0x83, 0x3E, 0xFF, 0xC3,       // cmp dword [esi], sign-extended -1; ret
         0x3B, 0x06, 0x73, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3,
         0x3B, 0x06, 0x7A, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3,
-        0x3B, 0x06, 0x7C, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3
+        0x3B, 0x06, 0x7C, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3,
+        0x56, 0xC3,                         // push esi; ret
+        0x6A, 0xFC, 0xC3,                   // push sign-extended imm8 -4; ret
+        0x68, 0x78, 0x56, 0x34, 0x12, 0xC3, // push imm32; ret
+        0x54, 0xC3,                         // push esp; ret
+        0xFF, 0x36, 0xC3,                   // push dword [esi]; ret (blocked checked shape)
+        0x56, 0x6A, 0xFC, 0xC3,             // push esi; push -4; ret
+        0x8D, 0x44, 0x08, 0x0F, 0xC3,       // lea eax, [eax+ecx+0x0F]; ret
+        0x8D, 0x44, 0xB3, 0xFC, 0xC3,       // lea eax, [ebx+esi*4-4]; ret
+        0x67, 0x8D, 0x47, 0x01, 0xC3,       // lea eax, [bx+1]; ret
+        0x21, 0xD8, 0xC3,                   // and eax, ebx; ret
+        0x83, 0xE0, 0x80, 0xC3,             // and eax, sign-extended -128; ret
+        0x21, 0x06, 0xC3,                   // and dword [esi], eax; ret
+        0x23, 0x06, 0xC3,                   // and eax, dword [esi]; ret
+        0x24, 0xF0, 0xC3,                   // and al, 0xF0; ret
+        0x66, 0x21, 0xD8, 0xC3,             // and ax, bx; ret
+        0x83, 0x26, 0x0F, 0xC3,             // and dword [esi], 0x0F; ret
+        0x21, 0xD8, 0x23, 0x0E, 0xC3,       // and eax, ebx; and ecx, [esi]; ret
+        0x21, 0xD8, 0x56, 0xC3              // and eax, ebx; push esi; ret
     };
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
@@ -169,7 +187,61 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "end = 0x1109B\n\n"
               "[[function]]\n"
               "at = 0x1109B\n"
-              "end = 0x110AB\n";
+              "end = 0x110AB\n\n"
+              "[[function]]\n"
+              "at = 0x110AB\n"
+              "end = 0x110AD\n\n"
+              "[[function]]\n"
+              "at = 0x110AD\n"
+              "end = 0x110B0\n\n"
+              "[[function]]\n"
+              "at = 0x110B0\n"
+              "end = 0x110B6\n\n"
+              "[[function]]\n"
+              "at = 0x110B6\n"
+              "end = 0x110B8\n\n"
+              "[[function]]\n"
+              "at = 0x110B8\n"
+              "end = 0x110BB\n\n"
+              "[[function]]\n"
+              "at = 0x110BB\n"
+              "end = 0x110BF\n\n"
+              "[[function]]\n"
+              "at = 0x110BF\n"
+              "end = 0x110C4\n\n"
+              "[[function]]\n"
+              "at = 0x110C4\n"
+              "end = 0x110C9\n\n"
+              "[[function]]\n"
+              "at = 0x110C9\n"
+              "end = 0x110CE\n\n"
+              "[[function]]\n"
+              "at = 0x110CE\n"
+              "end = 0x110D1\n\n"
+              "[[function]]\n"
+              "at = 0x110D1\n"
+              "end = 0x110D5\n\n"
+              "[[function]]\n"
+              "at = 0x110D5\n"
+              "end = 0x110D8\n\n"
+              "[[function]]\n"
+              "at = 0x110D8\n"
+              "end = 0x110DB\n\n"
+              "[[function]]\n"
+              "at = 0x110DB\n"
+              "end = 0x110DE\n\n"
+              "[[function]]\n"
+              "at = 0x110DE\n"
+              "end = 0x110E2\n\n"
+              "[[function]]\n"
+              "at = 0x110E2\n"
+              "end = 0x110E6\n\n"
+              "[[function]]\n"
+              "at = 0x110E6\n"
+              "end = 0x110EB\n\n"
+              "[[function]]\n"
+              "at = 0x110EB\n"
+              "end = 0x110EF\n";
     return bool(config);
 }
 

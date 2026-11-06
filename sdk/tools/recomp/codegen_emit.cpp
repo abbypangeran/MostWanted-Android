@@ -278,9 +278,11 @@ bool CodeGen::Run() {
     map += "const X86FuncMapping X86FuncMappings[] = {\n";
     for (uint32_t f : funcs) map += F("\t{0x%Xu, %s},\n", f, FuncName(f).c_str());
     map += "\t{0, nullptr},\n};\n";
+    map += F("const std::size_t X86FuncMappingCount = %zu;\n", funcs.size());
     map += "\nconst uint32_t X86Continuations[] = {\n";
     for (uint32_t c : an_.continuations) map += F("\t0x%Xu,\n", c);
     map += "\t0,\n};\n";
+    map += F("const std::size_t X86ContinuationCount = %zu;\n", an_.continuations.size());
     for (uint32_t f : absent) {
         map += F("\nX86_FUNC(__imp__%s) { %s(ctx, 0x%Xu, \"not in this image\"); }\n", FuncName(f).c_str(),
                  an_.cfg.checked_memory ? "x86_checked_trap" : "x86_trap", f);

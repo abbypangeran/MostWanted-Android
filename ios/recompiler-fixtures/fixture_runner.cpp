@@ -334,6 +334,246 @@ void CheckCmpTests(uint32_t destination) {
           "CMP permission test restores guest page");
 }
 
+struct AndFlags {
+    uint32_t cf, zf, sf, of, pf;
+};
+
+AndFlags ReferenceAndFlags(uint32_t left, uint32_t right, unsigned width) {
+    const uint32_t mask = width == 32 ? UINT32_MAX : (1u << width) - 1;
+    const uint32_t result = (left & right) & mask;
+    return {0, uint32_t(result == 0), (result >> (width - 1)) & 1, 0,
+            uint32_t(std::popcount(result & 0xFF) % 2 == 0)};
+}
+
+bool MatchesAndFlags(const X86Context& ctx, const AndFlags& flags) {
+    return ctx.cf == flags.cf && ctx.zf == flags.zf && ctx.sf == flags.sf && ctx.of == flags.of &&
+           ctx.pf == flags.pf;
+}
+
+bool SameCoreState(const X86Context& left, const X86Context& right) {
+    return left.eax == right.eax && left.ecx == right.ecx && left.edx == right.edx && left.ebx == right.ebx &&
+           left.esp == right.esp && left.ebp == right.ebp && left.esi == right.esi && left.edi == right.edi &&
+           left.cf == right.cf && left.zf == right.zf && left.sf == right.sf && left.of == right.of &&
+           left.pf == right.pf && left.af == right.af && left.df == right.df && left.xflags == right.xflags;
+}
+
+void SeedFlags(X86Context& ctx) {
+    ctx.cf = 1;
+    ctx.zf = 0;
+    ctx.sf = 1;
+    ctx.of = 1;
+    ctx.pf = 0;
+    ctx.af = 1;
+}
+
+void CheckPushLeaAndTests() {
+    constexpr uint32_t stack = 0x60000;
+    Check(mem::Commit(stack, mem::kPage), "checked PUSH fixture stack page commits");
+    X86Context ctx{};
+    ctx.esp = stack + 0x104;
+    ctx.esi = 0xAABBCCDD;
+    SeedFlags(ctx);
+    sub_000110AB(ctx, nullptr);
+    uint32_t word = 0;
+    Check(ctx.esp == stack + 0x104 && mem::Read(stack + 0x100, &word, sizeof(word)) == mem::AccessStatus::kOk &&
+              word == 0xAABBCCDD && ctx.cf == 1 && ctx.af == 1,
+          "PUSH register decrements 32-bit ESP, writes little-endian dword, and RET restores ESP");
+
+    ctx = X86Context{};
+    ctx.esp = stack + 0x114;
+    Check(Runs(sub_000110AD, ctx) && mem::Read(stack + 0x110, &word, sizeof(word)) == mem::AccessStatus::kOk &&
+              word == UINT32_MAX - 3,
+          "PUSH imm8 sign-extends -4 to a 32-bit stack value");
+    ctx = X86Context{};
+    ctx.esp = stack + 0x124;
+    Check(Runs(sub_000110B0, ctx) && mem::Read(stack + 0x120, &word, sizeof(word)) == mem::AccessStatus::kOk &&
+              word == 0x12345678,
+          "PUSH imm32 writes full little-endian value");
+    ctx = X86Context{};
+    ctx.esp = stack + 0x134;
+    const uint32_t esp_before = ctx.esp;
+    Check(Runs(sub_000110B6, ctx) && mem::Read(stack + 0x130, &word, sizeof(word)) == mem::AccessStatus::kOk &&
+              word == esp_before,
+          "PUSH ESP stores pre-decrement ESP value");
+    ctx = X86Context{};
+    ctx.esp = stack + 0x150;
+    ctx.esi = 0x10203040;
+    Check(Runs(sub_000110BB, ctx) && ctx.esp == stack + 0x14C &&
+              mem::Read(stack + 0x148, &word, sizeof(word)) == mem::AccessStatus::kOk && word == UINT32_MAX - 3 &&
+              mem::Read(stack + 0x14C, &word, sizeof(word)) == mem::AccessStatus::kOk && word == 0x10203040,
+          "repeated PUSH operations preserve LIFO stack contents");
+
+    constexpr uint32_t guard = 0x70000;
+    Check(mem::Commit(guard, mem::kPage), "PUSH guard fixture commits only upper stack page");
+    ctx = X86Context{};
+    ctx.esp = guard + 4;
+    ctx.esi = 0x55667788;
+    Check(Runs(sub_000110AB, ctx) && mem::Read(guard, &word, sizeof(word)) == mem::AccessStatus::kOk &&
+              word == 0x55667788,
+          "PUSH succeeds at committed stack boundary");
+
+    const auto check_push_fault = [&](uint32_t esp, uint32_t address, mem::AccessStatus status, const char* message) {
+        X86Context failed{};
+        failed.esp = esp;
+        failed.esi = 0xCAFEBABE;
+        SeedFlags(failed);
+        const X86Context before = failed;
+        Check(ThrowsMemoryFault(sub_000110AB, failed) && last_fault.instruction == 0x110AB &&
+                  last_fault.address == address && last_fault.status == status && last_fault.write &&
+                  SameCoreState(failed, before), message);
+    };
+    check_push_fault(guard, guard - 4, mem::AccessStatus::kUncommitted,
+                     "PUSH guard-page fault leaves ESP, registers, and flags unchanged");
+    check_push_fault(guard + 2, guard - 2, mem::AccessStatus::kUncommitted,
+                     "PUSH cross-page fault validates full dword before changing ESP");
+    Check(mem::Protect(guard, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
+          "PUSH read-only stack fixture protection set");
+    check_push_fault(guard + 4, guard, mem::AccessStatus::kPermissionDenied,
+                     "PUSH denied stack write preserves architectural state");
+    Check(mem::Protect(guard, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "PUSH stack protection restored");
+
+    ctx = X86Context{};
+    ctx.esp = guard + 4;
+    Check(ThrowsTrap(sub_000110B8, ctx) && last_trap_pc == 0x110B8 && ctx.esp == guard + 4,
+          "PUSH memory operand remains blocked until read/write ordering is supported");
+
+    ctx = X86Context{};
+    ctx.eax = 0xFFFFFFF0;
+    ctx.ecx = 0x30;
+    SeedFlags(ctx);
+    const uint32_t old_flags = ctx.cf | ctx.zf << 1 | ctx.sf << 2 | ctx.of << 3 | ctx.pf << 4 | ctx.af << 5;
+    Check(Runs(sub_000110BF, ctx) && ctx.eax == 0x2F &&
+              (ctx.cf | ctx.zf << 1 | ctx.sf << 2 | ctx.of << 3 | ctx.pf << 4 | ctx.af << 5) == old_flags,
+          "LEA computes base/index/displacement with 32-bit wrap and preserves flags without reading memory");
+    ctx = X86Context{};
+    ctx.ebx = 0x1000;
+    ctx.esi = 3;
+    Check(Runs(sub_000110C4, ctx) && ctx.eax == 0x1008,
+          "LEA applies SIB scale and signed displacement");
+    ctx = X86Context{};
+    ctx.ebx = 0x1234FFFF;
+    Check(Runs(sub_000110C9, ctx) && ctx.eax == 0,
+          "LEA address-size override wraps effective address to 16 bits");
+
+    ctx = X86Context{};
+    ctx.eax = 0xF0F0F0F0;
+    ctx.ebx = 0x0F0F0F0F;
+    SeedFlags(ctx);
+    AndFlags flags = ReferenceAndFlags(ctx.eax, ctx.ebx, 32);
+    const uint32_t old_af = ctx.af;
+    Check(Runs(sub_000110CE, ctx) && ctx.eax == 0 && MatchesAndFlags(ctx, flags) && ctx.af == old_af,
+          "AND register form updates defined flags and preserves undefined AF");
+    ctx = X86Context{};
+    ctx.eax = UINT32_MAX;
+    SeedFlags(ctx);
+    flags = ReferenceAndFlags(UINT32_MAX, UINT32_MAX - 127, 32);
+    Check(Runs(sub_000110D1, ctx) && ctx.eax == UINT32_MAX - 127 && MatchesAndFlags(ctx, flags) && ctx.af == 1,
+          "AND sign-extends imm8 -128 to dword result and flags");
+    ctx = X86Context{};
+    ctx.eax = 0xABCD00A5;
+    SeedFlags(ctx);
+    flags = ReferenceAndFlags(0xA5, 0xF0, 8);
+    Check(Runs(sub_000110DB, ctx) && ctx.eax == 0xABCD00A0 && MatchesAndFlags(ctx, flags) && ctx.af == 1,
+          "AND byte immediate preserves upper register bits and undefined AF");
+    ctx = X86Context{};
+    ctx.eax = 0xAAAAFFFF;
+    ctx.ebx = 0xBBBB000F;
+    SeedFlags(ctx);
+    flags = ReferenceAndFlags(0xFFFF, 0x000F, 16);
+    Check(Runs(sub_000110DE, ctx) && ctx.eax == 0xAAAA000F && MatchesAndFlags(ctx, flags) && ctx.af == 1,
+          "AND word register form preserves upper register bits and undefined AF");
+
+    constexpr uint32_t and_memory = 0x62000;
+    Check(mem::Commit(and_memory, mem::kPage), "AND memory fixture page commits");
+    uint32_t memory = 0xF0F0F0F0;
+    Check(mem::Write(and_memory, &memory, sizeof(memory)) == mem::AccessStatus::kOk,
+          "AND memory destination initializes");
+    ctx = X86Context{};
+    ctx.esi = and_memory;
+    ctx.eax = 0x0FF00FF0;
+    SeedFlags(ctx);
+    const uint32_t expected_memory = memory & ctx.eax;
+    flags = ReferenceAndFlags(memory, ctx.eax, 32);
+    Check(Runs(sub_000110D5, ctx) && mem::Read(and_memory, &memory, sizeof(memory)) == mem::AccessStatus::kOk &&
+              memory == expected_memory && MatchesAndFlags(ctx, flags) && ctx.af == 1,
+          "AND register to memory writes result and updates defined flags");
+
+    memory = 0x800000F0;
+    Check(mem::Write(and_memory + 4, &memory, sizeof(memory)) == mem::AccessStatus::kOk,
+          "AND memory source initializes");
+    ctx = X86Context{};
+    ctx.esi = and_memory + 4;
+    ctx.eax = UINT32_MAX;
+    SeedFlags(ctx);
+    flags = ReferenceAndFlags(ctx.eax, memory, 32);
+    Check(Runs(sub_000110D8, ctx) && ctx.eax == memory && MatchesAndFlags(ctx, flags) && ctx.af == 1,
+          "AND memory to register checks source read and sets flags");
+
+    uint32_t byte_memory = UINT32_MAX;
+    Check(mem::Write(and_memory + 8, &byte_memory, sizeof(byte_memory)) == mem::AccessStatus::kOk,
+          "AND memory immediate initializes");
+    ctx = X86Context{};
+    ctx.esi = and_memory + 8;
+    flags = ReferenceAndFlags(UINT32_MAX, 0x0F, 32);
+    Check(Runs(sub_000110E2, ctx) && mem::Read(and_memory + 8, &memory, sizeof(memory)) == mem::AccessStatus::kOk &&
+              memory == 0x0F && MatchesAndFlags(ctx, flags),
+          "AND memory immediate uses checked read-modify-write");
+
+    memory = 0x13579BDF;
+    Check(mem::Write(and_memory + 0x10, &memory, sizeof(memory)) == mem::AccessStatus::kOk,
+          "AND denied-write sentinel initializes");
+    Check(mem::Protect(and_memory, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
+          "AND destination page made read-only");
+    ctx = X86Context{};
+    ctx.esi = and_memory + 0x10;
+    ctx.eax = 0xFFFFFFFF;
+    SeedFlags(ctx);
+    const X86Context before_and_write_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000110D5, ctx) && last_fault.instruction == 0x110D5 &&
+              last_fault.address == and_memory + 0x10 && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              last_fault.write && SameCoreState(ctx, before_and_write_fault) &&
+              mem::Read(and_memory + 0x10, &memory, sizeof(memory)) == mem::AccessStatus::kOk &&
+              memory == 0x13579BDF,
+          "AND denied write preserves memory, destination registers, and prior flags");
+    Check(mem::Protect(and_memory, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "AND destination protection restored");
+
+    ctx = X86Context{};
+    ctx.eax = 0xF0;
+    ctx.ebx = 0x0F;
+    ctx.ecx = 0xAABBCCDD;
+    ctx.esi = 0x24000;
+    SeedFlags(ctx);
+    Check(ThrowsMemoryFault(sub_000110E6, ctx) && last_fault.instruction == 0x110E8 &&
+              last_fault.address == 0x24000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && ctx.eax == 0 && ctx.ecx == 0xAABBCCDD && ctx.cf == 0 && ctx.of == 0 &&
+              ctx.zf == 1 && ctx.sf == 0 && ctx.pf == 1 && ctx.af == 1,
+          "AND memory fault retains prior instruction results and flags in context");
+
+    ctx = X86Context{};
+    ctx.eax = 0xF0;
+    ctx.ebx = 0x0F;
+    ctx.esp = 0x24004;
+    ctx.esi = 0xCAFEBABE;
+    SeedFlags(ctx);
+    Check(ThrowsMemoryFault(sub_000110EB, ctx) && last_fault.instruction == 0x110ED &&
+              last_fault.address == 0x24000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              last_fault.write && ctx.eax == 0 && ctx.esp == 0x24004 && ctx.cf == 0 && ctx.zf == 1 &&
+              ctx.sf == 0 && ctx.of == 0 && ctx.pf == 1 && ctx.af == 1,
+          "PUSH fault preserves stack pointer and preceding AND flags");
+
+    ctx = X86Context{};
+    ctx.eax = 0x12345678;
+    ctx.esi = UINT32_MAX;
+    SeedFlags(ctx);
+    const X86Context before_and_read_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000110D8, ctx) && last_fault.instruction == 0x110D8 &&
+              last_fault.address == UINT32_MAX && last_fault.status == mem::AccessStatus::kInvalidAddress &&
+              !last_fault.write && SameCoreState(ctx, before_and_read_fault),
+          "AND invalid source span preserves guest state");
+}
+
 }  // namespace
 
 [[noreturn]] void x86_memory_fault(X86Context&, const X86MemoryFault& fault) {
@@ -508,6 +748,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
           "generated memory INC commits result while preserving carry flag");
 
     CheckCmpTests(destination);
+    CheckPushLeaAndTests();
 
     ctx = X86Context{};
     ctx.edi = destination;
