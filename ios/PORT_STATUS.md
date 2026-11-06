@@ -868,3 +868,44 @@ bash ./gradlew -PxbeGenerated="$PWD/.local/ios-port/phase2c6-entry-audit" :app:a
 ```
 
 **Next-stage decision: NO-GO for guest execution.** The synthetic preparation gate passes, but the Apple `Boot()` guard stays in place, direct CALL remains blocked, later instructions remain unsupported, and file/socket/object/critical-section/display/GPU/audio paths still expose raw or retained guest pointers. This checkpoint does not authorize guest execution, physical-device installation, merge, or release.
+
+## Phase 2C-7 checked CALL/RET and runtime access boundaries
+
+Verified on `feature/ios-port`, starting at `9bcb8e81e9c94eec3fd758fd836217f88edd85e3`. The Apple `Boot()` null-base guard is unchanged. The real Black Edition XBE was regenerated under ignored `.local/ios-port/phase2c7-entry-audit/` and statically inspected only; no real XBE instruction ran.
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `CHECKED_DIRECT_CALL` | **PASS (narrow support)** | Actual `xbe_recomp` output from the synthetic XBE tests direct relative 32-bit CALLs to mapped function entries. The checked helper writes the little-endian return address through `mem::Write` before changing ESP, records nested expected returns, and rejects unmapped or continuation targets before stack mutation. Indirect CALL, `CALL $+5`, and unsupported operand/target classes remain traps. Unchecked emission is unchanged. |
+| `CHECKED_RET_CONTINUATIONS` | **PASS (covered paths)** | Generated fixtures cover nested LIFO calls, the caller's generated post-call block, `RET`, `RET imm16`, corrupted return words, a valid synthetic `X86Resume` continuation, stale continuation rejection, and uncommitted CALL-write/RET-read faults. Fault fixtures check exact guest PC, address, direction, and status; production handlers log and abort. Xbox SEH recovery and real-game continuation behavior were not executed. |
+| `RUNTIME_POINTER_MIGRATION` | **PARTIAL** | Persisted-display CPU snapshot and contiguous `NtReadFile`/`NtWriteFile` buffers now use checked memory APIs. See raw paths and limits below. |
+| `ENTRY_SEQUENCE_AUDIT` | **PASS (static only)** | Regenerated checked output confirms blockers before the entry CALL and inside its target. This is not runtime reachability evidence. |
+| macOS ARM64 memory tests | **PASS** | Debug and Release CTests passed 1/1 each, including display allocation failure and checked file-transfer tests. |
+| Recompiler fixtures | **PASS** | Debug and Release CTests passed 2/2 each using generated synthetic-XBE code and production dispatch/memory helpers. |
+| iOS Simulator ARM64 | **PASS** | The memory/preparation app installed and ran on the iPhone 18 Pro simulator; it logged `memory tests: finished` with no `FAIL` assertions. Generated fixture execution was excluded from this app. |
+| iPhoneOS ARM64 | **PASS (unsigned compile/link)** | `mostwanted_memory_tests` built with signing disabled. It was not installed on a physical iPhone. |
+| Android | **PASS (build)** | `:app:assembleDebug` passed with Java 21 and NDK 28.2.13676358, using the fresh ignored Phase 2C-7 generated directory. Android runtime was not exercised. Android's SDK XML v4 compatibility message was nonfatal. |
+
+### Checked CALL/RET scope
+
+Checked mode accepts only direct relative 32-bit CALL instructions whose destination is a mapped generated function entry and is not an `X86Resume` continuation. Runtime dispatch repeats the check before writing the stack. After a successful checked stack write, the callee runs with a tracked expected return address; checked RET reads and validates that word before advancing ESP, then applies the optional 16-bit callee cleanup. Nested frames unwind in LIFO order. `CallGuest` uses a tracked host sentinel so checked guest RETs return to the host without dispatching the sentinel as guest code. `x86_resume` validates that its destination is a currently listed continuation before dispatch.
+
+The synthetic return path resumes at the generated caller's instruction following CALL; that is an in-function fallthrough, not an `X86Resume` table entry. A separate generated function validates the runtime's listed-continuation path. The fixture rejects a direct CALL to a continuation before touching ESP. Full guest exception/SEH behavior remains unverified. Indirect CALL, `CALL $+5`, unmapped direct targets, and targets classified as continuations remain blocked. The default unchecked emitter retains its prior CALL/RET behavior.
+
+### Regenerated real-game entry audit
+
+In checked output, `0x002B3916` now emits checked code through `PUSH` at `0x002B393F`, `LEA` at `0x002B3940`, `PUSH` at `0x002B3944`, `AND` at `0x002B3945`, and `PUSH -4` at `0x002B3948`. The next instruction is unsupported `POP ECX` at `0x002B394A`; later blockers before the direct CALL are `CDQ` at `0x002B3953`, `IDIV ECX` at `0x002B3954`, and `XOR ESI,ESI` at `0x002B395C`. Therefore the CALL at `0x002B396A` is not statically reachable along this checked entry path.
+
+The CALL target `0x002B5CA7` is a mapped generated function. If entered in isolation, its first blocker is `TEST EAX,EAX` at `0x002B5CAD`. Later emitted traps include `SHR ECX,2` at `0x002B5CC0`, memory-source PUSH instructions beginning at `0x002B5CCA`, indirect CALL `[0x003C9E68]` at `0x002B5CE0`, `TEST ECX,ECX` at `0x002B5CE8`, and `POP EBP` at `0x002B5D11`. `RET 0x18` at `0x002B5D12` is emitted as checked RET, but is not reachable through the current checked target path. The CALL's fallthrough is `0x002B396F` inside the same caller; the generated exception-continuation table contains only `0x000279CA`, an unrelated EH continuation. After a hypothetical return, more blocked direct calls occur at `0x002B397A` and `0x002B3980`, followed by blocked POPs at `0x002B3985–0x002B3986`.
+
+### Converted runtime APIs and remaining raw paths
+
+- `SavePersistedDisplay` now receives a guest virtual address. Its save helper validates the 32-bit range, 1–8 MiB pixel bound, and 1040-byte picture bound; it copies pixels with one checked `mem::Read`, then publishes a complete temporary file using flush, sync, and atomic replacement. Allocation, guest-read, write, or publication failure preserves the previous save. An injected `std::bad_alloc` test confirms allocation failure returns an error instead of escaping the caller.
+- This converts only the CPU snapshot. Both D3D persist callers first call `g_backend->Sync(data, bytes)`. On iOS, `native/vulkan.cpp::VulkanBackend::Sync` still copies readback rows through `kernel::HostPtr(data)` and raw `memcpy`; the Windows D3D12 backend has the same raw readback pattern. GPU readback is unconverted and untested, and the complete display-save route is therefore still unsafe for guest execution.
+- Contiguous synchronous `NtReadFile` and `NtWriteFile` now use bounded staging (64 MiB, inferred from the modeled Xbox RAM size). The complete guest span is preflighted, writes snapshot guest bytes before the host callback, and reads publish with one checked guest write after the host callback. Race tests cover concurrent decommit, permissions, overflow, partial host reads, host short-write counts, and no partial guest publication. This does not claim a maximum native Xbox request size was established.
+- `NtReadFileScatter`/`NtWriteFileGather` retain their raw scatter/gather path. IOSB/event/APC structures and other file exports still use raw guest access. Network buffers, guest objects/critical sections, RTL/interlocked paths, deferred audio/GPU buffers, and default-mode generated memory instructions also remain raw or retained. No guest object/critical-section change was made because atomic ownership could not be tested in this bounded phase.
+
+### Filesystem race and execution decision
+
+Tests use process-owned temporary directories and do not create or follow attacker-controlled links. The symlink replacement race remains. App-container paths on iOS are private to the app, but Android's configured `/storage/emulated/0/MostWanted` and removable-storage game directories are shared locations when `MANAGE_EXTERNAL_STORAGE` is granted. A concurrent writer can replace a path component between validation and open/rename. A portable repair would need descriptor-relative operations for the full file lifecycle plus separate Windows reparse-point handling; that exceeds this phase, so shared-path use remains unsafe under a concurrent untrusted writer.
+
+**Future restricted execution decision: NO-GO.** The entry stops at `POP ECX` before reaching the checked CALL, and the callee stops at `TEST EAX,EAX`. The synthetic preparation harness does not invoke production `Boot()` or combine launch/display imports with later startup stages; GPU/file/object/audio/network paths also remain unconverted. Preserve the Apple `Boot()` guard. No physical-device installation, real guest execution, merge to `main`, or customer release occurred.
