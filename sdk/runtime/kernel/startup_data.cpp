@@ -1,15 +1,105 @@
 #include "kernel/startup_data.h"
 
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <new>
+#include <system_error>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace kernel::startup_data {
 namespace {
 
 constexpr size_t kLaunchBytes = 0x1000;
 constexpr size_t kDisplayHeaderBytes = 7 * sizeof(uint32_t);
+constexpr size_t kMaxDisplayPixels = 0x800000;
+constexpr size_t kMaxDisplayPicture = 1040;
+
+bool WriteAtomically(const std::filesystem::path& path, const std::vector<uint8_t>& bytes, std::string& error) {
+    static std::atomic<uint64_t> sequence{0};
+    std::filesystem::path temporary;
+    FILE* file = nullptr;
+    for (unsigned attempt = 0; attempt < 32 && !file; ++attempt) {
+        temporary = path;
+        temporary += ".tmp." + std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+#ifdef _WIN32
+        const int descriptor = _wopen(temporary.c_str(), _O_CREAT | _O_EXCL | _O_BINARY | _O_WRONLY, _S_IREAD | _S_IWRITE);
+        if (descriptor >= 0) {
+            file = _fdopen(descriptor, "wb");
+            if (!file) {
+                const int failure = errno;
+                _close(descriptor);
+                std::error_code ignored;
+                std::filesystem::remove(temporary, ignored);
+                errno = failure;
+            }
+        }
+#else
+        int flags = O_CREAT | O_EXCL | O_WRONLY;
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        const int descriptor = open(temporary.c_str(), flags, 0666);
+        if (descriptor >= 0) {
+            file = fdopen(descriptor, "wb");
+            if (!file) {
+                const int failure = errno;
+                close(descriptor);
+                std::error_code ignored;
+                std::filesystem::remove(temporary, ignored);
+                errno = failure;
+            }
+        }
+#endif
+        if (!file && errno != EEXIST) break;
+    }
+    if (!file) {
+        error = "cannot create temporary display file: " + path.string();
+        return false;
+    }
+
+    bool ok = bytes.empty() || std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    if (std::fflush(file) != 0) ok = false;
+#ifdef _WIN32
+    if (ok && _commit(_fileno(file)) != 0) ok = false;
+#else
+    if (ok && fsync(fileno(file)) != 0) ok = false;
+#endif
+    if (std::fclose(file) != 0) ok = false;
+    if (!ok) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        error = "cannot write temporary display file: " + path.string();
+        return false;
+    }
+
+#ifdef _WIN32
+    ok = MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::error_code ec;
+    std::filesystem::rename(temporary, path, ec);
+    ok = !ec;
+#endif
+    if (!ok) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        error = "cannot publish display file: " + path.string();
+        return false;
+    }
+    return true;
+}
 
 ReadResult ReadFile(const std::filesystem::path& path, size_t limit, std::vector<uint8_t>& bytes, std::string& error) {
     std::error_code ec;
@@ -113,9 +203,7 @@ Result ImportLaunchData(const std::filesystem::path& path, uint32_t launch_data_
 Result ImportPersistedDisplay(const std::filesystem::path& path, DisplayState& state, std::string& error,
                               Operations operations) {
     error.clear();
-    constexpr size_t kMaxPixels = 0x800000;
-    constexpr size_t kMaxPicture = 1040;
-    constexpr size_t kMaxFile = kDisplayHeaderBytes + kMaxPixels + kMaxPicture;
+    constexpr size_t kMaxFile = kDisplayHeaderBytes + kMaxDisplayPixels + kMaxDisplayPicture;
     std::vector<uint8_t> bytes;
     const ReadResult read = Read(path, kMaxFile, bytes, error, operations);
     if (read == ReadResult::kMissing) return Result::kMissing;
@@ -130,7 +218,7 @@ Result ImportPersistedDisplay(const std::filesystem::path& path, DisplayState& s
     const uint32_t pixel_bytes = header[4], picture_bytes = header[6];
     const uint64_t allocation_bytes = uint64_t(0x40) + pixel_bytes;
     const uint64_t file_bytes = uint64_t(kDisplayHeaderBytes) + pixel_bytes + picture_bytes;
-    if (header[0] != kPersistMagic || !pixel_bytes || pixel_bytes > kMaxPixels || picture_bytes > kMaxPicture ||
+    if (header[0] != kPersistMagic || !pixel_bytes || pixel_bytes > kMaxDisplayPixels || picture_bytes > kMaxDisplayPicture ||
         header[5] > 1 || allocation_bytes > UINT32_MAX || file_bytes != bytes.size()) {
         error = "persisted-display metadata is invalid";
         return Result::kFailed;
@@ -174,6 +262,44 @@ Result ImportPersistedDisplay(const std::filesystem::path& path, DisplayState& s
     if (previous_allocation && previous_allocation != block) Release(previous_allocation, operations);
     RemoveSource(path, error);
     return Result::kImported;
+}
+
+bool ExportPersistedDisplay(const std::filesystem::path& path, uint32_t common, uint32_t format, uint32_t size,
+                            uint32_t guest_pixels, uint32_t pixel_bytes, bool marked, const std::string& picture,
+                            std::string& error, Operations operations) {
+    error.clear();
+    const uint64_t end = uint64_t(guest_pixels) + pixel_bytes;
+    if (!pixel_bytes || pixel_bytes > kMaxDisplayPixels || picture.size() > kMaxDisplayPicture ||
+        end > uint64_t(UINT32_MAX) + 1) {
+        error = "persisted-display data is outside supported bounds";
+        return false;
+    }
+
+    const size_t file_size = kDisplayHeaderBytes + pixel_bytes + picture.size();
+    std::vector<uint8_t> file;
+    try {
+        file = operations.allocate_display_file ? operations.allocate_display_file(file_size)
+                                                : std::vector<uint8_t>(file_size);
+    } catch (const std::bad_alloc&) {
+        error = "cannot allocate persisted-display save buffer";
+        return false;
+    }
+    if (file.size() != file_size) {
+        error = "cannot allocate persisted-display save buffer";
+        return false;
+    }
+    auto read_guest = operations.read_guest ? operations.read_guest : &mem::Read;
+    const mem::AccessStatus status = read_guest(guest_pixels, file.data() + kDisplayHeaderBytes, pixel_bytes);
+    if (status != mem::AccessStatus::kOk) {
+        error = "persisted-display guest read failed: " + std::string(mem::StatusName(status));
+        return false;
+    }
+
+    const std::array<uint32_t, 7> header = {kPersistMagic, common, format, size, pixel_bytes, marked ? 1u : 0u,
+                                            uint32_t(picture.size())};
+    std::memcpy(file.data(), header.data(), kDisplayHeaderBytes);
+    std::memcpy(file.data() + kDisplayHeaderBytes + pixel_bytes, picture.data(), picture.size());
+    return WriteAtomically(path, file, error);
 }
 
 }  // namespace kernel::startup_data

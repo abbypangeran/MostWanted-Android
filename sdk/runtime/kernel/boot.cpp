@@ -72,15 +72,11 @@ bool ResolveKernelThunk(uint32_t ordinal, uint32_t& address, bool& implemented, 
 }
 }  // namespace
 
-void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const void* pixels, uint32_t bytes) {
-    if (FILE* f = std::fopen(PersistFile().c_str(), "wb")) {
-        uint32_t head[7] = {startup_data::kPersistMagic, common, format, size, bytes, g_mark,
-                             uint32_t(g_picture.size())};
-        std::fwrite(head, sizeof head, 1, f);
-        std::fwrite(pixels, 1, bytes, f);
-        std::fwrite(g_picture.data(), 1, g_picture.size(), f);
-        std::fclose(f);
-    }
+void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, uint32_t guest_pixels, uint32_t bytes) {
+    std::string error;
+    if (!startup_data::ExportPersistedDisplay(PersistFile(), common, format, size, guest_pixels, bytes, g_mark, g_picture,
+                                              error))
+        LOGW("boot: persisted-display save failed: %s", error.c_str());
 }
 
 void MarkPersistedDisplay() { g_mark = true; }

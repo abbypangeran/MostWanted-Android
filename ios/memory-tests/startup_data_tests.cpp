@@ -1,11 +1,14 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kernel/startup_data.h"
@@ -95,6 +98,11 @@ bool WriteFile(const fs::path& path, const std::vector<uint8_t>& bytes) {
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
     return bool(file);
+}
+
+std::vector<uint8_t> ReadFile(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
 }
 
 void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
@@ -282,6 +290,106 @@ void CheckDisplayImports(const fs::path& directory) {
     state = {};
 }
 
+mem::AccessStatus FailGuestRead(uint32_t, void*, size_t) { return mem::AccessStatus::kPermissionDenied; }
+
+std::vector<uint8_t> FailDisplayFileAllocation(size_t) { throw std::bad_alloc(); }
+
+void CheckDisplayExports(const fs::path& directory) {
+    constexpr uint32_t kPixels = 0x70000;
+    const fs::path display = directory / "display-save.bin";
+    const std::vector<uint8_t> original = DisplayFile(4, std::string("old\0", 4), 0);
+    Check(WriteFile(display, original), "display-save test preserves a seeded previous file");
+    Check(mem::Commit(kPixels, mem::kPage), "display-save guest pixel page commits");
+    const std::array<uint8_t, 4> pixels = {0x20, 0x21, 0x22, 0x23};
+    Check(mem::Write(kPixels, pixels.data(), pixels.size()) == mem::AccessStatus::kOk,
+          "display-save guest pixel bytes initialize");
+
+    std::string error;
+    Check(kernel::startup_data::ExportPersistedDisplay(display, 0xABCD0002, 0x11223344, 0x55667788, kPixels, 4, true,
+                                                        std::string("pic\0", 4), error, TestOperations()) &&
+              ReadFile(display) == DisplayFile(),
+          "display save copies checked guest pixels and preserves the persisted file format");
+    const std::vector<uint8_t> saved = ReadFile(display);
+
+    Operations fail_buffer_allocation;
+    fail_buffer_allocation.allocate_display_file = FailDisplayFileAllocation;
+    bool allocation_escaped = false;
+    bool allocation_exported = true;
+    try {
+        allocation_exported = kernel::startup_data::ExportPersistedDisplay(display, 1, 2, 3, kPixels, 4, false, "new",
+                                                                             error, fail_buffer_allocation);
+    } catch (const std::bad_alloc&) {
+        allocation_escaped = true;
+    }
+    Check(!allocation_exported && !allocation_escaped && error.find("allocate") != std::string::npos &&
+              ReadFile(display) == saved,
+          "display-save allocation failure returns an error and preserves the previous file");
+
+    Check(mem::Protect(kPixels, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk,
+          "display-save pixel page becomes inaccessible");
+    Check(!kernel::startup_data::ExportPersistedDisplay(display, 1, 2, 3, kPixels, 4, false, "new", error) &&
+              ReadFile(display) == saved,
+          "display-save permission failure leaves the previous file unchanged");
+    Check(mem::Protect(kPixels, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "display-save pixel page protection is restored");
+
+    Operations fail_read;
+    fail_read.read_guest = FailGuestRead;
+    Check(!kernel::startup_data::ExportPersistedDisplay(display, 1, 2, 3, kPixels, 4, false, "new", error, fail_read) &&
+              ReadFile(display) == saved,
+          "injected guest-read failure preserves the previous display file");
+    Check(!kernel::startup_data::ExportPersistedDisplay(display, 1, 2, 3, UINT32_MAX - 1, 4, false, "new", error) &&
+              ReadFile(display) == saved,
+          "display-save address overflow is rejected before replacing the file");
+    Check(!kernel::startup_data::ExportPersistedDisplay(display, 1, 2, 3, kPixels, 0x800001, false, "new", error) &&
+              ReadFile(display) == saved,
+          "display-save byte limit is checked before allocating a host buffer");
+
+    const fs::path blocked = directory / "display-save-directory";
+    Check(fs::create_directory(blocked), "display-save publication failure target is prepared");
+    const fs::path sentinel = blocked / "preserve.bin";
+    Check(WriteFile(sentinel, original), "display-save failure target sentinel is written");
+    Check(!kernel::startup_data::ExportPersistedDisplay(blocked, 1, 2, 3, kPixels, 4, false, "new", error) &&
+              ReadFile(sentinel) == original,
+          "failed atomic publication leaves the existing target contents intact");
+
+    mem::Decommit(kPixels, mem::kPage);
+
+    bool race_safe = true;
+    const std::vector<uint8_t> expected = DisplayFile();
+    for (unsigned i = 0; i < 8; ++i) {
+        const bool committed = mem::Commit(kPixels, mem::kPage);
+        const bool initialized = committed && mem::Write(kPixels, pixels.data(), pixels.size()) == mem::AccessStatus::kOk;
+        Check(initialized, "display-save race page is prepared");
+        if (!initialized) {
+            if (committed) mem::Decommit(kPixels, mem::kPage);
+            race_safe = false;
+            break;
+        }
+
+        const std::vector<uint8_t> before = ReadFile(display);
+        std::atomic<bool> start{false};
+        bool exported = false;
+        bool decommitted = false;
+        std::thread saver([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            exported = kernel::startup_data::ExportPersistedDisplay(display, 0xABCD0002, 0x11223344, 0x55667788, kPixels,
+                                                                      4, true, std::string("pic\0", 4), error);
+        });
+        std::thread decommitter([&] {
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            decommitted = mem::Decommit(kPixels, mem::kPage);
+        });
+        start.store(true, std::memory_order_release);
+        saver.join();
+        decommitter.join();
+
+        const std::vector<uint8_t> after = ReadFile(display);
+        race_safe &= decommitted && (exported ? after == expected : after == before);
+    }
+    Check(race_safe, "checked display snapshot races safely with guest-page decommit");
+}
+
 }  // namespace
 
 extern "C" int RunStartupDataTests() {
@@ -290,6 +398,7 @@ extern "C" int RunStartupDataTests() {
     if (directory.path().empty() || !mem::Init()) return 1;
     CheckLaunchImports(directory.path());
     CheckDisplayImports(directory.path());
+    CheckDisplayExports(directory.path());
     mem::Shutdown();
     return failures ? 1 : 0;
 }

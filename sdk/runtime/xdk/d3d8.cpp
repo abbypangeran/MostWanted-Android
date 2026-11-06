@@ -428,7 +428,7 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
     uint32_t pitch = ((size >> 24 & 0xFF) + 1) * 64, height = (size >> 12 & 0xFFF) + 1, bytes = pitch * height;
     uint32_t data = mem::VirtualFromPhysical(R32(front + 4));
     if (g_backend) g_backend->Sync(data, bytes);
-    kernel::SavePersistedDisplay(R32(front), R32(front + 0xC), size, HostPtr(data), bytes);
+    kernel::SavePersistedDisplay(R32(front), R32(front + 0xC), size, data, bytes);
     LOGI("d3d: PersistDisplay, %u bytes", bytes);
     return 0;
 }

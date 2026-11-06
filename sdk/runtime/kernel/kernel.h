@@ -264,7 +264,7 @@ const char* ImageExe(std::string xbe_path);
 extern std::string g_launch_file;
 // The display a title keeps up through a quick reboot (D3DDevice_PersistDisplay): its front buffer goes to a file
 // beside launch.bin, and the next instance finds it as a surface at AvGetSavedDataAddress.
-void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const void* pixels, uint32_t bytes);
+void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, uint32_t guest_pixels, uint32_t bytes);
 uint32_t SavedDataAddress();
 void SetSavedDataAddress(uint32_t surface);
 // one bit of note carried with the kept display to the next instance
