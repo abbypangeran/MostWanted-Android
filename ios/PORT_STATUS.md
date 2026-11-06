@@ -782,3 +782,89 @@ bash ./gradlew --no-daemon :app:assembleDebug
 - No physical iPhone installation, real Xbox guest instruction, `Boot()` path, `StartThread`, `CallGuest`, merge, or release was performed.
 
 **Next-stage recommendation: NO-GO for kernel initialization or game execution.** Keep the Apple `Boot()` null-base guard. CMP is covered, but the entry path next reaches unsupported stack/control operations, the complete kernel-preparation sequence is not isolated, and runtime/HLE raw guest pointers remain.
+
+## Phase 2C-6 deterministic preparation and checked stack instructions
+
+Verified on `feature/ios-port`, starting from `206e41ed239760cf404fc4ab270b0d2ae1a43b93`. The Apple `Boot()` null-base guard remains. No real game instruction ran; neither `StartThread` nor `CallGuest` was invoked. Generated game output and build products stayed under ignored `.local/ios-port/`; no game asset or generated game source was added to the change.
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `KERNEL_CLOCK_LIFECYCLE` | **PASS** | Synchronous kernel-data initialization is separate from a joinable clock worker. Tests cover repeated starts/stops, update failure, concurrent stop, shutdown races, stale-write prevention, and stop-before-memory teardown. |
+| `DISPATCH_PREPARATION` | **PASS** | Synthetic function/continuation metadata is bounded and validated; checked thunk patching covers invalid/unterminated data and rollback after a write mutates then fails. No mapped guest function ran. |
+| `FILESYSTEM_PREPARATION` | **PASS (scoped; see limit)** | Each filesystem context owns its maps; temporary-root tests cover five drive mappings, rollback, remount, cleanup, traversal and symlink escape checks. A symlink can still be replaced between path validation and open. |
+| `NON_EXECUTING_KERNEL_PREPARATION` | **PASS** | Two complete synthetic setup/teardown passes cover checked memory, XBE parse/prepare, synchronous kernel data, dispatch, import resolution/patching, temporary filesystem setup, and KPCR/ETHREAD/stack/TLS preparation. Injected XBE, kernel-data, and thunk-write failures roll back. No worker, guest thread, or guest callback remains after teardown. Optional launch/display data was not included in this combined harness; its checked import tests remain separately covered by Phase 2C-5. |
+| `CHECKED_ENTRY_INSTRUCTIONS` | **PUSH: PASS; LEA: PASS; AND: PASS; CALL: BLOCKED** | Generated synthetic fixtures pass semantic and fault checks in Debug and Release. The actual XBE output was regenerated and statically inspected: PUSH/LEA/AND now emit checked forms at the target entry addresses. Direct CALL remains a checked trap; see the required B4 fixture plan below. |
+| macOS ARM64 memory tests | **PASS** | Debug and Release CTests passed 1/1 each, including the preparation harness and injected failures. |
+| Recompiler fixture tests | **PASS** | `checked_recompiler_tests` and `checked_fault_handler_tests` passed 2/2 in both Debug and Release. These are synthetic guest snippets, not game code. |
+| iOS Simulator ARM64 | **PASS** | The memory-test app ran on the iPhone 18 Pro simulator and logged `memory tests: finished`; generated fixture execution was excluded from this app. |
+| iPhoneOS ARM64 | **PASS (compile/link)** | The memory-test target compiled and linked unsigned for ARM64 with signing disabled. It was not installed on a physical iPhone. |
+| Android `:app:assembleDebug` | **PASS (build)** | Java 21 and NDK 28.2.13676358 built successfully in 2m 11s using the fresh ignored Phase 2C-6 generated directory; the final-source rebuild after the lifecycle/rollback fixes passed in 45s. The first attempt against stale ignored `generated/game` failed at link because it lacked the newly emitted count constants; the local retry passed. Android runtime was not exercised. SDK XML v4 and an SDL sensor deprecation warning were nonfatal. |
+
+### Preparation and instruction findings
+
+`InitKernelData()` now performs only synchronous, checked guest-memory initialization. `StartKernelClock()` separately starts one owned worker after preparation; stop joins it before memory shutdown. A memory lifecycle gate prevents a new worker from racing with initialization or shutdown. The update callback stops on its first failed checked write, and tests verify repeated initialization/teardown does not leave a writer attached to a later mapping.
+
+Dispatch consumes an explicit bounded metadata table rather than walking a zero-terminated generated array. Initialization rejects missing, duplicate, out-of-range, and oversized metadata and supports reset/reinitialization. Kernel thunk patching validates the file-backed thunk span, ordinal range and termination before accepting the table; a failed write restores the original slot, including a slot whose injected writer changed bytes before returning failure. `Boot()` checks every preparation stage and retains rollback on failure.
+
+Filesystem tests use a value-owned context rooted in temporary directories. Failed setup removes only directories created by that attempt and leaves the previous mappings intact. Resolution rejects path components and symlinks that escape the mapped root. There is a residual time-of-check/time-of-use window if another process replaces a symlink after resolution but before the host file API opens the path; descriptor-relative opens would be needed if concurrent untrusted writers are in scope.
+
+The actual checked-mode entry output at `0x002B393F–0x002B3948` now emits checked `PUSH ESI`, address-only `LEA EAX,[EAX+ECX+0x0F]`, `PUSH EDI`, `AND EAX,0xFFFFFFF0`, and sign-extended `PUSH -4`. Checked PUSH commits ESP only after a successful write; memory-source PUSH remains rejected. LEA does not dereference guest memory or change flags. AND updates defined flags and leaves undefined AF unchanged; fault fixtures verify guest-state preservation. CDQ, IDIV and XOR remain checked traps later in the same function. The direct CALL at `0x002B396A` remains blocked. The audit was static output inspection only and does not establish runtime reachability.
+
+### Direct CALL design plan (B4; implementation remains blocked)
+
+Before enabling direct CALL, add actual generated synthetic fixtures and require all of the following:
+
+1. A caller/callee fixture proves the 32-bit return address is written little-endian at `ESP - 4`, ESP changes only after a successful checked write, and the callee returns to the exact generated continuation.
+2. Nested caller/callee fixtures prove LIFO return-address order and correct continuation dispatch across multiple generated functions, including any emitted continuation/resume path.
+3. `RET` and `RET imm16` fixtures prove stack advancement and callee-cleanup semantics, and reject a return address that is not a valid mapped function/continuation for the active call.
+4. Injected write/read faults at uncommitted, read-only, guard, and boundary-crossing stack addresses prove guest registers/ESP remain consistent with the chosen x86 fault point; production fault-handler tests verify the reported guest PC/address/direction.
+5. Invalid target and continuation cases trap without null dispatch, stale continuation use, or host-stack escape. Audit the direct target and its reachable helper dependencies in generated output before the fixture can authorize support.
+
+The current generator still emits a checked trap for CALL. Existing `RET` behavior and `CallGuest` host-return handling are not evidence for checked guest CALL correctness. No CALL fixture was enabled and no game code ran.
+
+### Current startup pointer-safety ledger
+
+This table distinguishes preparation exercised in the synthetic harness from paths that require game execution or later services. The Apple guard keeps all later Boot rows unreachable on Apple.
+
+| Path | Phase 2C-6 status |
+| --- | --- |
+| Apple `Boot()` entry | **Guarded.** `mem::Base()` is null on Apple; Boot exits before XBE or generated-code access. |
+| XBE image, kernel data, dispatch and thunk preparation | **Checked and exercised** by the synthetic non-executing harness with rollback cases. |
+| Clock worker | **Owned and joined.** Its checked writes are covered by lifecycle and failure tests; startup remains guarded. |
+| Temporary filesystem mappings | **Scoped and tested.** Path traversal and symlink escape checks pass, with the replacement race above. No user save directory was used by tests. |
+| KPCR, ETHREAD, stack and TLS setup | **Prepared and checked** in the harness; no host guest thread was started. |
+| `SavePersistedDisplay` save side | **Raw pointer remains.** `src/d3d/d3d8.cpp` can pass guest pixels through `HostPtr()` to `SavePersistedDisplay`; this is not exercised during preparation. |
+| File and socket buffers | **Raw pointers remain** in `files.cpp` and `xnet.cpp` when runtime exports are called. Copy direction, access bounds and lifetime are not covered by this preparation checkpoint. |
+| Guest objects and critical sections | **Raw access remains** in `xboxkrnl.cpp` and related HLE paths through `G<T>()`/`HostPtr()`. |
+| Deferred GPU/audio pointers | **Raw or retained pointers remain** in graphics and sound services; asynchronous lifetime is not validated here. |
+| Guest thread start and kernel callbacks | **Not entered.** `StartThread`, `CallGuest`, direct CALL, and real guest instructions remain outside scope. |
+
+### Phase 2C-6 verification commands
+
+The following were run from the repository root. Simulator and device commands use the existing ignored build directories; no physical-device installation was performed.
+
+```sh
+# macOS ARM64 preparation harness, Debug and Release
+cmake --build .local/ios-port/memory-macos --config Debug --target mostwanted_memory_tests --parallel 8
+ctest --test-dir .local/ios-port/memory-macos -C Debug --output-on-failure
+cmake --build .local/ios-port/memory-macos --config Release --target mostwanted_memory_tests --parallel 8
+ctest --test-dir .local/ios-port/memory-macos -C Release --output-on-failure
+
+# checked instruction and fault fixtures, Debug and Release
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Debug --target checked_recompiler_tests checked_fault_handler_tests --parallel 8
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Debug --output-on-failure
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Release --target checked_recompiler_tests checked_fault_handler_tests --parallel 8
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Release --output-on-failure
+
+# simulator run and unsigned iPhoneOS ARM64 compile/link
+xcrun simctl launch --console-pty --terminate-running-process 43A6197F-AD68-48D4-84DB-6A147D89B8DC com.racas.mostwanted.memorytests
+cmake --build .local/ios-port/ios-device --config Debug --target mostwanted_memory_tests --parallel 8 -- CODE_SIGNING_ALLOWED=NO
+
+# Android, Java 21 and NDK 28.2.13676358; fresh local generated code is not tracked
+JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk \
+PATH=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin:$PATH \
+bash ./gradlew -PxbeGenerated="$PWD/.local/ios-port/phase2c6-entry-audit" :app:assembleDebug
+```
+
+**Next-stage decision: NO-GO for guest execution.** The synthetic preparation gate passes, but the Apple `Boot()` guard stays in place, direct CALL remains blocked, later instructions remain unsupported, and file/socket/object/critical-section/display/GPU/audio paths still expose raw or retained guest pointers. This checkpoint does not authorize guest execution, physical-device installation, merge, or release.
