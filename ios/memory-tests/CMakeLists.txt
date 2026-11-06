@@ -12,11 +12,13 @@ add_executable(mostwanted_memory_tests
     ../../sdk/runtime/kernel/kernel_thunks.cpp
     ../../sdk/runtime/kernel/filesystem_context.cpp
     ../../sdk/runtime/kernel/startup_data.cpp
+    ../../sdk/runtime/kernel/checked_file_transfer.cpp
     ../../sdk/runtime/kernel/guest_strings.cpp
     ../../sdk/runtime/xbe/image_loader.cpp
     memory_tests.cpp
     xbe_image_tests.cpp
     startup_data_tests.cpp
+    checked_file_transfer_tests.cpp
     clock_worker_tests.cpp
     dispatch_table_tests.cpp
     kernel_thunk_tests.cpp

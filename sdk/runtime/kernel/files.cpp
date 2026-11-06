@@ -9,6 +9,7 @@
 #include "kernel/filesystem_context.h"
 #include "kernel/kernel.h"
 #include "kernel/exports.h"
+#include "kernel/checked_file_transfer.h"
 
 namespace fs = std::filesystem;
 
@@ -373,8 +374,35 @@ static uint64_t Offset(File& f, uint32_t off) {
     return o >= 0 ? uint64_t(o) : f.pos;
 }
 
-// pages is the FILE_SEGMENT_ELEMENT array for scatter and gather, 0 for one buffer
-static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
+struct FileTransferIo {
+    File& file;
+    uint64_t position;
+};
+
+std::size_t ReadFileBytes(void* raw, uint8_t* destination, std::size_t size) {
+    auto& io = *static_cast<FileTransferIo*>(raw);
+    if (io.file.entry) return MountedDisc()->Read(*io.file.entry, io.position, destination, uint32_t(size));
+    return std::fread(destination, 1, size, io.file.fp);
+}
+
+std::size_t WriteFileBytes(void* raw, const uint8_t* source, std::size_t size) {
+    auto& io = *static_cast<FileTransferIo*>(raw);
+    return std::fwrite(source, 1, size, io.file.fp);
+}
+
+uint32_t FileTransferStatus(checked_file_transfer::Status status) {
+    switch (status) {
+        case checked_file_transfer::Status::kGuestMemory: return 0xC0000005;  // STATUS_ACCESS_VIOLATION
+        case checked_file_transfer::Status::kRequestTooLarge:
+        case checked_file_transfer::Status::kNoMemory: return kNoMemory;
+        case checked_file_transfer::Status::kHostContract: return kUnsuccessful;
+        case checked_file_transfer::Status::kOk: return kSuccess;
+    }
+    return kUnsuccessful;
+}
+
+// pages is the FILE_SEGMENT_ELEMENT array for scatter and gather; contiguous selects NtReadFile/NtWriteFile.
+static uint32_t Transfer(const Args& a, bool write, uint32_t pages, bool contiguous) {
     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
     auto f = FileFromHandle(h);
     if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
@@ -384,14 +412,26 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     uint64_t pos = Offset(*f, off);
     if (f->fp) Seek(f->fp, pos);
     uint32_t n = 0;
-    while (n < len) {
-        uint32_t at = pages ? R32(pages + n / 0x1000 * 8) + n % 0x1000 : buf + n;
-        uint32_t chunk = pages ? std::min(len - n, 0x1000 - n % 0x1000) : len;
-        size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
-                      : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
-                               : std::fread(HostPtr(at), 1, chunk, f->fp);
-        n += uint32_t(done);
-        if (done < chunk) break;
+    if (contiguous) {
+        FileTransferIo io{*f, pos};
+        auto result = write ? checked_file_transfer::WriteToHost(buf, len, &io, WriteFileBytes)
+                            : checked_file_transfer::ReadFromHost(buf, len, &io, ReadFileBytes);
+        if (result.status != checked_file_transfer::Status::kOk) {
+            // A failed read may have advanced FILE* before guest publication failed. Keep logical and host cursors at f.pos.
+            if (f->fp) Seek(f->fp, f->pos);
+            return Finish(*f, FileTransferStatus(result.status), 0, event, apc, apc_ctx, iosb);
+        }
+        n = result.transferred;
+    } else {
+        while (n < len) {
+            uint32_t at = pages ? R32(pages + n / 0x1000 * 8) + n % 0x1000 : buf + n;
+            uint32_t chunk = std::min(len - n, 0x1000 - n % 0x1000);
+            size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
+                          : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
+                                   : std::fread(HostPtr(at), 1, chunk, f->fp);
+            n += uint32_t(done);
+            if (done < chunk) break;
+        }
     }
     f->pos = pos + n;
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
@@ -399,11 +439,11 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
 }
 
-KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0); }
-KERNEL_EXPORT(236, NtWriteFile, 8) { return Transfer(a, true, 0); }
+KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0, true); }
+KERNEL_EXPORT(236, NtWriteFile, 8) { return Transfer(a, true, 0, true); }
 // the buffer argument is an array of one page per element
-KERNEL_EXPORT(220, NtReadFileScatter, 8) { return Transfer(a, false, a[5]); }
-KERNEL_EXPORT(237, NtWriteFileGather, 8) { return Transfer(a, true, a[5]); }
+KERNEL_EXPORT(220, NtReadFileScatter, 8) { return Transfer(a, false, a[5], false); }
+KERNEL_EXPORT(237, NtWriteFileGather, 8) { return Transfer(a, true, a[5], false); }
 
 KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
     uint32_t h = a[0], iosb = a[1], out = a[2], len = a[3], cls = a[4];
