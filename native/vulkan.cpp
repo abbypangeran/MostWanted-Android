@@ -39,6 +39,7 @@
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
 #include "host.h"
+#include "kernel/checked_gpu_transfer.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "vk_shader.h"
@@ -670,6 +671,26 @@ uint64_t MemSig(uint32_t data, uint32_t total, uint32_t whole_max = kSigWholeMax
     return sig;
 }
 
+bool MemSigChecked(uint32_t data, uint32_t total, uint64_t& result, uint32_t whole_max = kSigWholeMax) {
+    mem::ScopedLock lock;
+    if (mem::CheckAccess(data, total, mem::kRead) != mem::AccessStatus::kOk) return false;
+    uint64_t sig = Hash(&total, sizeof(total));
+    if (total <= whole_max) {
+        std::array<uint8_t, kSigWholeMax> snapshot{};
+        if (mem::Read(data, snapshot.data(), total) != mem::AccessStatus::kOk) return false;
+        result = Hash(snapshot.data(), total, sig);
+        return true;
+    }
+    std::array<uint8_t, kSigSampleBytes> sample{};
+    for (uint32_t i = 0; i < kSigSamples; i++) {
+        const uint32_t offset = uint32_t(uint64_t(total - kSigSampleBytes) * i / (kSigSamples - 1));
+        if (mem::Read(data + offset, sample.data(), sample.size()) != mem::AccessStatus::kOk) return false;
+        sig = Hash(sample.data(), sample.size(), sig);
+    }
+    result = sig;
+    return true;
+}
+
 bool Changed(const Target& t) {
     if (t.drawn || t.read.empty()) return false;
     uint32_t row = t.gw * 4, pitch = GuestPitch(t.gw);
@@ -1046,6 +1067,17 @@ private:
         uint64_t frame[kFrames] = {};
         uint64_t delivered = 0;
         uint32_t gw = 0, gh = 0, next = 0;
+        uint32_t guest_capacity = 0;
+    };
+    struct ReadBackRequest {
+        VulkanBackend* backend = nullptr;
+        Image* image = nullptr;
+        uint32_t width = 0, height = 0;
+        kernel::checked_gpu_transfer::Layout layout;
+    };
+    struct MappedReadbackRequest {
+        const uint8_t* pixels = nullptr;
+        std::size_t bytes = 0;
     };
 
     Frame& CurrentFrame() { return frames_[frame_ % kFrames]; }
@@ -1138,7 +1170,10 @@ private:
     bool DepthCopy(const State& s);
     bool Shrink(Image& src, uint32_t w, uint32_t h, Image& down, uint32_t taps = 1);
     Image* CopySource(Target& t, Image& down);
-    bool ReadBack(Image& im, uint32_t w, uint32_t h, std::vector<uint8_t>& out);
+    static std::size_t ReadBackToHost(void* context, uint8_t* destination, std::size_t capacity);
+    static std::size_t CopyMappedToHost(void* context, uint8_t* destination, std::size_t capacity);
+    bool ReadBack(Image& im, uint32_t w, uint32_t h, const kernel::checked_gpu_transfer::Layout& layout,
+                  uint8_t* destination, std::size_t capacity);
 
     // draws
     void EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh);
@@ -3094,19 +3129,47 @@ Image* VulkanBackend::CopySource(Target& t, Image& down) {
 }
 
 // a copy source to the CPU, rows packed; waits for the GPU
-bool VulkanBackend::ReadBack(Image& im, uint32_t w, uint32_t h, std::vector<uint8_t>& out) {
+bool VulkanBackend::ReadBack(Image& im, uint32_t w, uint32_t h,
+                             const kernel::checked_gpu_transfer::Layout& layout, uint8_t* destination,
+                             std::size_t capacity) {
+    if (!destination || capacity != layout.source_bytes || layout.source_pitch != layout.row_bytes ||
+        layout.row_bytes != std::size_t(w) * 4 || layout.source_bytes != layout.row_bytes * h)
+        return false;
     Buffer rb;
-    if (!CreateBuffer(rb, VkDeviceSize(w) * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) return false;
+    if (!CreateBuffer(rb, layout.source_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) return false;
     VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
     vkCmdCopyImageToBuffer(Cb(), im.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.buf, 1, &c);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     vkCmdPipelineBarrier(Cb(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    if (!Submit(true, false)) return false;
-    out.assign(rb.mem.map, rb.mem.map + size_t(w) * h * 4);
+    if (!Submit(true, false)) {
+        Retire(rb);
+        return false;
+    }
+    if (!rb.mem.map) {
+        Destroy(rb);
+        return false;
+    }
+    std::memcpy(destination, rb.mem.map, capacity);
     Destroy(rb);
     return true;
+}
+
+std::size_t VulkanBackend::ReadBackToHost(void* context, uint8_t* destination, std::size_t capacity) {
+    auto& request = *static_cast<ReadBackRequest*>(context);
+    if (!request.backend || !request.image || capacity != request.layout.source_bytes) return 0;
+    return request.backend->ReadBack(*request.image, request.width, request.height, request.layout, destination,
+                                     capacity)
+               ? capacity
+               : 0;
+}
+
+std::size_t VulkanBackend::CopyMappedToHost(void* context, uint8_t* destination, std::size_t capacity) {
+    auto& request = *static_cast<MappedReadbackRequest*>(context);
+    if (!request.pixels || !destination || capacity != request.bytes) return 0;
+    std::memcpy(destination, request.pixels, capacity);
+    return capacity;
 }
 
 // ---- draws
@@ -3793,28 +3856,36 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
 
 // ---- read-backs
 
-void VulkanBackend::Sync(uint32_t data, uint32_t) {
+void VulkanBackend::Sync(uint32_t data, uint32_t size) {
     if (gpu_failed_) return;
     auto it = targets_.find(TargetMapKey(data, false));
     if (it == targets_.end() || !it->second.drawn) return;
     Target& t = it->second;
+    const std::size_t capacity = size ? std::min<std::size_t>(size, t.bytes) : t.bytes;
+    const auto layout = kernel::checked_gpu_transfer::MakeLayout(t.gw, t.gh, std::size_t(t.gw) * 4, capacity);
+    if (layout.status != kernel::checked_gpu_transfer::Status::kOk) return;
     Image down;
     Image* src = CopySource(t, down);
     std::vector<uint8_t> px;
-    bool ok = src && ReadBack(*src, t.gw, t.gh, px);
+    ReadBackRequest request{this, src, t.gw, t.gh, layout.layout};
+    const auto copied = src ? kernel::checked_gpu_transfer::Transfer(data, capacity, t.gw, t.gh,
+                                                                      layout.layout.source_pitch, &request,
+                                                                      ReadBackToHost, px)
+                            : kernel::checked_gpu_transfer::Result{kernel::checked_gpu_transfer::Status::kReadbackFailure};
     Retire(down);  // kept until its recorded use has safely finished
-    if (!ok) return;
-    uint32_t pitch = GuestPitch(t.gw);
-    uint8_t* guest = static_cast<uint8_t*>(kernel::HostPtr(data));
-    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * pitch, &px[size_t(y) * t.gw * 4], t.gw * 4);
+    if (copied.status != kernel::checked_gpu_transfer::Status::kOk) return;
     t.read = std::move(px);
     t.drawn = false;
-    t.sig = MemSig(t.data, t.bytes);
+    uint64_t sig = 0;
+    if (MemSigChecked(t.data, t.bytes, sig)) t.sig = sig;
 }
 
 void VulkanBackend::SyncLate(uint32_t data) {
     if (gpu_failed_) return;
-    if (!DeliverLate(data)) Sync(data, 0);
+    if (!DeliverLate(data)) {
+        auto target = targets_.find(TargetMapKey(data, false));
+        if (target != targets_.end()) Sync(data, target->second.bytes);
+    }
     RecordLate(data);
 }
 
@@ -3824,6 +3895,8 @@ bool VulkanBackend::DeliverLate(uint32_t data) {
     auto it = late_.find(data);
     if (it == late_.end()) return false;
     Late& l = it->second;
+    const auto layout = kernel::checked_gpu_transfer::MakeLayout(l.gw, l.gh, std::size_t(l.gw) * 4, l.guest_capacity);
+    if (layout.status != kernel::checked_gpu_transfer::Status::kOk) return true;
     uint64_t done = Completed(), now = presents_seen_.load();
     int best = -1;
     for (int i = 0; i < kFrames; i++) {
@@ -3833,11 +3906,12 @@ bool VulkanBackend::DeliverLate(uint32_t data) {
     }
     if (best < 0) return false;
     if (l.fence[best] > l.delivered) {
-        const uint8_t* p = l.rb[best].mem.map;
-        uint32_t pitch = GuestPitch(l.gw);
-        uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
-        for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, p + size_t(y) * l.gw * 4, l.gw * 4);
-        l.delivered = l.fence[best];
+        MappedReadbackRequest request{l.rb[best].mem.map, layout.layout.source_bytes};
+        std::vector<uint8_t> pixels;
+        const auto copied = kernel::checked_gpu_transfer::Transfer(data, l.guest_capacity, l.gw, l.gh,
+                                                                    layout.layout.source_pitch, &request,
+                                                                    CopyMappedToHost, pixels);
+        if (copied.status == kernel::checked_gpu_transfer::Status::kOk) l.delivered = l.fence[best];
     }
     return true;
 }
@@ -3847,7 +3921,11 @@ void VulkanBackend::RecordLate(uint32_t data) {
     auto it = targets_.find(TargetMapKey(data, false));
     if (it == targets_.end()) return;
     Target& t = it->second;
-    t.sig = MemSig(t.data, t.bytes);
+    const auto layout = kernel::checked_gpu_transfer::MakeLayout(t.gw, t.gh, std::size_t(t.gw) * 4, t.bytes);
+    if (layout.status != kernel::checked_gpu_transfer::Status::kOk) return;
+    uint64_t sig = 0;
+    if (!MemSigChecked(t.data, t.bytes, sig)) return;
+    t.sig = sig;
     t.read.clear();
     std::lock_guard lock(late_lock_);
     Late& l = late_[data];
@@ -3858,11 +3936,12 @@ void VulkanBackend::RecordLate(uint32_t data) {
         l.gw = t.gw;
         l.gh = t.gh;
     }
+    l.guest_capacity = t.bytes;
     uint32_t slot = l.next;
     if (l.fence[slot] > Completed()) return;
     Image* src = CopySource(t, l.down);
     if (!src) return;
-    if (!l.rb[slot].buf && !CreateBuffer(l.rb[slot], VkDeviceSize(t.gw) * t.gh * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true))
+    if (!l.rb[slot].buf && !CreateBuffer(l.rb[slot], layout.layout.source_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true))
         return;
     EndRender();
     VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {t.gw, t.gh, 1}};
