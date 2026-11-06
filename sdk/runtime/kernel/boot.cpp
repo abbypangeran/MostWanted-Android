@@ -4,8 +4,11 @@
 #include <cstdlib>
 
 #include "app/app.h"
+#include "kernel/clock_worker.h"
 #include "kernel/kernel.h"
+#include "kernel/kernel_thunks.h"
 #include "kernel/startup_data.h"
+#include "cpu/dispatch_table.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -22,11 +25,6 @@
 #include "xbe/image_loader.h"
 
 extern const char kImageSha1[];
-
-namespace dispatch {
-void Init();
-uint32_t KernelThunkAddress(uint32_t ordinal);
-}  // namespace dispatch
 
 namespace xnet {
 void CloseSockets();  // xdk/xnet.cpp
@@ -63,6 +61,14 @@ void LoadPreviousRunData() {
     } else if (display == startup_data::Result::kFailed) {
         LOGW("boot: persisted display import failed; source preserved: %s", error.c_str());
     }
+}
+
+bool ResolveKernelThunk(uint32_t ordinal, uint32_t& address, bool& implemented, void*) {
+    if (ordinal >= 400) return false;
+    const uint32_t data = DataAddress(ordinal);
+    address = data ? data : dispatch::KernelThunkAddress(ordinal);
+    implemented = HasExport(ordinal);
+    return address != 0;
 }
 }  // namespace
 
@@ -117,31 +123,45 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     g_image = &g_xbe;
     if (app::kGame.loaded) app::kGame.loaded();
 
-    if (!InitKernelData()) {
-        LOGE("boot: kernel data initialization failed");
+    bool filesystem_mounted = false;
+    auto rollback_image = [&] {
+        dispatch::Reset();
+        if (filesystem_mounted) {
+            ClearFilesystemMappings();
+            filesystem_mounted = false;
+        }
         g_image = nullptr;
         uint32_t image_base = img.base, image_size = 0;
         if (mem::FreeVirtual(image_base, image_size, mem::kMemRelease) != 0)
             LOGE("boot: could not roll back the prepared XBE image");
+    };
+
+    if (!InitKernelData()) {
+        LOGE("boot: kernel data initialization failed");
+        rollback_image();
         return false;
     }
-    dispatch::Init();
-
-    uint32_t missing = 0;
-    for (uint32_t slot = img.kernel_thunk;; slot += 4) {
-        uint32_t v = R32(slot);
-        if (!v) break;
-        uint32_t ord = v & 0x7FFFFFFF;  // high bit flags an import by ordinal
-        uint32_t data = DataAddress(ord);
-        W32(slot, data ? data : dispatch::KernelThunkAddress(ord));
-        if (!HasExport(ord)) {
-            LOGW("boot: kernel import %u (%s) has no implementation", ord, ExportName(ord));
-            missing++;
-        }
+    if (!dispatch::Init(err)) {
+        LOGE("boot: dispatch initialization failed: %s", err.c_str());
+        rollback_image();
+        return false;
     }
-    LOGI("boot: kernel imports resolved, %u missing", missing);
+    std::vector<uint32_t> missing;
+    if (!PatchKernelThunks(img, ResolveKernelThunk, nullptr, missing, err)) {
+        LOGE("boot: kernel thunk patching failed: %s", err.c_str());
+        rollback_image();
+        return false;
+    }
+    for (uint32_t ordinal : missing)
+        LOGW("boot: kernel import %u (%s) has no implementation", ordinal, ExportName(ordinal));
+    LOGI("boot: kernel imports resolved, %zu missing", missing.size());
 
-    MountDefaults(game_dir, data_dir);
+    if (!MountDefaults(game_dir, data_dir)) {
+        LOGE("boot: filesystem setup failed");
+        rollback_image();
+        return false;
+    }
+    filesystem_mounted = true;
 
     // a quick reboot into this title left optional launch and display data behind
     g_launch_file = data_dir + "/launch.bin";
@@ -149,9 +169,16 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
 
     uint32_t tls = 0;
     if (img.tls_addr) tls = ((img.tls.data_end - img.tls.data_start + img.tls.zero_fill + 15) & ~15u) + 4;
+    if (!StartKernelClock()) {
+        LOGE("boot: kernel clock worker could not start");
+        rollback_image();
+        return false;
+    }
     ThreadRef t = CreateThread(std::max<uint32_t>(img.stack_commit, 0x10000), tls, 0, img.entry, 0, false);
     if (!t) {
         LOGE("boot: guest thread initialization failed");
+        StopKernelClockWorker();
+        rollback_image();
         return false;
     }
     StartThread(t);
@@ -203,18 +230,21 @@ void Relaunch(const char* exe) {
     } else {
         LOGE("relaunch: cannot start %s.exe (%lu)", exe, GetLastError());
     }
+    StopKernelClockWorker();
     std::_Exit(0);
 #else
     char self[4096] = {};
     ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
     std::string path = std::string(self, n > 0 ? size_t(n) : 0);
     path = path.substr(0, path.find_last_of('/') + 1) + exe;
+    StopKernelClockWorker();
     execl(path.c_str(), path.c_str(), nullptr);
     std::_Exit(0);
 #endif
 }
 
 void Shutdown(int code) {
+    StopKernelClockWorker();
     LOGR("Exit (%d)", code);
     logx::Flush();
     std::_Exit(code);

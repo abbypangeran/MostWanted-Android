@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/log.h"
+#include "kernel/clock_worker.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -61,8 +62,12 @@ static bool IsPhysicalRange(uint64_t start, uint64_t end) {
 }
 
 bool Init() {
+    kernel::KernelMemoryLifecycle lifecycle;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (g_base) return !g_poisoned;
+    if (g_base) {
+        lifecycle.SetReady(!g_poisoned);
+        return !g_poisoned;
+    }
     const uint64_t size = 1ull << 32;
 #ifdef _WIN32
     HANDLE ram = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kPhysicalSize, nullptr);
@@ -136,6 +141,7 @@ bool Init() {
         LOGE("memory: could not reserve the 4 GB guest space");
         return false;
     }
+    lifecycle.SetReady(true);
     LOGI("memory: guest space at %p", static_cast<void*>(g_base));
     return true;
 }
@@ -506,6 +512,8 @@ static void EnsureRanges() {
 }
 
 void Shutdown() {
+    kernel::KernelMemoryLifecycle lifecycle;
+    lifecycle.StopWorker();
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (!g_base) return;
     const uint64_t size = 1ull << 32;

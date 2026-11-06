@@ -5,7 +5,9 @@
 #include <ctime>
 
 #include "app/app.h"
+#include "kernel/clock_worker.h"
 #include "kernel/crypto.h"
+#include "kernel/kernel_data_init.h"
 #include "kernel/exports.h"
 #include "xbe/image_loader.h"
 #include "xbe/xbe.h"
@@ -62,34 +64,9 @@ const xbe::Section* ImageSection(uint32_t address) {
     return &g_image->sections[offset / 56];
 }
 
-bool PutAnsi(uint32_t str, const char* text) {
-    size_t n = std::strlen(text);
-    if (n >= UINT16_MAX || str > UINT32_MAX - 8) return false;
-    std::vector<uint8_t> descriptor(9 + n, 0);
-    const uint16_t length = uint16_t(n), maximum = uint16_t(n + 1);
-    const uint32_t buffer = str + 8;
-    std::memcpy(descriptor.data(), &length, sizeof(length));
-    std::memcpy(descriptor.data() + 2, &maximum, sizeof(maximum));
-    std::memcpy(descriptor.data() + 4, &buffer, sizeof(buffer));
-    std::memcpy(descriptor.data() + 8, text, n + 1);
-    const auto status = mem::Write(str, descriptor.data(), descriptor.size());
-    if (status != mem::AccessStatus::kOk) {
-        LOGE("kernel: ANSI initialization at %08X failed: %s", str, mem::StatusName(status));
-        return false;
-    }
-    return true;
-}
-
 uint8_t& Irql() { return G<uint8_t>(Current()->kpcr + 0x24); }
 
 int64_t TimeoutArg(uint32_t ptr) { return ptr ? int64_t(R64(ptr)) : INT64_MAX; }
-
-// KSYSTEM_TIME: readers retry until High1Time equals High2Time
-void PutSystemTime(uint32_t va, uint64_t t) {
-    W32(va + 8, uint32_t(t >> 32));
-    W32(va, uint32_t(t));
-    W32(va + 4, uint32_t(t >> 32));
-}
 
 uint64_t InterruptTime() {
     using namespace std::chrono;
@@ -97,47 +74,68 @@ uint64_t InterruptTime() {
     return uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count() / 100);
 }
 
+struct KernelClockAddresses {
+    const uint32_t tick_count;
+    const uint32_t interrupt_time;
+    const uint32_t system_time;
+};
+
+bool WriteSystemTime(uint32_t address, uint64_t time) {
+    const uint32_t high = uint32_t(time >> 32), low = uint32_t(time);
+    return mem::Write(address + 8, &high, sizeof(high)) == mem::AccessStatus::kOk &&
+           mem::Write(address, &low, sizeof(low)) == mem::AccessStatus::kOk &&
+           mem::Write(address + 4, &high, sizeof(high)) == mem::AccessStatus::kOk;
+}
+
+bool UpdateKernelClock(void* context) {
+    const auto& addresses = *static_cast<const KernelClockAddresses*>(context);
+    static const auto start = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    const uint32_t tick = uint32_t(ms);
+    if (mem::Write(addresses.tick_count, &tick, sizeof(tick)) != mem::AccessStatus::kOk ||
+        !WriteSystemTime(addresses.interrupt_time, InterruptTime()) ||
+        !WriteSystemTime(addresses.system_time, uint64_t(Now100ns()))) {
+        LOGE("kernel: clock worker guest-memory update failed");
+        return false;
+    }
+    return true;
+}
+
+void* KernelClockContext() {
+    static KernelClockAddresses addresses{g_tick_count_va, DataAddress(120), DataAddress(154)};
+    return &addresses;
+}
+
 }  // namespace
 
 uint32_t g_tick_count_va = 0;
 uint32_t g_launch_data_page_va = 0;
+namespace {
+bool g_kernel_data_initialized = false;
+}
 
 bool InitKernelData() {
-    g_tick_count_va = DataAddress(156);
-    g_launch_data_page_va = DataAddress(164);
-    W32(DataAddress(164), 0);
-    uint32_t hw = DataAddress(322);
-    W32(hw, 0x00000020);
-    W8(hw + 4, 0xD3);  // GPU revision
-    W8(hw + 5, 0xB1);  // MCP revision
-    uint32_t ver = DataAddress(324);
-    W16(ver, 1);
-    W16(ver + 2, 0);
-    W16(ver + 4, 5838);
-    W16(ver + 6, 1);
-    if (!PutAnsi(DataAddress(326), "\\Device\\CdRom0\\default.xbe") ||
-        !PutAnsi(DataAddress(41), "RECOMP HARD DISK") || !PutAnsi(DataAddress(42), "0000000000000000"))
+    if (g_kernel_data_initialized && KernelClockWorkerRunning()) return true;
+    KernelDataLayout layout{DataAddress(164), DataAddress(322), DataAddress(324), DataAddress(326), DataAddress(41),
+                            DataAddress(42), DataAddress(40), DataAddress(356), DataAddress(357), DataAddress(89),
+                            DataAddress(157)};
+    std::string error;
+    if (!InitializeKernelData(layout, error)) {
+        g_kernel_data_initialized = false;
+        LOGE("kernel: data initialization failed: %s", error.c_str());
         return false;
-    W32(DataAddress(40), 3);
-    W32(DataAddress(356), 0);
-    // IDE_CHANNEL_OBJECT DeviceQueue.DeviceListHead, XAPI walks it to cancel file I/O
-    uint32_t queue = DataAddress(357) + 0x28;
-    W32(queue, queue);
-    W32(queue + 4, queue);
-    W8(DataAddress(89), 1);
-    W32(DataAddress(157), 10000);  // 1 ms in 100 ns units
-    // the start of the clock
-    std::thread([] {
-        auto start = std::chrono::steady_clock::now();
-        for (;;) {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-            W32(g_tick_count_va, uint32_t(ms));
-            PutSystemTime(DataAddress(120), InterruptTime());
-            PutSystemTime(DataAddress(154), uint64_t(Now100ns()));
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }).detach();
+    }
+    g_tick_count_va = DataAddress(156);
+    g_launch_data_page_va = layout.launch_data_page;
+    g_kernel_data_initialized = true;
     return true;
+}
+
+bool StartKernelClock() {
+    if (!g_kernel_data_initialized) return false;
+    const auto* addresses = static_cast<const KernelClockAddresses*>(KernelClockContext());
+    if (!addresses->tick_count || !addresses->interrupt_time || !addresses->system_time) return false;
+    return StartKernelClockWorker(UpdateKernelClock, const_cast<KernelClockAddresses*>(addresses));
 }
 
 // critical sections

@@ -232,6 +232,7 @@ ThreadRef CurrentRef();
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
 void RunDpcs(X86Context& ctx);
 bool InitKernelData();
+bool StartKernelClock();
 void LogGuestStack(X86Context& ctx, int words);
 X86Context& CurrentContext();
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
@@ -246,7 +247,8 @@ void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3
 std::vector<ThreadRef> Threads();
 
 // files
-void MountDefaults(const std::string& game_dir, const std::string& data_dir);
+bool MountDefaults(const std::string& game_dir, const std::string& data_dir);
+void ClearFilesystemMappings();
 bool CreateSymbolicLink(const std::string& link, const std::string& target);
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);

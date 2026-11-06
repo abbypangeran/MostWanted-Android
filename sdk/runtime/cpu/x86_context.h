@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 union X86Xmm {
@@ -35,5 +36,7 @@ struct X86FuncMapping {
 
 // produced by the recompiler
 extern const X86FuncMapping X86FuncMappings[];
+extern const std::size_t X86FuncMappingCount;
 extern const uint32_t X86Continuations[];  // zero terminated
+extern const std::size_t X86ContinuationCount;
 extern const uint32_t X86CodeBase, X86CodeEnd, X86ImageBase, X86ImageEnd, X86EntryPoint, X86KernelThunk;

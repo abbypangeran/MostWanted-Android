@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/log.h"
+#include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
 
@@ -18,9 +19,7 @@
 
 namespace {
 
-std::vector<X86Func*> g_table;  // one slot per code byte
-std::vector<bool> g_continuation;
-uint32_t g_lo = 0, g_hi = 0;
+dispatch::Table g_dispatch;
 
 struct Export {
     const char* name = nullptr;
@@ -36,22 +35,23 @@ constexpr uint32_t kKernelThunkBase = 0xFE000000;
 
 namespace dispatch {
 
-void Init() {
-    g_lo = X86CodeBase;
-    g_hi = X86CodeEnd;
-    g_table.assign(g_hi - g_lo, nullptr);
-    size_t n = 0;
-    for (const X86FuncMapping* m = X86FuncMappings; m->host; m++, n++)
-        if (m->guest >= g_lo && m->guest < g_hi) g_table[m->guest - g_lo] = m->host;
-    g_continuation.assign(g_hi - g_lo, false);
-    for (const uint32_t* c = X86Continuations; *c; c++)
-        if (*c >= g_lo && *c < g_hi) g_continuation[*c - g_lo] = true;
-    LOGI("dispatch: %zu functions over %08X..%08X", n, g_lo, g_hi);
+bool Init(std::string& error) {
+    const Metadata metadata{X86CodeBase, X86CodeEnd, X86EntryPoint,
+                            std::span<const X86FuncMapping>(X86FuncMappings, X86FuncMappingCount),
+                            std::span<const uint32_t>(X86Continuations, X86ContinuationCount)};
+    if (!g_dispatch.Initialize(metadata, error)) {
+        LOGE("dispatch: %s", error.c_str());
+        g_dispatch.Reset();
+        return false;
+    }
+    LOGI("dispatch: %zu functions over %08X..%08X", metadata.functions.size(), X86CodeBase, X86CodeEnd);
+    return true;
 }
 
+void Reset() { g_dispatch.Reset(); }
+
 X86Func* Find(uint32_t guest) {
-    if (guest >= g_lo && guest < g_hi) return g_table[guest - g_lo];
-    return nullptr;
+    return g_dispatch.Find(guest);
 }
 
 // host code the guest may call through a pointer gets an address in this range
@@ -67,13 +67,13 @@ uint32_t HostThunk(X86Func* fn) {
     return kHostThunkBase + uint32_t(g_host_thunks.size() - 1) * 4;
 }
 
-uint32_t KernelThunkAddress(uint32_t ordinal) { return kKernelThunkBase + ordinal * 4; }
+uint32_t KernelThunkAddress(uint32_t ordinal) { return ordinal < 400 ? kKernelThunkBase + ordinal * 4 : 0; }
 
 }  // namespace dispatch
 
 void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
     ctx.last_icall = target;
-    if (target >= g_lo && target < g_hi && g_continuation[target - g_lo]) throw X86Resume{target, ctx.esp};
+    if (g_dispatch.IsContinuation(target)) throw X86Resume{target, ctx.esp};
     if (X86Func* f = dispatch::Find(target)) {
         f(ctx, base);
         return;
@@ -102,7 +102,9 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
 
 void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r) {
     ctx.esp = r.esp;
-    dispatch::Find(r.target)(ctx, base);
+    X86Func* function = dispatch::Find(r.target);
+    if (!function) x86_trap(ctx, r.target, "continuation has no recompiled function");
+    function(ctx, base);
 }
 
 void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {

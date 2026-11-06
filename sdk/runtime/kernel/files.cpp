@@ -4,9 +4,9 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <map>
 
 #include "kernel/disc.h"
+#include "kernel/filesystem_context.h"
 #include "kernel/kernel.h"
 #include "kernel/exports.h"
 
@@ -16,15 +16,7 @@ namespace kernel {
 
 namespace {
 
-std::mutex g_links_lock;
-std::map<std::string, std::string> g_links;    // upper case "\??\D:" -> "\Device\CdRom0"
-std::map<std::string, fs::path> g_devices;     // upper case device -> host directory
-constexpr char kCdRom[] = "\\DEVICE\\CDROM0";
-
-std::string Upper(std::string s) {
-    for (char& c : s) c = char(std::toupper(uint8_t(c)));
-    return s;
-}
+filesystem::Context g_filesystem;
 
 std::string Normalize(std::string p) {
     std::replace(p.begin(), p.end(), '/', '\\');
@@ -35,35 +27,6 @@ std::string Normalize(std::string p) {
     }
     while (out.size() > 1 && out.back() == '\\') out.pop_back();
     return out;
-}
-
-// host lookup that ignores case on file systems that do not
-fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
-    fs::path cur = dir;
-    for (auto& part : parts) {
-        if (part.empty() || part == ".") continue;
-        if (part == "..") {
-            cur = cur.parent_path();
-            continue;
-        }
-        fs::path direct = cur / part;
-        std::error_code ec;
-        if (fs::exists(direct, ec)) {
-            cur = direct;
-            continue;
-        }
-        bool found = false;
-        std::string want = Upper(part);
-        for (auto& e : fs::directory_iterator(cur, ec)) {
-            if (Upper(e.path().filename().string()) == want) {
-                cur = e.path();
-                found = true;
-                break;
-            }
-        }
-        if (!found) cur = direct;
-    }
-    return cur;
 }
 
 struct File : Object {
@@ -171,40 +134,31 @@ void Complete(uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
 
 }  // namespace
 
-void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
-    std::lock_guard<std::mutex> lock(g_links_lock);
-    fs::path d = data_dir;
-    g_devices[kCdRom] = game_dir;
-    g_devices["\\DEVICE\\HARDDISK0\\PARTITION1"] = d / "E";
-    g_devices["\\DEVICE\\HARDDISK0\\PARTITION2"] = d / "C";
-    g_devices["\\DEVICE\\HARDDISK0\\PARTITION3"] = d / "X";
-    g_devices["\\DEVICE\\HARDDISK0\\PARTITION4"] = d / "Y";
-    g_devices["\\DEVICE\\HARDDISK0\\PARTITION5"] = d / "Z";
-    for (auto& [k, v] : g_devices) {
-        std::error_code ec;
-        fs::create_directories(v, ec);
+bool MountDefaults(const std::string& game_dir, const std::string& data_dir) {
+    std::string error;
+    if (!g_filesystem.MountDefaults(game_dir, data_dir, error)) {
+        LOGE("files: filesystem setup failed: %s", error.c_str());
+        return false;
     }
-    g_links["\\??\\D:"] = "\\Device\\CdRom0";
     const Disc* disc = MountedDisc();
     LOGI("files: D: is %s, hard disk under %s", disc ? disc->Path().string().c_str() : game_dir.c_str(), data_dir.c_str());
+    return true;
 }
 
+void ClearFilesystemMappings() { g_filesystem.Clear(); }
+
 bool CreateSymbolicLink(const std::string& link, const std::string& target) {
-    std::lock_guard<std::mutex> lock(g_links_lock);
-    g_links[Upper(Normalize(link))] = Normalize(target);
+    if (!g_filesystem.CreateSymbolicLink(link, target)) return false;
     LOGI("files: link %s -> %s", link.c_str(), target.c_str());
     return true;
 }
 
 bool DeleteSymbolicLink(const std::string& link) {
-    std::lock_guard<std::mutex> lock(g_links_lock);
-    return g_links.erase(Upper(Normalize(link))) != 0;
+    return g_filesystem.DeleteSymbolicLink(link);
 }
 
 std::string QuerySymbolicLink(const std::string& link) {
-    std::lock_guard<std::mutex> lock(g_links_lock);
-    auto it = g_links.find(Upper(Normalize(link)));
-    return it == g_links.end() ? std::string() : it->second;
+    return g_filesystem.QuerySymbolicLink(link);
 }
 
 namespace {
@@ -220,41 +174,12 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     if (root_handle) {
         if (auto f = FileFromHandle(root_handle)) p = Normalize(f->xbox + "\\" + p);
     }
-    if (p.size() >= 2 && p[1] == ':') p = "\\??\\" + p;
-    std::lock_guard<std::mutex> lock(g_links_lock);
-    for (int depth = 0; depth < 8; depth++) {
-        std::string up = Upper(p);
-        bool changed = false;
-        for (auto& [k, v] : g_links) {
-            if (up.compare(0, k.size(), k) == 0 && (up.size() == k.size() || up[k.size()] == '\\')) {
-                p = v + p.substr(k.size());
-                changed = true;
-                break;
-            }
-        }
-        if (!changed) break;
-    }
-    std::string up = Upper(p);
-    const std::pair<const std::string, fs::path>* best = nullptr;
-    for (auto& e : g_devices)
-        if (up.compare(0, e.first.size(), e.first) == 0 && (up.size() == e.first.size() || up[e.first.size()] == '\\'))
-            if (!best || e.first.size() > best->first.size()) best = &e;
-    if (!best) return {};
-    std::vector<std::string> parts;
-    std::string rest = p.substr(best->first.size());
-    size_t s = 0;
-    while (s < rest.size()) {
-        size_t e = rest.find('\\', s);
-        if (e == std::string::npos) e = rest.size();
-        if (e > s) parts.push_back(rest.substr(s, e - s));
-        s = e + 1;
-    }
-    // no Xbox name holds ':', and fs::path would take "D:" as a host drive
-    for (auto& part : parts)
-        if (part.find(':') != std::string::npos) return {};
-    if (best->first == kCdRom)
-        if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts)};
-    return {MatchCase(best->second, parts).string()};
+    filesystem::ResolvedPath resolved;
+    std::string error;
+    if (!g_filesystem.ResolvePath(p, resolved, error)) return {};
+    if (resolved.device == "\\DEVICE\\CDROM0")
+        if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(resolved.parts)};
+    return {resolved.host.string()};
 }
 
 // the disc image is read only: nothing on it is created, replaced or written

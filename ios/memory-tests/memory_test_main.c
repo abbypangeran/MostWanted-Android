@@ -5,6 +5,10 @@
 extern int RunMemoryTests(void);
 extern int RunXbeImageLoaderTests(const char *real_xbe_path);
 extern int RunStartupDataTests(void);
+extern int RunClockWorkerTests(void);
+extern int RunDispatchTableTests(void);
+extern int RunKernelThunkTests(void);
+extern int RunFilesystemSetupTests(void);
 extern int RunGuestMemoryPrototypeTests(void);
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
 extern int RunCheckedRecompilerFixtureTests(void);
@@ -21,6 +25,10 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     int failures = RunMemoryTests();
     failures += RunGuestMemoryPrototypeTests();
     failures += RunStartupDataTests();
+    failures += RunClockWorkerTests();
+    failures += RunDispatchTableTests();
+    failures += RunKernelThunkTests();
+    failures += RunFilesystemSetupTests();
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
     failures += RunCheckedRecompilerFixtureTests();
 #endif
