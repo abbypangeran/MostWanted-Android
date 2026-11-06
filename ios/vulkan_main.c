@@ -30,6 +30,8 @@ typedef struct AppState {
 
 static AppState app;
 
+extern int RunVulkanReadbackProbe(VkPhysicalDevice physical, VkDevice device, VkQueue queue, VkCommandPool pool);
+
 static bool VkOk(VkResult result, const char *operation) {
     if (result == VK_SUCCESS) return true;
     SDL_Log("vulkan: %s failed: VkResult %d", operation, (int)result);
@@ -496,6 +498,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     SDL_Log("SDL iOS Vulkan window initialized; driver=%s window=%u", SDL_GetCurrentVideoDriver(),
             SDL_GetWindowID(app.window));
     if (!CreateInstanceAndSurface() || !SelectPhysicalDevice() || !CreateDevice() || !CreateSwapchain())
+        return SDL_APP_FAILURE;
+    if (!RunVulkanReadbackProbe(app.physical_device, app.device, app.queue, app.command_pool))
         return SDL_APP_FAILURE;
     SDL_Log("iOS Vulkan bootstrap passed");
     return SDL_APP_CONTINUE;

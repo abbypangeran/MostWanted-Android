@@ -31,15 +31,23 @@ set_target_properties(MoltenVK::MoltenVK PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${MOLTENVK_DEP_DIR}/MoltenVK/MoltenVK/include"
 )
 
-add_executable(mostwanted_vulkan_ios MACOSX_BUNDLE ../vulkan_main.c)
+add_executable(mostwanted_vulkan_ios MACOSX_BUNDLE ../vulkan_main.c readback_probe.cpp
+    ../../sdk/runtime/core/log.cpp
+    ../../sdk/runtime/kernel/clock_worker.cpp
+    ../../sdk/runtime/kernel/memory.cpp
+    ../../sdk/runtime/kernel/checked_gpu_transfer.cpp)
 target_include_directories(mostwanted_vulkan_ios PRIVATE "${MOLTENVK_DEP_DIR}/MoltenVK/MoltenVK/include")
+target_include_directories(mostwanted_vulkan_ios PRIVATE ../../sdk/runtime)
+target_compile_features(mostwanted_vulkan_ios PRIVATE cxx_std_20)
 target_link_libraries(mostwanted_vulkan_ios PRIVATE SDL3::SDL3-static MoltenVK::MoltenVK c++
+    Threads::Threads
     "-framework Metal" "-framework Foundation" "-framework QuartzCore"
     "-framework CoreGraphics" "-framework IOSurface" "-framework UIKit")
 set_target_properties(mostwanted_vulkan_ios PROPERTIES
     MACOSX_BUNDLE_BUNDLE_NAME "Most Wanted Vulkan Bootstrap"
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/../Info.plist"
     XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "15.0"
+    XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_STANDARD "gnu++20"
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.racas.mostwanted.vulkan"
     XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1"
 )
