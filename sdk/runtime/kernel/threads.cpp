@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <new>
+#include <utility>
 
 #include "kernel/kernel.h"
 #include "kernel/thread_memory.h"
@@ -22,38 +24,68 @@ thread_local ThreadRef t_current;
 std::mutex g_threads_lock;
 std::vector<ThreadRef> g_threads;
 std::atomic<uint32_t> g_next_id{0x10};
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+std::atomic<ThreadPreparationFailPoint> g_thread_fail_point{ThreadPreparationFailPoint::kNone};
+std::atomic<uint32_t> g_worker_launch_count{0};
+
+bool FailAt(ThreadPreparationFailPoint point) {
+    auto expected = point;
+    return g_thread_fail_point.compare_exchange_strong(expected, ThreadPreparationFailPoint::kNone);
+}
+#endif
 
 // guest structures per thread
 constexpr uint32_t kKpcrSize = 0x400;
 constexpr uint32_t kEthreadSize = 0x200;
 
+void FreeGuestBlocks(Thread& t) {
+    if (t.ethread) mem::FreeSystem(t.ethread);
+    if (t.kpcr) mem::FreeSystem(t.kpcr);
+    if (t.stack_top) mem::FreeStack(t.stack_top);
+    t.ethread = t.kpcr = t.stack_top = t.stack_size = t.tls = 0;
+}
+
 bool SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
+    if (tls_size > UINT32_MAX - 3) return false;
     stack_size = std::max<uint32_t>(stack_size, 0x10000);
     tls_size = (tls_size + 3) & ~3u;
+    constexpr uint32_t kMaximumStackRequest = mem::kStackSize - 0x10000;
+    if (stack_size > kMaximumStackRequest - 0x1000 ||
+        tls_size > kMaximumStackRequest - 0x1000 - stack_size)
+        return false;
     t.stack_top = mem::AllocStack(stack_size + tls_size + 0x1000);
     t.stack_size = stack_size;
-#ifdef __APPLE__
     if (!t.stack_top) {
         LOGE("thread: guest stack allocation failed");
         return false;
     }
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+    if (FailAt(ThreadPreparationFailPoint::kAfterStack)) {
+        FreeGuestBlocks(t);
+        return false;
+    }
 #endif
     t.kpcr = mem::AllocSystem(kKpcrSize, 64);
-#ifdef __APPLE__
     if (!t.kpcr) {
         LOGE("thread: KPCR allocation failed");
-        mem::FreeStack(t.stack_top);
-        t.stack_top = 0;
+        FreeGuestBlocks(t);
+        return false;
+    }
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+    if (FailAt(ThreadPreparationFailPoint::kAfterKpcr)) {
+        FreeGuestBlocks(t);
         return false;
     }
 #endif
     t.ethread = mem::AllocSystem(kEthreadSize, 64);
-#ifdef __APPLE__
     if (!t.ethread) {
         LOGE("thread: ETHREAD allocation failed");
-        mem::FreeSystem(t.kpcr);
-        mem::FreeStack(t.stack_top);
-        t.kpcr = t.stack_top = 0;
+        FreeGuestBlocks(t);
+        return false;
+    }
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+    if (FailAt(ThreadPreparationFailPoint::kAfterEthread)) {
+        FreeGuestBlocks(t);
         return false;
     }
 #endif
@@ -63,10 +95,7 @@ bool SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     const auto status = InitializeThreadGuestMemory(t.kpcr, t.ethread, t.stack_top, stack_size, t.tls, t.id);
     if (status != mem::AccessStatus::kOk) {
         LOGE("thread: guest KPCR/ETHREAD initialization failed: %s", mem::StatusName(status));
-        mem::FreeSystem(t.ethread);
-        mem::FreeSystem(t.kpcr);
-        mem::FreeStack(t.stack_top);
-        t.ethread = t.kpcr = t.stack_top = t.tls = 0;
+        FreeGuestBlocks(t);
         return false;
     }
 #else
@@ -90,6 +119,15 @@ bool SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     return true;
 }
 
+bool ValidThreadSizes(uint32_t stack_size, uint32_t tls_size) {
+    if (tls_size > UINT32_MAX - 3) return false;
+    stack_size = std::max<uint32_t>(stack_size, 0x10000);
+    tls_size = (tls_size + 3) & ~3u;
+    constexpr uint32_t kMaximumStackRequest = mem::kStackSize - 0x10000;
+    return stack_size <= kMaximumStackRequest - 0x1000 &&
+           tls_size <= kMaximumStackRequest - 0x1000 - stack_size;
+}
+
 void InitContext(Thread& t, X86Context& ctx) {
     std::memset(&ctx, 0, sizeof(ctx));
     ctx.esp = (t.tls & ~15u) - 16;
@@ -100,9 +138,14 @@ void InitContext(Thread& t, X86Context& ctx) {
     t.ctx = &ctx;
 }
 
-void Register(const ThreadRef& t) {
+bool Register(const ThreadRef& t) {
     std::lock_guard<std::mutex> lock(g_threads_lock);
-    g_threads.push_back(t);
+    try {
+        g_threads.push_back(t);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return true;
 }
 
 void Unregister(Thread* t) {
@@ -137,29 +180,52 @@ void NameHostThread(const char* name) {
 }
 
 // recompiled code nests host frames as deep as the guest's calls, give it room
-void Spawn(std::function<void()> fn) {
-    auto* f = new std::function<void()>(std::move(fn));
+template <class Function>
+bool Spawn(Function&& fn) {
+    std::unique_ptr<std::function<void()>> f;
+    try {
+        f = std::make_unique<std::function<void()>>(std::forward<Function>(fn));
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
 #ifdef _WIN32
     auto entry = [](void* p) -> DWORD {
         std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
         (*g)();
         return 0;
     };
-    HANDLE h = ::CreateThread(nullptr, 64u << 20, entry, f, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-    if (h) ::CloseHandle(h);
+    auto* raw = f.release();
+    HANDLE h = ::CreateThread(nullptr, 64u << 20, entry, raw, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (!h) {
+        f.reset(raw);
+        return false;
+    }
+    ::CloseHandle(h);
 #else
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 64u << 20);
+    if (pthread_attr_init(&attr)) return false;
+    if (pthread_attr_setstacksize(&attr, 64u << 20) ||
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)) {
+        pthread_attr_destroy(&attr);
+        return false;
+    }
     pthread_t th;
-    pthread_create(&th, &attr, [](void* p) -> void* {
+    auto* raw = f.release();
+    const int result = pthread_create(&th, &attr, [](void* p) -> void* {
         std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
         (*g)();
         return nullptr;
-    }, f);
-    pthread_detach(th);
+    }, raw);
     pthread_attr_destroy(&attr);
+    if (result) {
+        f.reset(raw);
+        return false;
+    }
 #endif
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+    ++g_worker_launch_count;
+#endif
+    return true;
 }
 
 }  // namespace
@@ -173,28 +239,114 @@ std::vector<ThreadRef> Threads() {
     return g_threads;
 }
 
-struct StartInfo {
-    uint32_t system_routine, start_routine, start_context;
-};
-static std::unordered_map<Thread*, StartInfo> g_start;
-static std::mutex g_start_lock;
-
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
                        uint32_t start_context, bool suspended) {
-    auto t = std::make_shared<Thread>();
+    ThreadRef t;
+    try {
+        t = std::make_shared<Thread>();
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
     t->id = g_next_id.fetch_add(4);
     if (!SetupGuestBlocks(*t, stack_size, tls_size)) return {};
-    Bind(t, t->ethread);
+    t->system_routine = system_routine;
+    t->start_routine = start_routine;
+    t->start_context = start_context;
+    if (!TryBind(t, t->ethread)) {
+        FreeGuestBlocks(*t);
+        return {};
+    }
     if (suspended) t->suspend = 1;
-    std::lock_guard<std::mutex> lock(g_start_lock);
-    g_start[t.get()] = {system_routine, start_routine, start_context};
     return t;
 }
 
-void StartThread(ThreadRef t) {
-    if (!t) return;
-    Register(t);
-    Spawn([t] {
+namespace {
+
+uint32_t PublishPreparedThread(const ThreadRef& t, uint32_t handle_out, uint32_t id_out) {
+    if (!t || t->state.load() != ThreadState::kPrepared) return kInvalidParameter;
+    if (handle_out && id_out && uint64_t(handle_out) < uint64_t(id_out) + 4 &&
+        uint64_t(id_out) < uint64_t(handle_out) + 4)
+        return kInvalidParameter;
+    mem::ScopedLock memory_lock;
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+    if (FailAt(ThreadPreparationFailPoint::kBeforePublish)) return kNoMemory;
+#endif
+    if ((handle_out && mem::CheckAccess(handle_out, sizeof(uint32_t), mem::kRead | mem::kWrite) != mem::AccessStatus::kOk) ||
+        (id_out && mem::CheckAccess(id_out, sizeof(uint32_t), mem::kRead | mem::kWrite) != mem::AccessStatus::kOk))
+        return kAccessViolation;
+
+    uint32_t handle = 0;
+    if (handle_out && !TryNewHandle(t, handle)) return kNoMemory;
+    t->handle_out = handle_out;
+    t->id_out = id_out;
+    t->published_handle = handle;
+    if (id_out) {
+        if (mem::Write(id_out, &t->id, sizeof(t->id)) != mem::AccessStatus::kOk) return kAccessViolation;
+        t->id_published = true;
+    }
+    if (handle_out) {
+        if (mem::Write(handle_out, &handle, sizeof(handle)) != mem::AccessStatus::kOk) return kAccessViolation;
+        t->handle_published = true;
+    }
+    return kSuccess;
+}
+
+void ClearPublishedOutputs(Thread& t) {
+    mem::ScopedLock memory_lock;
+    uint32_t value = 0;
+    if (t.handle_out && t.handle_published && t.published_handle &&
+        mem::Read(t.handle_out, &value, sizeof(value)) == mem::AccessStatus::kOk && value == t.published_handle) {
+        value = 0;
+        mem::Write(t.handle_out, &value, sizeof(value));
+    }
+    value = 0;
+    if (t.id_out && t.id_published && mem::Read(t.id_out, &value, sizeof(value)) == mem::AccessStatus::kOk && value == t.id) {
+        value = 0;
+        mem::Write(t.id_out, &value, sizeof(value));
+    }
+}
+
+}  // namespace
+
+uint32_t PrepareSystemThreadEx(uint32_t handle_out, uint32_t stack_size, uint32_t tls_size, uint32_t id_out,
+                               uint32_t start_routine, uint32_t start_context, bool suspended,
+                               uint32_t system_routine, ThreadRef& prepared) {
+    if (prepared) return kInvalidParameter;
+    if (!ValidThreadSizes(stack_size, tls_size)) return kInvalidParameter;
+    ThreadRef t = CreateThread(stack_size, tls_size, system_routine, start_routine, start_context, suspended);
+    if (!t) return kNoMemory;
+    const uint32_t status = PublishPreparedThread(t, handle_out, id_out);
+    if (status != kSuccess) {
+        CancelPreparedThread(t);
+        return status;
+    }
+    prepared = std::move(t);
+    return kSuccess;
+}
+
+bool CancelPreparedThread(const ThreadRef& t) {
+    if (!t) return false;
+    ThreadState expected = ThreadState::kPrepared;
+    if (!t->state.compare_exchange_strong(expected, ThreadState::kCancelled)) return false;
+    if (t->published_handle) CloseHandle(t->published_handle);
+    ClearPublishedOutputs(*t);
+    Unbind(std::static_pointer_cast<Object>(t));
+    FreeGuestBlocks(*t);
+    t->published_handle = t->handle_out = t->id_out = 0;
+    t->handle_published = t->id_published = false;
+    t->system_routine = t->start_routine = t->start_context = 0;
+    return true;
+}
+
+bool StartThread(ThreadRef t) {
+    if (!t) return false;
+    ThreadState expected = ThreadState::kPrepared;
+    if (!t->state.compare_exchange_strong(expected, ThreadState::kActive)) return false;
+    if (!Register(t)) {
+        t->state = ThreadState::kPrepared;
+        return false;
+    }
+    if (!Spawn([t] {
         t_current = t;
         char name[32];
         std::snprintf(name, sizeof(name), "guest %X", t->id);
@@ -205,40 +357,67 @@ void StartThread(ThreadRef t) {
             std::unique_lock<std::mutex> lock(t->apc_lock);
             t->resume_cv.wait(lock, [&] { return t->suspend.load() <= 0; });
         }
-        StartInfo si;
-        {
-            std::lock_guard<std::mutex> lock(g_start_lock);
-            si = g_start[t.get()];
-            g_start.erase(t.get());
-        }
-        LOGI("thread %X starts at %08X (%08X, %08X)", t->id, si.system_routine ? si.system_routine : si.start_routine,
-             si.start_routine, si.start_context);
+        LOGI("thread %X starts at %08X (%08X, %08X)", t->id,
+             t->system_routine ? t->system_routine : t->start_routine, t->start_routine, t->start_context);
         uint32_t code;
-        if (si.system_routine)
-            code = CallGuest(ctx, si.system_routine, {si.start_routine, si.start_context});
+        if (t->system_routine)
+            code = CallGuest(ctx, t->system_routine, {t->start_routine, t->start_context});
         else
-            code = CallGuest(ctx, si.start_routine, {si.start_context});
+            code = CallGuest(ctx, t->start_routine, {t->start_context});
         LOGI("thread %X returned %08X", t->id, code);
         MarkExited(*t, code);
+        t->state = ThreadState::kExited;
+        t->ctx = nullptr;
         Unregister(t.get());
         t_current.reset();
-    });
+    })) {
+        Unregister(t.get());
+        t->state = ThreadState::kPrepared;
+        return false;
+    }
+    return true;
 }
 
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+void SetThreadPreparationFailureForTest(ThreadPreparationFailPoint point) { g_thread_fail_point = point; }
+uint32_t ThreadWorkerLaunchCountForTest() { return g_worker_launch_count.load(); }
+#endif
+
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
-    auto t = std::make_shared<Thread>();
+    ThreadRef t;
+    try {
+        t = std::make_shared<Thread>();
+    } catch (const std::bad_alloc&) {
+        return;
+    }
     t->id = g_next_id.fetch_add(4);
     if (!SetupGuestBlocks(*t, 0x20000, 0x100)) return;
-    Bind(t, t->ethread);
-    std::string n = name;
-    Spawn([t, fn, n] {
+    if (!TryBind(t, t->ethread)) {
+        FreeGuestBlocks(*t);
+        return;
+    }
+    std::string n;
+    try {
+        n = name;
+    } catch (const std::bad_alloc&) {
+        Unbind(t);
+        FreeGuestBlocks(*t);
+        return;
+    }
+    t->state = ThreadState::kActive;
+    if (!Spawn([t, fn = std::move(fn), n = std::move(n)] {
         t_current = t;
         NameHostThread(n.c_str());
         X86Context ctx;
         InitContext(*t, ctx);
         fn(ctx);
+        t->state = ThreadState::kExited;
+        t->ctx = nullptr;
         t_current.reset();
-    });
+    })) {
+        Unbind(t);
+        FreeGuestBlocks(*t);
+    }
 }
 
 void ExitThread(uint32_t code) {
@@ -246,6 +425,8 @@ void ExitThread(uint32_t code) {
     if (t) {
         LOGI("thread %X exits with %08X", t->id, code);
         MarkExited(*t, code);
+        t->state = ThreadState::kExited;
+        t->ctx = nullptr;
         Unregister(t);
     }
     t_current.reset();

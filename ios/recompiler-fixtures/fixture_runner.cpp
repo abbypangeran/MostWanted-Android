@@ -17,7 +17,9 @@
 #include "x86_recomp_shared.h"
 
 namespace kernel {
+#ifndef MOSTWANTED_FIXTURE_EXTERNAL_G_BASE
 uint8_t* g_base = nullptr;
+#endif
 }
 
 namespace dispatch {
@@ -33,6 +35,52 @@ int traps = 0;
 X86MemoryFault last_fault{};
 uint32_t last_trap_pc = 0;
 std::string last_trap_reason;
+
+enum class Kernel255Mode { kAbiOnly, kPrepareThread, kBadCleanup, kBadReturnAddress };
+Kernel255Mode g_kernel255_mode = Kernel255Mode::kAbiOnly;
+std::array<uint32_t, 10> g_kernel255_args{};
+std::array<kernel::ThreadRef, 8> g_prepared_threads{};
+size_t g_prepared_thread_count = 0;
+uint32_t g_kernel255_calls = 0;
+constexpr uint32_t kKernel255Result = 0x13579BDF;
+
+void Kernel255FixtureHandler(X86Context& ctx, uint8_t*) {
+    ++g_kernel255_calls;
+    if (mem::Read(ctx.esp + 4, g_kernel255_args.data(), sizeof(g_kernel255_args)) != mem::AccessStatus::kOk) {
+        kernel::Return(ctx, kernel::kAccessViolation, 10);
+        return;
+    }
+    if (g_kernel255_mode == Kernel255Mode::kBadCleanup) {
+        ctx.eax = kKernel255Result;
+        ctx.esp += 4;
+        return;
+    }
+    if (g_kernel255_mode == Kernel255Mode::kBadReturnAddress) {
+        kernel::Return(ctx, kKernel255Result, 10);
+        const uint32_t invalid_return = 0xDEADBEEF;
+        mem::Write(ctx.esp - 44, &invalid_return, sizeof(invalid_return));
+        return;
+    }
+    if (g_kernel255_mode == Kernel255Mode::kPrepareThread) {
+        kernel::ThreadRef prepared;
+        const uint32_t status = kernel::PrepareSystemThreadEx(
+            g_kernel255_args[0], g_kernel255_args[2] ? g_kernel255_args[2] : 0x10000, g_kernel255_args[3],
+            g_kernel255_args[4], g_kernel255_args[5], g_kernel255_args[6], g_kernel255_args[7] & 0xFF,
+            g_kernel255_args[9], prepared);
+        if (status == kernel::kSuccess) {
+            if (g_prepared_thread_count < g_prepared_threads.size())
+                g_prepared_threads[g_prepared_thread_count++] = std::move(prepared);
+            else {
+                kernel::CancelPreparedThread(prepared);
+                kernel::Return(ctx, kernel::kNoMemory, 10);
+                return;
+            }
+        }
+        kernel::Return(ctx, status, 10);
+        return;
+    }
+    kernel::Return(ctx, kKernel255Result, 10);
+}
 
 __attribute__((noinline)) void LocalCopy(void* destination, const void* source, size_t size) {
     std::memcpy(destination, source, size);
@@ -813,6 +861,251 @@ void CheckIndirectCallTests() {
           "concurrent dispatch reset yields stable generated target or explicit uninitialized result");
 }
 
+void CheckKernel255AbiAndPreparationTests() {
+    constexpr uint32_t slot = 0x12000, stack_base = 0xA0000, top = 0xA1000, output = 0xA4000;
+    Check(mem::Commit(slot, mem::kPage) && mem::Commit(stack_base, 2 * mem::kPage) &&
+              mem::Commit(output, 4 * mem::kPage),
+          "ordinal-255 fixture slot, guest stack, and output pages commit");
+    const uint32_t sentinel = 0xAABBCCDD;
+    std::array<uint32_t, 10> args{output, 0x44, 0x10000, 0x40, output + 4, 0x111B2, 0x12345678, 0, 0,
+                                  0x111AC};
+    auto invoke = [&](uint32_t target, uint32_t stack, const std::array<uint32_t, 10>& values, bool write_args = true) {
+        Check(mem::Write(slot, &target, sizeof(target)) == mem::AccessStatus::kOk,
+              "ordinal-255 fixture target patches the generated import slot");
+        if (write_args) {
+            std::array<uint32_t, 11> frame{};
+            std::copy(values.begin(), values.end(), frame.begin());
+            frame.back() = sentinel;
+            Check(mem::Write(stack, frame.data(), sizeof(frame)) == mem::AccessStatus::kOk,
+                  "ordinal-255 fixture stack arguments initialize");
+        }
+        X86Context ctx{};
+        ctx.esp = stack;
+        SeedFlags(ctx);
+        traps = faults = 0;
+        bool completed = false;
+        try {
+            sub_0001119E(ctx, nullptr);
+            completed = true;
+        } catch (const FixtureStop&) {
+        }
+        return std::pair{completed, ctx};
+    };
+
+    const uint32_t import_ordinal = 0x800000FF;
+    const uint32_t calls_before_import = g_kernel255_calls;
+    const auto [import_completed, import_ctx] = invoke(import_ordinal, top, args);
+    Check(!import_completed && traps == 1 && last_trap_pc == 0x1119E &&
+              last_trap_reason.find("unknown") != std::string::npos && import_ctx.esp == top &&
+              g_kernel255_calls == calls_before_import,
+          "generated CALL rejects the original ordinal-encoded import before patching");
+
+    kernel::RegisterExport(255, "WrongExportName", Kernel255FixtureHandler);
+    Check(!dispatch::SetKernel255FixtureBridge(true),
+          "test bridge refuses ordinal 255 until its exact export name is registered");
+    const uint32_t thunk = dispatch::KernelThunkAddress(255);
+    const auto [unregistered_completed, unregistered_ctx] = invoke(thunk, top, args);
+    Check(!unregistered_completed && traps == 1 && last_trap_reason.find("kernel") != std::string::npos &&
+              unregistered_ctx.esp == top && g_kernel255_calls == calls_before_import,
+          "checked CALL rejects an unregistered ordinal-255 export without stack mutation");
+
+    kernel::RegisterExport(255, "PsCreateSystemThreadEx", Kernel255FixtureHandler);
+    Check(dispatch::SetKernel255FixtureBridge(true),
+          "test bridge authorizes only the registered PsCreateSystemThreadEx ordinal");
+    g_kernel255_mode = Kernel255Mode::kAbiOnly;
+    const auto [abi_completed, abi_ctx] = invoke(thunk, top, args);
+    Check(abi_completed && abi_ctx.eax == kKernel255Result && abi_ctx.esp == top + 44 &&
+              abi_ctx.cf == 1 && abi_ctx.zf == 0 && abi_ctx.sf == 1 && abi_ctx.of == 1 && abi_ctx.pf == 0 &&
+              abi_ctx.af == 1 && abi_ctx.checked_call == nullptr && abi_ctx.last_icall == thunk &&
+              g_kernel255_args == args,
+          "generated kernel CALL preserves flags, returns EAX, validates frame, and applies ten-argument stdcall cleanup");
+
+    const uint32_t calls_before_wrong_ordinal = g_kernel255_calls;
+    const auto [wrong_ordinal_completed, wrong_ordinal_ctx] = invoke(dispatch::KernelThunkAddress(254), top, args);
+    Check(!wrong_ordinal_completed && traps == 1 && wrong_ordinal_ctx.esp == top &&
+              g_kernel255_calls == calls_before_wrong_ordinal,
+          "checked bridge rejects the neighboring kernel ordinal");
+    const auto [mutated_completed, mutated_ctx] = invoke(thunk + 1, top, args);
+    Check(!mutated_completed && traps == 1 && mutated_ctx.esp == top &&
+              g_kernel255_calls == calls_before_wrong_ordinal,
+          "checked bridge rejects a misaligned mutated ordinal-255 thunk address");
+
+    Check(mem::Write(slot, &thunk, sizeof(thunk)) == mem::AccessStatus::kOk,
+          "exact ordinal-255 thunk restores before checked return-address test");
+    X86Context invalid_return{};
+    invalid_return.esp = top;
+    SeedFlags(invalid_return);
+    const X86Context invalid_return_before = invalid_return;
+    traps = 0;
+    try {
+        x86_checked_indirect_call(invalid_return, nullptr, slot, 0x90000, 0x1119E);
+    } catch (const FixtureStop&) {
+    }
+    Check(traps == 1 && last_trap_pc == 0x1119E && last_trap_reason.find("return address") != std::string::npos &&
+              SameCoreState(invalid_return, invalid_return_before) && invalid_return.checked_call == nullptr &&
+              g_kernel255_calls == calls_before_wrong_ordinal,
+          "checked kernel CALL rejects return addresses outside the generated guest code span before dispatch");
+
+    g_kernel255_mode = Kernel255Mode::kBadCleanup;
+    const auto [bad_cleanup_completed, bad_cleanup_ctx] = invoke(thunk, top, args);
+    Check(!bad_cleanup_completed && traps == 1 && last_trap_reason.find("stdcall") != std::string::npos &&
+              bad_cleanup_ctx.checked_call == nullptr,
+          "checked bridge rejects a test export with incorrect stdcall cleanup");
+    g_kernel255_mode = Kernel255Mode::kBadReturnAddress;
+    const auto [bad_return_completed, bad_return_ctx] = invoke(thunk, top, args);
+    Check(!bad_return_completed && traps == 1 && last_trap_reason.find("return address was modified") != std::string::npos &&
+              bad_return_ctx.checked_call == nullptr,
+          "checked bridge rejects a modified checked CALL return address");
+
+    const uint32_t uncommitted_top = 0xA2000;
+    const auto [bad_stack_completed, bad_stack_ctx] = invoke(thunk, uncommitted_top, args, false);
+    Check(!bad_stack_completed && faults == 1 && last_fault.instruction == 0x1119E &&
+              last_fault.address == uncommitted_top && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && bad_stack_ctx.esp == uncommitted_top &&
+              g_kernel255_calls == calls_before_wrong_ordinal + 2,
+          "checked bridge validates all ten argument words before invoking the export");
+    Check(mem::Protect(top, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk,
+          "ordinal-255 argument page becomes inaccessible");
+    const auto [denied_stack_completed, denied_stack_ctx] = invoke(thunk, top, args, false);
+    Check(!denied_stack_completed && faults == 1 && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              denied_stack_ctx.esp == top,
+          "checked bridge rejects a denied argument span before invoking the export");
+    Check(mem::Protect(top, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "ordinal-255 argument page permissions restore");
+
+    g_kernel255_mode = Kernel255Mode::kPrepareThread;
+    g_prepared_thread_count = 0;
+    const auto baseline = mem::Query();
+    const uint32_t workers_before = kernel::ThreadWorkerLaunchCountForTest();
+    std::array<uint32_t, 2> outputs{0xAAAAAAAA, 0xBBBBBBBB};
+    Check(mem::Write(output, outputs.data(), sizeof(outputs)) == mem::AccessStatus::kOk,
+          "thread preparation output sentinels initialize");
+    const auto [prepared_completed, prepared_ctx] = invoke(thunk, top, args);
+    uint32_t published_handle = 0, published_id = 0;
+    mem::Read(output, &published_handle, sizeof(published_handle));
+    mem::Read(output + 4, &published_id, sizeof(published_id));
+    const auto prepared_thread = g_prepared_threads[0];
+    Check(prepared_completed && prepared_ctx.eax == kernel::kSuccess && prepared_ctx.esp == top + 44 &&
+              g_prepared_thread_count == 1 && prepared_thread &&
+              prepared_thread->state.load() == kernel::ThreadState::kPrepared &&
+              prepared_thread->start_routine == args[5] && prepared_thread->start_context == args[6] &&
+              prepared_thread->system_routine == args[9] && published_handle != 0 &&
+              published_id == prepared_thread->id && kernel::FromHandle(published_handle).get() == prepared_thread.get() &&
+              kernel::IsPointerBoundForTest(prepared_thread->ethread, prepared_thread.get()) &&
+              kernel::Threads().empty() && kernel::ThreadWorkerLaunchCountForTest() == workers_before,
+          "ordinal-255 test service prepares and publishes a thread without activating a host worker or guest callback");
+    auto duplicate_output = prepared_thread;
+    const uint32_t duplicate_status = kernel::PrepareSystemThreadEx(
+        output, 0x10000, 0x20, output + 4, args[5], args[6], false, args[9], duplicate_output);
+    std::array<uint32_t, 2> after_duplicate{};
+    const bool duplicate_outputs_read = mem::Read(output, after_duplicate.data(), sizeof(after_duplicate)) ==
+                                       mem::AccessStatus::kOk;
+    Check(duplicate_status == kernel::kInvalidParameter && duplicate_output.get() == prepared_thread.get() &&
+              kernel::FromHandle(published_handle).get() == prepared_thread.get() && duplicate_outputs_read &&
+              after_duplicate[0] == published_handle && after_duplicate[1] == published_id,
+          "preparation rejects reuse of an occupied output reference without replacing its live thread");
+    const uint32_t prepared_stack = prepared_thread ? prepared_thread->stack_top : 0;
+    const uint32_t prepared_ethread = prepared_thread ? prepared_thread->ethread : 0;
+    Check(kernel::CancelPreparedThread(prepared_thread) &&
+              prepared_thread->state.load() == kernel::ThreadState::kCancelled &&
+              !kernel::FromHandle(published_handle) && kernel::ThreadWorkerLaunchCountForTest() == workers_before &&
+              !kernel::IsPointerBoundForTest(prepared_ethread, prepared_thread.get()) &&
+              !mem::IsCommitted(prepared_stack - 1) &&
+              kernel::Threads().empty() && mem::Query().system_used == baseline.system_used &&
+              mem::Read(output, outputs.data(), sizeof(outputs)) == mem::AccessStatus::kOk && outputs[0] == 0 &&
+              outputs[1] == 0 && !kernel::CancelPreparedThread(prepared_thread) &&
+              !kernel::StartThread(prepared_thread) && kernel::ThreadWorkerLaunchCountForTest() == workers_before,
+          "prepared thread cancellation closes its handle, clears owned outputs, frees guest blocks, and cannot repeat");
+    g_prepared_threads[0].reset();
+    duplicate_output.reset();
+    g_prepared_thread_count = 0;
+
+    auto failure = [&](std::array<uint32_t, 10> failure_args, kernel::ThreadPreparationFailPoint point,
+                       uint32_t expected_status, const char* description) {
+        const uint32_t old_workers = kernel::ThreadWorkerLaunchCountForTest();
+        const std::array<uint32_t, 2> sentinels{0xAAAAAAAA, 0xBBBBBBBB};
+        mem::Write(output, sentinels.data(), sizeof(sentinels));
+        kernel::SetThreadPreparationFailureForTest(point);
+        const auto [completed, failed_ctx] = invoke(thunk, top, failure_args);
+        std::array<uint32_t, 2> after{};
+        mem::Read(output, after.data(), sizeof(after));
+        Check(completed && failed_ctx.eax == expected_status && g_prepared_thread_count == 0 &&
+                  after == sentinels && mem::Query().system_used == baseline.system_used &&
+                  kernel::Threads().empty() && kernel::ThreadWorkerLaunchCountForTest() == old_workers,
+              description);
+    };
+
+    auto invalid_stack = args;
+    invalid_stack[2] = UINT32_MAX;
+    failure(invalid_stack, kernel::ThreadPreparationFailPoint::kNone, kernel::kInvalidParameter,
+            "oversized stack request fails before allocation or output publication");
+    auto invalid_tls = args;
+    invalid_tls[3] = UINT32_MAX;
+    failure(invalid_tls, kernel::ThreadPreparationFailPoint::kNone, kernel::kInvalidParameter,
+            "overflowing TLS request fails before allocation or output publication");
+    for (const auto [point, label] : {
+             std::pair{kernel::ThreadPreparationFailPoint::kAfterStack, "stack allocation rollback"},
+             std::pair{kernel::ThreadPreparationFailPoint::kAfterKpcr, "KPCR allocation rollback"},
+             std::pair{kernel::ThreadPreparationFailPoint::kAfterEthread, "ETHREAD allocation rollback"}}) {
+        const std::string description = std::string("injected ") + label + " frees all prepared resources";
+        failure(args, point, kernel::kNoMemory, description.c_str());
+    }
+    failure(args, kernel::ThreadPreparationFailPoint::kBeforePublish, kernel::kNoMemory,
+            "injected output publication failure after allocation rolls back the prepared thread");
+
+    auto invalid_output = args;
+    invalid_output[4] = uncommitted_top;
+    failure(invalid_output, kernel::ThreadPreparationFailPoint::kNone, kernel::kAccessViolation,
+            "uncommitted output page failure cancels preparation without publishing a handle");
+
+    const std::array<uint32_t, 2> write_only_sentinels{0xAAAAAAAA, 0xBBBBBBBB};
+    mem::Write(output, write_only_sentinels.data(), sizeof(write_only_sentinels));
+    const bool write_only_protected = mem::Protect(output, 4 * mem::kPage, mem::kWrite) == mem::AccessStatus::kOk;
+    kernel::ThreadRef write_only_output;
+    const uint32_t write_only_status = write_only_protected
+                                           ? kernel::PrepareSystemThreadEx(output, 0x10000, 0x20, output + 4,
+                                                                           args[5], args[6], false, args[9],
+                                                                           write_only_output)
+                                           : kernel::kNoMemory;
+    const bool write_only_restored = mem::Protect(output, 4 * mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk;
+    std::array<uint32_t, 2> write_only_after{};
+    Check(write_only_protected && write_only_restored && write_only_status == kernel::kAccessViolation &&
+              !write_only_output && mem::Read(output, write_only_after.data(), sizeof(write_only_after)) ==
+                                        mem::AccessStatus::kOk &&
+              write_only_after == write_only_sentinels && mem::Query().system_used == baseline.system_used &&
+              kernel::Threads().empty() && kernel::ThreadWorkerLaunchCountForTest() == workers_before,
+          "write-only output pages reject preparation before publication and rollback all allocations");
+
+    const std::array<uint32_t, 10> duplicate_args_a{output, 0, 0x10000, 0x20, output + 4, 0x111B2, 0x111AC, 0, 0,
+                                                    0x111AC};
+    const std::array<uint32_t, 10> duplicate_args_b{output + 8, 0, 0x10000, 0x20, output + 12, 0x111B2,
+                                                    0x22223333, 0, 0, 0x111AC};
+    g_prepared_thread_count = 0;
+    Check(mem::Write(output, outputs.data(), sizeof(outputs)) == mem::AccessStatus::kOk &&
+              mem::Write(output + 8, outputs.data(), sizeof(outputs)) == mem::AccessStatus::kOk,
+          "duplicate-preparation output regions initialize");
+    const auto [first_completed, first_ctx] = invoke(thunk, top, duplicate_args_a);
+    const auto [second_completed, second_ctx] = invoke(thunk, top, duplicate_args_b);
+    const auto first_thread = g_prepared_threads[0];
+    const auto second_thread = g_prepared_threads[1];
+    const bool duplicate_prepared = first_completed && second_completed && first_ctx.eax == kernel::kSuccess &&
+                                    second_ctx.eax == kernel::kSuccess && first_thread && second_thread &&
+                                    first_thread->id != second_thread->id &&
+                                    first_thread->stack_top != second_thread->stack_top &&
+                                    kernel::ThreadWorkerLaunchCountForTest() == workers_before &&
+                                    kernel::Threads().empty();
+    const bool both_cancelled = kernel::CancelPreparedThread(first_thread) &&
+                                kernel::CancelPreparedThread(second_thread);
+    Check(duplicate_prepared && both_cancelled && mem::Query().system_used == baseline.system_used &&
+              kernel::Threads().empty(),
+          "separate prepared calls own distinct resources and both cancel without worker activation");
+    g_prepared_threads[0].reset();
+    g_prepared_threads[1].reset();
+    g_prepared_thread_count = 0;
+    g_kernel255_mode = Kernel255Mode::kAbiOnly;
+    Check(dispatch::SetKernel255FixtureBridge(false), "ordinal-255 test-only bridge disables after fixture coverage");
+}
+
 void CheckPostCallInstructionTests() {
     X86Context ctx{};
     ctx.esp = 0x74000;
@@ -1526,6 +1819,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckEntryChainTests();
     CheckCalleeInstructionTests();
     CheckIndirectCallTests();
+    CheckKernel255AbiAndPreparationTests();
     CheckPostCallInstructionTests();
     CheckDispatchLeaseTests();
 

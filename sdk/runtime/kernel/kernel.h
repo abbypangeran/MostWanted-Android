@@ -35,6 +35,7 @@ enum : uint32_t {
     kNotImplemented = 0xC0000002,
     kInvalidHandle = 0xC0000008,
     kInvalidParameter = 0xC000000D,
+    kAccessViolation = 0xC0000005,
     kNoSuchFile = 0xC000000F,
     kEndOfFile = 0xC0000011,
     kNoMemory = 0xC0000017,
@@ -185,11 +186,17 @@ struct Object {
 using ObjectRef = std::shared_ptr<Object>;
 
 uint32_t NewHandle(ObjectRef obj);
+bool TryNewHandle(ObjectRef obj, uint32_t& handle);
 ObjectRef FromHandle(uint32_t handle);
 bool CloseHandle(uint32_t handle);
 uint32_t DuplicateHandle(uint32_t handle);
 ObjectRef FromPointer(uint32_t guest);  // dispatcher object in guest memory, created on first use
 void Bind(ObjectRef obj, uint32_t guest);
+bool TryBind(ObjectRef obj, uint32_t guest);
+void Unbind(const ObjectRef& obj);
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+bool IsPointerBoundForTest(uint32_t guest, const Object* obj);
+#endif
 ObjectRef FindNamed(const std::string& name);
 void AddNamed(const std::string& name, ObjectRef obj);
 
@@ -213,11 +220,16 @@ void SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, std
 bool CancelTimer(Object& timer);
 
 // threads
+enum class ThreadState : uint8_t { kPrepared, kActive, kExited, kCancelled };
 struct Thread : Object {
     uint32_t id = 0;
     uint32_t kpcr = 0, ethread = 0, stack_top = 0, stack_size = 0, tls = 0;
+    uint32_t system_routine = 0, start_routine = 0, start_context = 0, published_handle = 0;
+    uint32_t handle_out = 0, id_out = 0;
+    bool handle_published = false, id_published = false;
     uint32_t exit_code = 0;
     int priority = 0;
+    std::atomic<ThreadState> state{ThreadState::kPrepared};
     std::atomic<int> suspend{0};
     std::mutex apc_lock;
     std::deque<std::array<uint32_t, 4>> apcs;  // routine, arg1, arg2, arg3
@@ -237,7 +249,16 @@ void LogGuestStack(X86Context& ctx, int words);
 X86Context& CurrentContext();
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
                        uint32_t start_context, bool suspended);
-void StartThread(ThreadRef t);
+uint32_t PrepareSystemThreadEx(uint32_t handle_out, uint32_t stack_size, uint32_t tls_size, uint32_t id_out,
+                               uint32_t start_routine, uint32_t start_context, bool suspended,
+                               uint32_t system_routine, ThreadRef& prepared);
+bool CancelPreparedThread(const ThreadRef& t);
+bool StartThread(ThreadRef t);
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+enum class ThreadPreparationFailPoint : uint8_t { kNone, kAfterStack, kAfterKpcr, kAfterEthread, kBeforePublish };
+void SetThreadPreparationFailureForTest(ThreadPreparationFailPoint point);
+uint32_t ThreadWorkerLaunchCountForTest();
+#endif
 [[noreturn]] void ExitThread(uint32_t code);
 void Resume(Thread& t);
 uint32_t Suspend(Thread& t);  // previous count; another thread stops at its next kernel wait, delay or yield

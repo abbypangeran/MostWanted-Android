@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
@@ -27,6 +28,9 @@ struct Export {
     uint32_t data = 0;
 };
 Export g_exports[400];
+#ifdef MOSTWANTED_CHECKED_KERNEL_ABI_TESTS
+bool g_kernel255_fixture_bridge = false;
+#endif
 
 }  // namespace
 
@@ -105,6 +109,16 @@ uint32_t HostThunk(X86Func* fn) {
 
 uint32_t KernelThunkAddress(uint32_t ordinal) { return ordinal < 400 ? kKernelThunkBase + ordinal * 4 : 0; }
 
+#ifdef MOSTWANTED_CHECKED_KERNEL_ABI_TESTS
+bool SetKernel255FixtureBridge(bool enabled) {
+    if (enabled && (!g_exports[255].fn || !g_exports[255].name ||
+                    std::strcmp(g_exports[255].name, "PsCreateSystemThreadEx") != 0))
+        return false;
+    g_kernel255_fixture_bridge = enabled;
+    return true;
+}
+#endif
+
 ResolvedTarget ResolveTarget(uint32_t guest) {
     if (g_call_lease_depth) return ResolveTargetLocked(guest);
     std::shared_lock<std::shared_mutex> lock(g_dispatch_lock);
@@ -160,6 +174,48 @@ namespace {
 void CheckedCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
     dispatch::CallLease lease;
     const dispatch::ResolvedTarget resolved = lease.Resolve(target);
+#ifdef MOSTWANTED_CHECKED_KERNEL_ABI_TESTS
+    if (resolved.kind == dispatch::TargetKind::kKernelThunk && g_kernel255_fixture_bridge &&
+        target == kKernelThunkBase + 255 * 4) {
+        constexpr uint32_t kArgumentBytes = 10 * sizeof(uint32_t);
+        const uint32_t argument_address = ctx.esp;
+        if (return_address < g_dispatch.CodeBase() || return_address >= g_dispatch.CodeEnd())
+            x86_checked_trap(ctx, call_pc, "checked kernel CALL return address is outside generated code");
+        if (argument_address > UINT32_MAX - kArgumentBytes)
+            throw X86MemoryFault{call_pc, argument_address, mem::AccessStatus::kInvalidAddress, false};
+        mem::ScopedLock memory_lock;
+        const mem::AccessStatus args_status = mem::CheckAccess(argument_address, kArgumentBytes, mem::kRead);
+        if (args_status != mem::AccessStatus::kOk)
+            throw X86MemoryFault{call_pc, argument_address, args_status, false};
+        const Export& registered = g_exports[255];
+        if (!registered.fn || !registered.name || std::strcmp(registered.name, "PsCreateSystemThreadEx") != 0)
+            x86_checked_trap(ctx, call_pc, "checked kernel CALL ordinal 255 is not registered as PsCreateSystemThreadEx");
+
+        const uint32_t stack_address = ctx.esp - 4;
+        x86_mem_write<uint32_t>(call_pc, stack_address, return_address);
+        const uint32_t stdcall_esp = ctx.esp + kArgumentBytes;
+        X86CheckedCallFrame frame{ctx.checked_call, return_address, false};
+        ctx.checked_call = &frame;
+        struct RestoreFrame {
+            X86Context& ctx;
+            X86CheckedCallFrame& frame;
+            ~RestoreFrame() {
+                if (ctx.checked_call == &frame) ctx.checked_call = frame.previous;
+            }
+        } restore{ctx, frame};
+
+        ctx.esp = stack_address;
+        ctx.last_icall = target;
+        registered.fn(ctx, base);
+        if (ctx.esp != stdcall_esp)
+            x86_checked_trap(ctx, call_pc, "checked kernel CALL violated the 10-argument stdcall stack cleanup");
+        const uint32_t actual_return = x86_mem_read<uint32_t>(call_pc, stack_address);
+        if (actual_return != return_address)
+            x86_checked_trap(ctx, call_pc, "checked kernel CALL return address was modified");
+        frame.returned = true;
+        return;
+    }
+#endif
     if (resolved.kind != dispatch::TargetKind::kGeneratedFunction || !resolved.function) {
         char reason[128];
         std::snprintf(reason, sizeof(reason), "checked CALL target %08X rejected: %s", target,

@@ -52,7 +52,9 @@ add_executable(checked_recompiler_tests
     ${XBE_SDK}/runtime/core/log.cpp
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
     ${GENERATED_SOURCE}
     ${GENERATED_MAPPING}
 )
@@ -77,6 +79,8 @@ add_dependencies(checked_recompiler_tests generate_checked_fixture)
 target_compile_features(checked_recompiler_tests PRIVATE cxx_std_20)
 target_include_directories(checked_recompiler_tests PRIVATE ${XBE_SDK}/runtime ${GENERATED_DIR})
 target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_CHECKED_RECOMPILER_FIXTURE_CLI=1)
+target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_CHECKED_KERNEL_ABI_TESTS=1)
+target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_THREAD_PREPARATION_TESTS=1)
 target_link_libraries(checked_recompiler_tests PRIVATE Threads::Threads)
 if(BUILD_TESTING)
     add_test(NAME checked_recompiler_tests COMMAND checked_recompiler_tests)

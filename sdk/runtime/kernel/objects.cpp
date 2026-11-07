@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <new>
 #include <queue>
 
 #include "kernel/kernel.h"
@@ -41,6 +42,16 @@ uint32_t NewHandle(ObjectRef obj) {
     return h;
 }
 
+bool TryNewHandle(ObjectRef obj, uint32_t& handle) {
+    handle = 0;
+    try {
+        handle = NewHandle(std::move(obj));
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return handle != 0;
+}
+
 ObjectRef FromHandle(uint32_t handle) {
     if (handle == 0xFFFFFFFE) return CurrentRef();  // NtCurrentThread pseudo handle
     std::lock_guard<std::mutex> lock(g_handles_lock);
@@ -71,6 +82,36 @@ void Bind(ObjectRef obj, uint32_t guest) {
     g_by_ptr[guest] = {obj, serial};
     Stamp(guest, serial);
 }
+
+bool TryBind(ObjectRef obj, uint32_t guest) {
+    if (!obj || !guest) return false;
+    std::lock_guard<std::mutex> lock(g_ptr_lock);
+    uint32_t serial = g_serial++;
+    try {
+        g_by_ptr[guest] = {obj, serial};
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    obj->guest = guest;
+    Stamp(guest, serial);
+    return true;
+}
+
+void Unbind(const ObjectRef& obj) {
+    if (!obj || !obj->guest) return;
+    std::lock_guard<std::mutex> lock(g_ptr_lock);
+    auto it = g_by_ptr.find(obj->guest);
+    if (it != g_by_ptr.end() && it->second.obj.get() == obj.get()) g_by_ptr.erase(it);
+    obj->guest = 0;
+}
+
+#ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
+bool IsPointerBoundForTest(uint32_t guest, const Object* obj) {
+    std::lock_guard<std::mutex> lock(g_ptr_lock);
+    auto it = g_by_ptr.find(guest);
+    return it != g_by_ptr.end() && it->second.obj.get() == obj;
+}
+#endif
 
 ObjectRef FromPointer(uint32_t guest) {
     if (!guest) return nullptr;

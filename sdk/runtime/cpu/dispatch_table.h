@@ -14,6 +14,9 @@ bool Init(std::string& error);
 void Reset();
 uint32_t KernelThunkAddress(uint32_t ordinal);
 uint32_t HostThunk(X86Func* fn);
+#ifdef MOSTWANTED_CHECKED_KERNEL_ABI_TESTS
+bool SetKernel255FixtureBridge(bool enabled);
+#endif
 
 enum class TargetKind {
     kGeneratedFunction, kContinuation, kKernelThunk, kHostThunk, kNull, kUninitialized, kUnmapped, kUnknown

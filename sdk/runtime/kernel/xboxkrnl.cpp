@@ -701,7 +701,11 @@ KERNEL_EXPORT(246, ObReferenceObjectByHandle, 3) {
     if (!o) return kInvalidHandle;
     if (!o->guest) {
         uint32_t body = mem::AllocSystem(32);
-        Bind(o, body);
+        if (!body) return kNoMemory;
+        if (!TryBind(o, body)) {
+            mem::FreeSystem(body);
+            return kNoMemory;
+        }
     }
     W32(a[2], o->guest);
     return kSuccess;
@@ -817,14 +821,13 @@ KERNEL_EXPORT(153, KeSynchronizeExecution, 3) { return CallGuest(ctx, a[1], {a[2
 // threads
 
 KERNEL_EXPORT(255, PsCreateSystemThreadEx, 10) {
-    uint32_t handle_out = a[0], stack = a[2], tls = a[3], id_out = a[4], start = a[5], context = a[6];
-    bool suspended = a[7] & 0xFF;
-    uint32_t system = a[9];
-    ThreadRef t = CreateThread(stack ? stack : 0x10000, tls, system, start, context, suspended);
-    if (!t) return kNoMemory;
-    if (handle_out) W32(handle_out, NewHandle(t));
-    if (id_out) W32(id_out, t->id);
-    StartThread(t);
+    ThreadRef t;
+    uint32_t status = PrepareSystemThreadEx(a[0], a[2] ? a[2] : 0x10000, a[3], a[4], a[5], a[6], a[7] & 0xFF, a[9], t);
+    if (status != kSuccess) return status;
+    if (!StartThread(t)) {
+        CancelPreparedThread(t);
+        return kNoMemory;
+    }
     return kSuccess;
 }
 
@@ -875,11 +878,13 @@ KERNEL_EXPORT(238, NtYieldExecution, 0) {
 KERNEL_EXPORT(104, KeGetCurrentThread, 0) { return Current()->ethread; }
 
 KERNEL_EXPORT(254, PsCreateSystemThread, 5) {
-    ThreadRef t = CreateThread(0x10000, 0, 0, a[2], a[3], false);
-    if (!t) return kNoMemory;
-    if (a[0]) W32(a[0], NewHandle(t));
-    if (a[1]) W32(a[1], t->id);
-    StartThread(t);
+    ThreadRef t;
+    uint32_t status = PrepareSystemThreadEx(a[0], 0x10000, 0, a[1], a[2], a[3], false, 0, t);
+    if (status != kSuccess) return status;
+    if (!StartThread(t)) {
+        CancelPreparedThread(t);
+        return kNoMemory;
+    }
     return kSuccess;
 }
 

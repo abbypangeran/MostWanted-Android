@@ -42,6 +42,8 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     ../sdk/runtime/cpu/dispatch_table.cpp
     ../sdk/runtime/kernel/kernel_thunks.cpp
     ../sdk/runtime/kernel/filesystem_context.cpp
+    ../sdk/runtime/kernel/files.cpp
+    ../sdk/runtime/kernel/disc.cpp
     ../sdk/runtime/kernel/startup_data.cpp
     ../sdk/runtime/kernel/checked_file_transfer.cpp
     ../sdk/runtime/kernel/checked_gpu_transfer.cpp
@@ -50,6 +52,7 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     memory-tests/xbe_image_tests.cpp
     memory-tests/startup_data_tests.cpp
     memory-tests/checked_file_transfer_tests.cpp
+    memory-tests/file_transfer_export_tests.cpp
     memory-tests/checked_gpu_transfer_tests.cpp
     memory-tests/clock_worker_tests.cpp
     memory-tests/dispatch_table_tests.cpp
@@ -58,19 +61,33 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
 )
 set(MOSTWANTED_CHECKED_FIXTURE_DIR "" CACHE PATH "Generated checked-recompiler fixture directory")
 if(MOSTWANTED_CHECKED_FIXTURE_DIR)
-    foreach(FIXTURE_FILE x86_recomp.0.cpp x86_recomp_shared.h)
+    foreach(FIXTURE_FILE x86_recomp.0.cpp x86_func_mapping.cpp x86_recomp_shared.h)
         if(NOT EXISTS "${MOSTWANTED_CHECKED_FIXTURE_DIR}/${FIXTURE_FILE}")
             message(FATAL_ERROR "Missing checked-recompiler fixture file: ${MOSTWANTED_CHECKED_FIXTURE_DIR}/${FIXTURE_FILE}")
         endif()
     endforeach()
     target_sources(mostwanted_memory_tests PRIVATE
         recompiler-fixtures/fixture_runner.cpp
+        ../sdk/runtime/cpu/dispatch.cpp
+        ../sdk/runtime/kernel/objects.cpp
+        ../sdk/runtime/kernel/ordinals.cpp
+        ../sdk/runtime/kernel/threads.cpp
         "${MOSTWANTED_CHECKED_FIXTURE_DIR}/x86_recomp.0.cpp"
+        "${MOSTWANTED_CHECKED_FIXTURE_DIR}/x86_func_mapping.cpp"
     )
     target_include_directories(mostwanted_memory_tests PRIVATE "${MOSTWANTED_CHECKED_FIXTURE_DIR}")
-    target_compile_definitions(mostwanted_memory_tests PRIVATE MOSTWANTED_CHECKED_RECOMPILER_FIXTURE=1)
+    target_compile_definitions(mostwanted_memory_tests PRIVATE
+        MOSTWANTED_CHECKED_RECOMPILER_FIXTURE=1
+        MOSTWANTED_CHECKED_KERNEL_ABI_TESTS=1
+        MOSTWANTED_THREAD_PREPARATION_TESTS=1
+        MOSTWANTED_FIXTURE_EXTERNAL_G_BASE=1
+    )
 endif()
 target_compile_features(mostwanted_memory_tests PRIVATE cxx_std_20)
+target_compile_definitions(mostwanted_memory_tests PRIVATE MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS=1)
+if(NOT MOSTWANTED_CHECKED_FIXTURE_DIR)
+    target_compile_definitions(mostwanted_memory_tests PRIVATE MOSTWANTED_FILE_TRANSFER_TEST_STUBS=1)
+endif()
 target_include_directories(mostwanted_memory_tests PRIVATE ../sdk/runtime guest-memory-prototype)
 target_link_libraries(mostwanted_memory_tests PRIVATE SDL3::SDL3-static Threads::Threads)
 set_target_properties(mostwanted_memory_tests PROPERTIES

@@ -18,6 +18,10 @@ namespace kernel {
 namespace {
 
 filesystem::Context g_filesystem;
+#ifdef MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS
+using TransferAfterIoHook = void (*)(uint32_t);
+TransferAfterIoHook g_transfer_after_io_hook_for_test = nullptr;
+#endif
 
 std::string Normalize(std::string p) {
     std::replace(p.begin(), p.end(), '/', '\\');
@@ -441,6 +445,9 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages, bool contigu
             if (done < chunk) break;
         }
     }
+#ifdef MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS
+    if (contiguous && g_transfer_after_io_hook_for_test) g_transfer_after_io_hook_for_test(iosb);
+#endif
     f->pos = pos + n;
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb, contiguous);  // disk full
     if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb, contiguous);
@@ -452,6 +459,25 @@ KERNEL_EXPORT(236, NtWriteFile, 8) { return Transfer(a, true, 0, true); }
 // the buffer argument is an array of one page per element
 KERNEL_EXPORT(220, NtReadFileScatter, 8) { return Transfer(a, false, a[5], false); }
 KERNEL_EXPORT(237, NtWriteFileGather, 8) { return Transfer(a, true, a[5], false); }
+
+#ifdef MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS
+extern "C" uint32_t FileTransferTestCreateHandle(FILE* fp) {
+    auto f = std::make_shared<File>();
+    f->fp = fp;
+    return NewHandle(f);
+}
+
+extern "C" void FileTransferTestSetAfterIoHook(TransferAfterIoHook hook) {
+    g_transfer_after_io_hook_for_test = hook;
+}
+
+extern "C" bool FileTransferTestInvokeExport(uint32_t ordinal, X86Context& ctx) {
+    if (ordinal == 219) kentry_NtReadFile(ctx, nullptr);
+    else if (ordinal == 236) kentry_NtWriteFile(ctx, nullptr);
+    else return false;
+    return true;
+}
+#endif
 
 KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
     uint32_t h = a[0], iosb = a[1], out = a[2], len = a[3], cls = a[4];

@@ -6,6 +6,7 @@ extern int RunMemoryTests(void);
 extern int RunXbeImageLoaderTests(const char *real_xbe_path);
 extern int RunStartupDataTests(void);
 extern int RunCheckedFileTransferTests(void);
+extern int RunFileTransferExportTests(void);
 extern int RunCheckedGpuTransferTests(void);
 extern int RunClockWorkerTests(void);
 extern int RunDispatchTableTests(void);
@@ -28,6 +29,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     failures += RunGuestMemoryPrototypeTests();
     failures += RunStartupDataTests();
     failures += RunCheckedFileTransferTests();
+    failures += RunFileTransferExportTests();
     failures += RunCheckedGpuTransferTests();
     failures += RunClockWorkerTests();
     failures += RunDispatchTableTests();

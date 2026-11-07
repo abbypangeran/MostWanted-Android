@@ -11,6 +11,8 @@ add_executable(mostwanted_memory_tests
     ../../sdk/runtime/cpu/dispatch_table.cpp
     ../../sdk/runtime/kernel/kernel_thunks.cpp
     ../../sdk/runtime/kernel/filesystem_context.cpp
+    ../../sdk/runtime/kernel/files.cpp
+    ../../sdk/runtime/kernel/disc.cpp
     ../../sdk/runtime/kernel/startup_data.cpp
     ../../sdk/runtime/kernel/checked_file_transfer.cpp
     ../../sdk/runtime/kernel/checked_gpu_transfer.cpp
@@ -20,6 +22,7 @@ add_executable(mostwanted_memory_tests
     xbe_image_tests.cpp
     startup_data_tests.cpp
     checked_file_transfer_tests.cpp
+    file_transfer_export_tests.cpp
     checked_gpu_transfer_tests.cpp
     clock_worker_tests.cpp
     dispatch_table_tests.cpp
@@ -28,5 +31,9 @@ add_executable(mostwanted_memory_tests
     memory_test_cli.cpp
 )
 target_compile_features(mostwanted_memory_tests PRIVATE cxx_std_20)
+target_compile_definitions(mostwanted_memory_tests PRIVATE
+    MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS=1
+    MOSTWANTED_FILE_TRANSFER_TEST_STUBS=1
+)
 target_include_directories(mostwanted_memory_tests PRIVATE ../../sdk/runtime)
 add_test(NAME mostwanted_memory_tests COMMAND mostwanted_memory_tests)

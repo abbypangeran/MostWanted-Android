@@ -177,7 +177,13 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
         rollback_image();
         return false;
     }
-    StartThread(t);
+    if (!StartThread(t)) {
+        LOGE("boot: guest host-thread activation failed");
+        CancelPreparedThread(t);
+        StopKernelClockWorker();
+        rollback_image();
+        return false;
+    }
     return true;
 }
 
