@@ -1066,3 +1066,75 @@ All generated files and build directories below are ignored local artifacts. The
 The first Android attempt used a stale ignored generated map and failed because the mapping-count symbols were missing. The rerun used the fresh Phase 2C-9 generator output and passed. No XBE, ISO, or generated game source was staged.
 
 **Integration and release status:** Phase work remains on `feature/ios-port`; this checkpoint does not merge to `main`, install to a physical iPhone, execute real guest code, create an IPA, or release to customers. **Next action:** keep the Apple `Boot()` guard and treat guest execution readiness as NO-GO until callback lifetime, IOSB transaction behavior, remaining HLE pointer paths, and the exact reachable instruction/call route are bounded and tested.
+
+## Phase 2C-10 checked kernel ABI and inactive thread preparation
+
+Baseline: `3c074bc5dbffe5d197fb604c893b753d54f86488` on `feature/ios-port`. Implementation and tests: `2edb0b03d14801a6210a4a46154036068e81017f`. The real Black Edition output was inspected statically; the tests use an actual recompiler-generated synthetic XBE. The Apple `Boot()` guard remains. No real XBE instruction, guest callback, thread activation, or physical-device install ran.
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `CHECKED_KERNEL_THUNK_ABI` | **PASS (fixture-only ordinal 255)** | Generated synthetic-XBE indirect CALL reaches only `0xFE0003FC` when the fixture bridge is enabled and the registered name is exactly `PsCreateSystemThreadEx`. The bridge validates a generated-code return address and 40 readable argument bytes, preserves checked frame and return-word behavior, and verifies 10-argument stdcall cleanup (`ESP = S + 40`), EAX, flags, and fault behavior. The test handler is not the production export. Other kernel/host thunk classes remain rejected. |
+| `THREAD_PREPARE_NO_START` | **PASS** | The production `PrepareSystemThreadEx` path builds stack/TLS/KPCR/ETHREAD state and publishes optional outputs while leaving the thread prepared, absent from the active-thread list, and without a host worker. Cancellation closes its handle, clears still-owned output values, unbinds ETHREAD, and releases guest allocations. Allocation-stage and publication failures, invalid sizes/pages, duplicate output-reference use, distinct repeated preparations, and repeated cancellation are covered. |
+| `KERNEL_255_PREPARATION` | **PASS (test-only service bridge)** | Synthetic ordinal-255 calls reach the non-starting test handler, which calls the production preparation routine with all ten arguments. Handle/ID publication and cancellation pass; worker-launch count stays unchanged. The production `PsCreateSystemThreadEx` export remains connected to its normal explicit activation call and was not invoked. |
+| `IOSB_TRANSACTION_LIFETIME` | **PARTIAL** | Export-level `NtReadFile`/`NtWriteFile` tests cover valid data/status/event publication, invalid IOSB rejection before file or event side effects, and a barrier-controlled IOSB host-page decommit after read I/O. The last case returns access violation after guest read data and the host file cursor have advanced; the next read observes EOF. There is no host-side rollback or IOSB pin. Scatter/gather exports still use raw IOSB publication. |
+| `CALLBACK_READINESS_AUDIT` | **PASS (static inventory only)** | The thread-start, file APC, timer APC, and DPC routes, retained values, dispatch, cancellation, and page-lifetime limits are recorded below. This audit does not authorize dispatch. Detached worker shutdown is unresolved and blocks execution. |
+| `PLATFORM_REGRESSION` | **PASS** | macOS ARM64 memory/preparation CTests: Debug 1/1, Release 1/1. Generated instruction/CALL/RET/ABI/fault fixtures: Debug 2/2, Release 2/2. iOS Simulator memory/preparation app ran to completion with no failed assertions. Unsigned iPhoneOS ARM64 `mostwanted_ios` and `mostwanted_memory_tests` compiled and linked. Android `:app:assembleDebug` passed with Java 21 and NDK 28.2.13676358. |
+| `GUEST_EXECUTION_READINESS` | **NO-GO** | The fixture handler does not activate threads or execute callbacks. Real callback target/page lifetime, detached-worker quiescence, raw runtime/HLE pointers, IOSB side effects, scatter/gather, and later graphics/audio/filesystem boundaries remain unresolved. Keep the Apple `Boot()` guard. |
+
+### Checked ordinal-255 ABI and preparation behavior
+
+The checked bridge exists only in builds defining `MOSTWANTED_CHECKED_KERNEL_ABI_TESTS`; it is not compiled into the Android or production iOS host. It admits the exact registered kernel thunk `kKernelThunkBase + 255 * 4` only while the fixture enables the bridge and ordinal 255 is registered under the exact name `PsCreateSystemThreadEx`. The current indirect target is still read through checked memory. The expected test call must have a return address in the generated-code span and all ten argument dwords readable before the handler runs. The bridge performs one checked return-address write, calls the fixture handler under the dispatch-table lease, then verifies the return word and exact 10-argument stdcall cleanup. Fixture cases reject the initial ordinal encoding, a wrong ordinal/name, invalid target, bad return span, unmapped/denied arguments, modified return word, and bad stack cleanup. It does not enable arbitrary kernel or host thunks and does not route through unrestricted legacy `x86_icall`.
+
+The fixture handler's success branch calls `PrepareSystemThreadEx`, not the production `PsCreateSystemThreadEx` export. That production-relevant helper validates stack/TLS arithmetic, allocates and initializes guest stack/TLS/KPCR/ETHREAD state, binds the ETHREAD, and publishes optional handle/ID outputs while holding the guest-memory lock. Output spans must be readable and writable so rollback can compare and clear only values this operation published; write-only output spans fail before publication, with preparation resources rolled back. A test-only failpoint after each allocation stage and before output publication verifies rollback. Cancellation is allowed only from the prepared state; it closes the operation's handle, clears output locations only when they still contain values published by that operation, removes the matching pointer binding, and frees stack/system-pool allocations. The checked fixture confirms no active thread, worker launch, or guest callback is produced. `StartThread` remains a separate operation; the production Xbox exports call it explicitly after successful preparation to preserve Android behavior.
+
+Host worker launch now reports allocation and OS thread-creation failure, and a failed launch removes the active registration so the caller can cancel the still-prepared thread. The workers remain detached, however. There is no stop/join or runtime-wide quiescence operation for guest threads, DPC, timer, audio, or vblank workers. Closure ownership and launch-failure rollback do not solve shutdown. This is an explicit blocker for eventual iOS execution; this phase did not start workers to test shutdown.
+
+### Static startup and callback dependency map
+
+The audited static route is `0x002B3916 → 0x002B396A → 0x002B5CA7 → 0x002B5CE0 → PsCreateSystemThreadEx`. The bytes at guest `0x003C9E68` start as `0x800000FF`; XBE import patching resolves ordinal 255 to `0xFE0003FC`. The checked fixture tests this mapping synthetically. The real XBE's entry code was not executed.
+
+At `0x002B3916`, six pushed values feed the call to `0x002B396A`: `0, 0, 0x002B38A2, 0, 0, 0` (rightmost push becomes argument 0). In the downstream `0x002B5CA7` sequence, ten arguments are pushed to the import slot at `0x002B5CE0`:
+
+| `PsCreateSystemThreadEx` argument | Static source |
+| --- | --- |
+| 0, handle output | `&[ebp+0x0C]` |
+| 1 | `0` |
+| 2, stack size | incoming argument 1 or fallback `[0x00010130]` (runtime-derived value) |
+| 3, TLS size | `[0x004EDC74]` (runtime-derived value; caller writes it earlier at `0x002B394E`) |
+| 4, thread-ID output | `0` |
+| 5, start routine | `0x002B38A2` |
+| 6, start context | `0` |
+| 7, suspended | incoming argument 4, statically zero on this route |
+| 8 | `0` |
+| 9, system routine | `0x002B5C0F` |
+
+The static routine VAs and zero context are established by the generated instructions; the effective stack size and TLS contents are runtime-derived. The thread object now retains the supplied `system_routine`, `start_routine`, and `start_context` directly. Activation waits for suspension to clear, then calls the system routine with `(start_routine, start_context)`, or the start routine with `(start_context)` when no system routine is supplied.
+
+The candidate start routine `0x002B38A2` begins with a direct call to `0x002B58B8`, an unsupported checked instruction boundary. The inspected path reads `0x003C9E34` and `0x003C9E3C`, then reaches dynamic calls through `[0x003C9D30]` and EDI loaded from `[0x003C9D28]`. These are static dependencies, not evidence that the routine is reached.
+
+The candidate system routine `0x002B5C0F` begins with `PUSH 0x18`, also outside the checked instruction set. It then pushes `0x003ED5B8`, calls `0x00319804`, accesses FS plus globals `0x003ED3F0`, `0x003ED3EC`, and `0x003ED3FC`, and calls the dynamic start routine from `[ebp+8]`. Later it calls import `[0x003C9E64]` and reaches `INT3`. None of these instructions ran.
+
+Each callback path ultimately uses legacy `CallGuest`/`x86_icall`. Its dispatch lease protects the selected dispatch entry only for the synchronous call; it does not keep queued callback targets or guest pages valid while they wait.
+
+| Callback path | Retained target and arguments | Dispatch, invalidation, and shutdown boundary |
+| --- | --- | --- |
+| Thread start | `Thread` retains start/system routine VAs and context from the export arguments. | `StartThread`'s detached host worker later calls legacy `CallGuest`; it does not pin guest code/data pages or classify the target under checked policy. No worker join or guest-code cancellation exists. |
+| File completion APC | `Complete` queues `(routine, context, IOSB, 0)` on the thread after IOSB publication; `RunApcs` later invokes it on that thread context. | Callback target/arguments remain VAs; pages are not pinned or revalidated as a complete callback span. The APC queue has no cancellation/removal API. `CallGuest` holds a dispatch lease only for the synchronous invocation. |
+| Timer APC | Timer entry retains APC routine/context and a weak thread reference; expiry queues `(context, timeLo, timeHi)`. | Cancelled timer sequences are ignored, but the timer worker is detached and has no stop/join path. Queued APC values and guest pages are not pinned. |
+| DPC | Queue retains DPC VA and copied system arguments; dispatch later reads `DeferredRoutine` and `DeferredContext` from guest DPC fields and calls `(dpc, context, arg1, arg2)`. | Guest field reads and callback target are not checked/pinned; removing a DPC clears the guest `Inserted` field but does not remove an already queued host record. The DPC worker is detached. |
+
+Before any callback dispatch can be authorized, targets and arguments need checked access or lifetime pins covering the full call, callback code/data mappings must survive protection/decommit, cancellation must invalidate already queued work, dispatch-table reset must remain excluded until all callbacks quiesce, and every host worker must stop/join before guest memory or runtime state is torn down. The current `Shutdown` path stops the kernel clock and calls `_Exit`; it does not establish this callback quiescence. Later graphics, audio, filesystem, socket, object, wait, scatter/gather, and GPU-input paths retain additional raw or long-lived guest pointers.
+
+### Phase 2C-10 verification evidence
+
+All generated XBE/C++ and build outputs remain in ignored `.local/ios-port/` directories. The fixture suite uses `xbe_recomp` to build the synthetic import call and does not run the real XBE.
+
+| Check | Result |
+| --- | --- |
+| macOS ARM64 memory/preparation | Debug and Release CTests passed 1/1 each, including contiguous file-export lifecycle checks. |
+| Generated checked fixtures | Debug and Release each passed 2/2 CTests for checked instructions, CALL/RET, ordinal-255 ABI, thread preparation, and faults. |
+| iOS Simulator | iPhone 18 Pro simulator ran `mostwanted_memory_tests` through completion; memory, preparation, IOSB export, and generated fixture assertions had no failures. |
+| iPhoneOS ARM64 | `mostwanted_ios` and `mostwanted_memory_tests` built unsigned as arm64 Mach-O executables. Neither app was installed on hardware. |
+| Android | `:app:assembleDebug` passed with Java 21 and NDK 28.2.13676358; the existing SDK XML v4 compatibility notices were nonfatal. |
+
+**Integration and release status:** changes remain on `feature/ios-port`; no merge to `main`, release, real XBE execution, guest callback, thread activation, or physical-device installation occurred. The task authorizes a normal fast-forward push. **Next action:** preserve the Apple guard and do not start a restricted guest-execution experiment until callback page lifetime, worker shutdown/join, non-transactional file-status semantics, scatter/gather, and later HLE access boundaries receive separate review and tests.
