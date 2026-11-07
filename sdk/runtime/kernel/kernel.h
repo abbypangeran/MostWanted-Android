@@ -17,6 +17,7 @@
 #include "core/log.h"
 #include "cpu/x86_ops.h"
 #include "kernel/memory.h"
+#include "kernel/worker_lifecycle.h"
 
 namespace kernel {
 
@@ -212,10 +213,10 @@ int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status);
 int32_t ReleaseMutant(Object& o, uint32_t& status);
 int64_t Now100ns();                           // system time, 100 ns since 1601
 int64_t ToDeadline(int64_t due_100ns);        // relative or absolute to a steady clock deadline in ns
-void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2);
+bool QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2);
 struct Thread;
 // apc_routine runs on apc_thread with (apc_context, due low, due high) each time the timer fires
-void SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, std::shared_ptr<Thread> apc_thread = nullptr,
+bool SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, std::shared_ptr<Thread> apc_thread = nullptr,
               uint32_t apc_routine = 0, uint32_t apc_context = 0);
 bool CancelTimer(Object& timer);
 
@@ -231,6 +232,7 @@ struct Thread : Object {
     int priority = 0;
     std::atomic<ThreadState> state{ThreadState::kPrepared};
     std::atomic<int> suspend{0};
+    std::atomic<bool> stop_requested{false};
     std::mutex apc_lock;
     std::deque<std::array<uint32_t, 4>> apcs;  // routine, arg1, arg2, arg3
     std::condition_variable resume_cv;
@@ -242,7 +244,8 @@ using ThreadRef = std::shared_ptr<Thread>;
 Thread* Current();
 ThreadRef CurrentRef();
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
-void RunDpcs(X86Context& ctx);
+bool StartManagedHostThread(const char* name, std::function<void(X86Context&, WorkerStopToken)> fn);
+void RunDpcs(X86Context& ctx, WorkerStopToken stop);
 bool InitKernelData();
 bool StartKernelClock();
 void LogGuestStack(X86Context& ctx, int words);
@@ -264,7 +267,15 @@ void Resume(Thread& t);
 uint32_t Suspend(Thread& t);  // previous count; another thread stops at its next kernel wait, delay or yield
 void SuspendPoint();           // blocks the current thread while it is suspended
 bool RunApcs(Thread& t);
-void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
+bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+using WaitBlockedHook = void (*)(Thread*);
+using WaitSuspendHook = void (*)(Thread*);
+using WaitApcHook = void (*)(Thread*);
+void SetWaitBlockedHookForTest(WaitBlockedHook hook);
+void SetWaitSuspendHookForTest(WaitSuspendHook hook);
+void SetWaitApcHookForTest(WaitApcHook hook);
+#endif
 std::vector<ThreadRef> Threads();
 
 // files

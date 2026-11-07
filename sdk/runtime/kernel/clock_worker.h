@@ -38,7 +38,7 @@ bool KernelClockWorkerRunning();
 class KernelMemoryLifecycle {
 public:
     KernelMemoryLifecycle();
-    void SetReady(bool ready);
+    bool SetReady(bool ready);
     bool StopWorker();
 
 private:

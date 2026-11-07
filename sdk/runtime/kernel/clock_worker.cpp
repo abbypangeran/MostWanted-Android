@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "core/log.h"
+#include "kernel/worker_lifecycle.h"
 
 namespace kernel {
 
@@ -92,13 +93,15 @@ bool KernelClockWorkerRunning() { return g_worker.Running(); }
 
 KernelMemoryLifecycle::KernelMemoryLifecycle() : lock_(g_memory_lifecycle_mutex) {}
 
-void KernelMemoryLifecycle::SetReady(bool ready) { g_memory_ready = ready; }
+bool KernelMemoryLifecycle::SetReady(bool ready) {
+    g_memory_ready = ready && RestartKernelWorkers();
+    return !ready || g_memory_ready;
+}
 
 bool KernelMemoryLifecycle::StopWorker() {
     g_memory_ready = false;
-    const bool stopped = g_worker.Stop();
-    if (!stopped) LOGE("kernel: clock worker stopped after an update failure");
-    return stopped;
+    if (!g_worker.Stop()) LOGE("kernel: clock worker stopped after an update failure");
+    return StopKernelWorkers();
 }
 
 }  // namespace kernel

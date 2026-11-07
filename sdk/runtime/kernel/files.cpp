@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -20,7 +21,10 @@ namespace {
 filesystem::Context g_filesystem;
 #ifdef MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS
 using TransferAfterIoHook = void (*)(uint32_t);
+using TransferAfterCompletionHook = void (*)(uint32_t, uint32_t, uint32_t);
 TransferAfterIoHook g_transfer_after_io_hook_for_test = nullptr;
+TransferAfterCompletionHook g_transfer_after_completion_hook_for_test = nullptr;
+std::atomic<int> g_host_io_error_for_test{0};
 #endif
 
 std::string Normalize(std::string p) {
@@ -367,7 +371,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
 // I/O completes before the call returns: the status block is written, then the file object, the event and the
 // APC are signalled (GetOverlappedResult without an event waits on the file handle)
 static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uint32_t apc, uint32_t apc_ctx,
-                       uint32_t iosb, bool checked_iosb) {
+                       uint32_t iosb, bool checked_iosb, mem::ScopedPageLease* iosb_lease) {
     if (checked_iosb) {
         if (checked_file_transfer::WriteStatusBlock(iosb, status, n) != mem::AccessStatus::kOk)
             return 0xC0000005;  // STATUS_ACCESS_VIOLATION; do not signal completion after failed publication
@@ -376,6 +380,11 @@ static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uin
     }
     SetEvent(f);
     Complete(event, apc, apc_ctx, iosb);
+#ifdef MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS
+    if (g_transfer_after_completion_hook_for_test)
+        g_transfer_after_completion_hook_for_test(iosb, status, n);
+#endif
+    if (iosb_lease) iosb_lease->Release();
     return status;
 }
 
@@ -387,17 +396,34 @@ static uint64_t Offset(File& f, uint32_t off) {
 struct FileTransferIo {
     File& file;
     uint64_t position;
+    bool host_error = false;
 };
 
 std::size_t ReadFileBytes(void* raw, uint8_t* destination, std::size_t size) {
     auto& io = *static_cast<FileTransferIo*>(raw);
     if (io.file.entry) return MountedDisc()->Read(*io.file.entry, io.position, destination, uint32_t(size));
-    return std::fread(destination, 1, size, io.file.fp);
+#ifdef MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS
+    if (g_host_io_error_for_test.exchange(0) == 1) {
+        io.host_error = true;
+        return 0;
+    }
+#endif
+    const std::size_t transferred = std::fread(destination, 1, size, io.file.fp);
+    io.host_error = std::ferror(io.file.fp) != 0;
+    return transferred;
 }
 
 std::size_t WriteFileBytes(void* raw, const uint8_t* source, std::size_t size) {
     auto& io = *static_cast<FileTransferIo*>(raw);
-    return std::fwrite(source, 1, size, io.file.fp);
+#ifdef MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS
+    if (g_host_io_error_for_test.exchange(0) == 2) {
+        io.host_error = true;
+        return 0;
+    }
+#endif
+    const std::size_t transferred = std::fwrite(source, 1, size, io.file.fp);
+    io.host_error = std::ferror(io.file.fp) != 0;
+    return transferred;
 }
 
 uint32_t FileTransferStatus(checked_file_transfer::Status status) {
@@ -417,10 +443,11 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages, bool contigu
     auto f = FileFromHandle(h);
     if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
     if (write && f->entry) return kAccessDenied;
-    if (contiguous && iosb && mem::CheckAccess(iosb, 8, mem::kWrite) != mem::AccessStatus::kOk)
+    std::lock_guard<std::mutex> lock(f->io);
+    mem::ScopedPageLease iosb_lease;
+    if (contiguous && iosb && iosb_lease.Acquire(iosb, 8, mem::kWrite) != mem::AccessStatus::kOk)
         return 0xC0000005;  // STATUS_ACCESS_VIOLATION
     ResetEvent(*f);
-    std::lock_guard<std::mutex> lock(f->io);
     uint64_t pos = Offset(*f, off);
     if (f->fp) Seek(f->fp, pos);
     uint32_t n = 0;
@@ -431,9 +458,14 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages, bool contigu
         if (result.status != checked_file_transfer::Status::kOk) {
             // A failed read may have advanced FILE* before guest publication failed. Keep logical and host cursors at f.pos.
             if (f->fp) Seek(f->fp, f->pos);
-            return Finish(*f, FileTransferStatus(result.status), 0, event, apc, apc_ctx, iosb, contiguous);
+            return Finish(*f, FileTransferStatus(result.status), 0, event, apc, apc_ctx, iosb, contiguous,
+                          contiguous && iosb ? &iosb_lease : nullptr);
         }
         n = result.transferred;
+        if (io.host_error) {
+            f->pos = pos + n;
+            return Finish(*f, kUnsuccessful, n, event, apc, apc_ctx, iosb, contiguous, &iosb_lease);
+        }
     } else {
         while (n < len) {
             uint32_t at = pages ? R32(pages + n / 0x1000 * 8) + n % 0x1000 : buf + n;
@@ -449,9 +481,10 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages, bool contigu
     if (contiguous && g_transfer_after_io_hook_for_test) g_transfer_after_io_hook_for_test(iosb);
 #endif
     f->pos = pos + n;
-    if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb, contiguous);  // disk full
-    if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb, contiguous);
-    return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb, contiguous);
+    mem::ScopedPageLease* lease = contiguous && iosb ? &iosb_lease : nullptr;
+    if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb, contiguous, lease);
+    if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb, contiguous, lease);
+    return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb, contiguous, lease);
 }
 
 KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0, true); }
@@ -469,6 +502,14 @@ extern "C" uint32_t FileTransferTestCreateHandle(FILE* fp) {
 
 extern "C" void FileTransferTestSetAfterIoHook(TransferAfterIoHook hook) {
     g_transfer_after_io_hook_for_test = hook;
+}
+
+extern "C" void FileTransferTestSetAfterCompletionHook(TransferAfterCompletionHook hook) {
+    g_transfer_after_completion_hook_for_test = hook;
+}
+
+extern "C" void FileTransferTestSetHostIoErrorForTest(int mode) {
+    g_host_io_error_for_test.store(mode == 1 || mode == 2 ? mode : 0);
 }
 
 extern "C" bool FileTransferTestInvokeExport(uint32_t ordinal, X86Context& ctx) {

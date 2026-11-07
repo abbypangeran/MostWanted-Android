@@ -228,6 +228,14 @@ void CheckConcurrentStartAndMemoryShutdown() {
           "clock start is rejected after guest-memory shutdown");
 }
 
+void CheckClockFailureDoesNotBlockMemoryTeardown() {
+    Check(mem::Init(), "guest memory starts for failed-clock teardown test");
+    Check(kernel::StartKernelClockWorker(FailTick, nullptr) && WaitUntil([&] { return !kernel::KernelClockWorkerRunning(); }),
+          "failed clock update exits before teardown");
+    mem::Shutdown();
+    Check(!mem::IsInitialized(), "joined clock update failure does not retain guest memory");
+}
+
 }  // namespace
 
 extern "C" int RunClockWorkerTests() {
@@ -235,5 +243,6 @@ extern "C" int RunClockWorkerTests() {
     CheckKernelDataInitialization();
     CheckMemoryShutdownStopsGlobalWorker();
     CheckConcurrentStartAndMemoryShutdown();
+    CheckClockFailureDoesNotBlockMemoryTeardown();
     return failures ? 1 : 0;
 }

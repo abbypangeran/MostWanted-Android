@@ -89,6 +89,7 @@ bool PrepareImage(const Image& image, uint32_t expected_entry, std::string_view 
         error = "XBE SHA-1 mismatch: expected " + std::string(expected_sha1) + ", got " + actual_sha1;
         return false;
     }
+    mem::ScopedVirtualRangeLock range_lock;
     mem::ScopedLock memory_lock;
     if (!mem::ReserveImage(image.base, image.image_size)) {
         char message[96];
@@ -100,7 +101,9 @@ bool PrepareImage(const Image& image, uint32_t expected_entry, std::string_view 
     auto write = checked_write ? checked_write : &mem::Write;
     auto fail = [&](const char* operation, uint32_t va, mem::AccessStatus status) {
         error = AccessError(operation, va, status);
+        memory_lock.Unlock();
         if (!Release(image.base)) error += "; XBE image rollback failed";
+        memory_lock.Lock();
         return false;
     };
     mem::AccessStatus status = write(image.base, image.file.data(), image.header_size);
@@ -129,7 +132,7 @@ bool PrepareImage(const Image& image, uint32_t expected_entry, std::string_view 
 }
 
 SectionStatus LoadSection(const Image& image, uint32_t section_header, std::string& error, CheckedWrite checked_write) {
-    mem::ScopedLock memory_lock;
+    mem::ScopedVirtualRangeLock range_lock;
     const Section* section = SectionAt(image, section_header);
     if (!section) {
         error = "invalid XBE section header";
@@ -194,7 +197,7 @@ SectionStatus LoadSection(const Image& image, uint32_t section_header, std::stri
 }
 
 SectionStatus UnloadSection(const Image& image, uint32_t section_header, std::string& error, CheckedWrite checked_write) {
-    mem::ScopedLock memory_lock;
+    mem::ScopedVirtualRangeLock range_lock;
     if (!SectionAt(image, section_header)) {
         error = "invalid XBE section header";
         return SectionStatus::kInvalidSection;

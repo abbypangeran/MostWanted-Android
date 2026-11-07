@@ -34,6 +34,7 @@ set_target_properties(MoltenVK::MoltenVK PROPERTIES
 add_executable(mostwanted_vulkan_ios MACOSX_BUNDLE ../vulkan_main.c readback_probe.cpp
     ../../sdk/runtime/core/log.cpp
     ../../sdk/runtime/kernel/clock_worker.cpp
+    ../../sdk/runtime/kernel/worker_lifecycle.cpp
     ../../sdk/runtime/kernel/memory.cpp
     ../../sdk/runtime/kernel/checked_gpu_transfer.cpp)
 target_include_directories(mostwanted_vulkan_ios PRIVATE "${MOLTENVK_DEP_DIR}/MoltenVK/MoltenVK/include")

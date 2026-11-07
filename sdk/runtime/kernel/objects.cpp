@@ -1,10 +1,12 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <new>
 #include <queue>
 
 #include "kernel/kernel.h"
+#include "kernel/worker_lifecycle.h"
 
 namespace kernel {
 
@@ -12,6 +14,11 @@ namespace {
 
 std::mutex g_dispatch;
 std::condition_variable g_cv;
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+std::atomic<WaitBlockedHook> g_wait_blocked_hook{nullptr};
+std::atomic<WaitSuspendHook> g_wait_suspend_hook{nullptr};
+std::atomic<WaitApcHook> g_wait_apc_hook{nullptr};
+#endif
 
 std::mutex g_handles_lock;
 std::unordered_map<uint32_t, ObjectRef> g_handles;
@@ -33,6 +40,12 @@ std::unordered_map<std::string, std::weak_ptr<Object>> g_names;
 
 std::mutex& DispatchLock() { return g_dispatch; }
 void SignalChanged() { g_cv.notify_all(); }
+
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+void SetWaitBlockedHookForTest(WaitBlockedHook hook) { g_wait_blocked_hook.store(hook); }
+void SetWaitSuspendHookForTest(WaitSuspendHook hook) { g_wait_suspend_hook.store(hook); }
+void SetWaitApcHookForTest(WaitApcHook hook) { g_wait_apc_hook.store(hook); }
+#endif
 
 uint32_t NewHandle(ObjectRef obj) {
     std::lock_guard<std::mutex> lock(g_handles_lock);
@@ -236,6 +249,17 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
     int64_t deadline = infinite ? 0 : ToDeadline(timeout);
     std::unique_lock<std::mutex> lock(g_dispatch);
     for (;;) {
+        if (self && self->stop_requested.load()) return kAlerted;
+        if (self && self->suspend.load() > 0) {
+            lock.unlock();
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+            if (auto hook = g_wait_suspend_hook.load()) hook(self);
+#endif
+            SuspendPoint();
+            if (self->stop_requested.load()) return kAlerted;
+            lock.lock();
+            continue;
+        }
         if (wait_all) {
             bool all = std::all_of(objs.begin(), objs.end(), [&](const ObjectRef& o) { return o && Satisfied(*o, me); });
             if (all) {
@@ -256,17 +280,30 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
                 pending = !self->apcs.empty();
             }
             if (pending) {
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+                if (auto hook = g_wait_apc_hook.load()) hook(self);
+#endif
                 lock.unlock();
-                RunApcs(*self);
-                return kUserApc;
+                if (RunApcs(*self)) return kUserApc;
+                if (self->stop_requested.load() || !KernelWorkersAccepting()) return kAlerted;
+                lock.lock();
+                continue;
             }
         }
         if (!infinite) {
             int64_t now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
             if (now >= deadline) return kTimeout;
             // bounded so alertable waits notice new APCs
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+            if (self)
+                if (auto hook = g_wait_blocked_hook.load()) hook(self);
+#endif
             g_cv.wait_for(lock, nanoseconds(std::min<int64_t>(deadline - now, 50000000)));
         } else {
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+            if (self)
+                if (auto hook = g_wait_blocked_hook.load()) hook(self);
+#endif
             g_cv.wait_for(lock, milliseconds(50));
         }
     }
@@ -362,14 +399,33 @@ bool g_dpc_thread = false;
 
 }  // namespace
 
-void RunDpcs(X86Context& ctx) {
+void RunDpcs(X86Context& ctx, WorkerStopToken stop) {
+    WorkerStopCallback wake(stop, [] { g_dpc_cv.notify_all(); });
+    if (!wake.Ready()) {
+        std::lock_guard<std::mutex> lock(g_dpc_lock);
+        g_dpcs.clear();
+        g_dpc_thread = false;
+        return;
+    }
     for (;;) {
-        std::array<uint32_t, 3> d;
+        std::array<uint32_t, 3> d{};
         {
             std::unique_lock<std::mutex> lock(g_dpc_lock);
-            g_dpc_cv.wait(lock, [] { return !g_dpcs.empty(); });
+            g_dpc_cv.wait(lock, [&] { return stop.StopRequested() || !g_dpcs.empty(); });
+            if (stop.StopRequested()) {
+                g_dpcs.clear();
+                g_dpc_thread = false;
+                return;
+            }
             d = g_dpcs.front();
             g_dpcs.pop_front();
+        }
+        GuestDispatchLease dispatch_lease;
+        if (!dispatch_lease.Allowed()) {
+            std::lock_guard<std::mutex> lock(g_dpc_lock);
+            g_dpcs.clear();
+            g_dpc_thread = false;
+            return;
         }
         uint32_t dpc = d[0];
         G<uint8_t>(dpc + 2) = 0;  // Inserted
@@ -378,24 +434,50 @@ void RunDpcs(X86Context& ctx) {
     }
 }
 
-void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2) {
+bool QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2) {
+    if (!KernelWorkersAccepting()) return false;
     std::lock_guard<std::mutex> lock(g_dpc_lock);
+    if (!KernelWorkersAccepting()) return false;
     W32(dpc + 0x14, arg1);  // KDPC.SystemArgument1 and 2
     W32(dpc + 0x18, arg2);
-    g_dpcs.push_back({dpc, arg1, arg2});
+    try {
+        g_dpcs.push_back({dpc, arg1, arg2});
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
     g_dpc_cv.notify_one();
     if (!g_dpc_thread) {
         g_dpc_thread = true;
-        StartHostThread("dpc", [](X86Context& ctx) { RunDpcs(ctx); });
+        if (!StartManagedHostThread("dpc", [](X86Context& ctx, WorkerStopToken stop) { RunDpcs(ctx, stop); })) {
+            g_dpcs.pop_back();
+            g_dpc_thread = false;
+            W8(dpc + 2, 0);
+            return false;
+        }
     }
+    return true;
 }
 
-static void TimerLoop() {
+static void TimerLoop(WorkerStopToken stop) {
     using namespace std::chrono;
+    WorkerStopCallback wake(stop, [] { g_timer_cv.notify_all(); });
+    if (!wake.Ready()) {
+        std::lock_guard<std::mutex> lock(g_timer_lock);
+        g_timers = {};
+        g_timer_seq.clear();
+        g_timer_thread = false;
+        return;
+    }
     std::unique_lock<std::mutex> lock(g_timer_lock);
     for (;;) {
+        if (stop.StopRequested()) {
+            g_timers = {};
+            g_timer_seq.clear();
+            g_timer_thread = false;
+            return;
+        }
         if (g_timers.empty()) {
-            g_timer_cv.wait(lock);
+            g_timer_cv.wait(lock, [&] { return stop.StopRequested() || !g_timers.empty(); });
             continue;
         }
         int64_t now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
@@ -407,38 +489,57 @@ static void TimerLoop() {
         g_timers.pop();
         auto it = g_timer_seq.find(e.timer.get());
         if (it == g_timer_seq.end() || it->second != e.seq) continue;
+        if (e.period_ms > 0) {
+            e.deadline += int64_t(e.period_ms) * 1000000;
+            try {
+                g_timers.push(e);
+            } catch (const std::bad_alloc&) {
+                g_timer_seq.erase(it);
+                LOGE("kernel: periodic timer could not be requeued");
+                continue;
+            }
+        } else {
+            g_timer_seq.erase(it);
+        }
+        if (stop.StopRequested()) continue;
         {
             std::lock_guard<std::mutex> dl(g_dispatch);
             SetSignal(*e.timer, 1);
             g_cv.notify_all();
         }
-        if (e.dpc) QueueDpc(e.dpc, uint32_t(Now100ns()), uint32_t(Now100ns() >> 32));
-        if (auto t = e.apc_thread.lock(); t && e.apc_routine)
-            QueueApc(*t, e.apc_routine, e.apc_context, uint32_t(Now100ns()), uint32_t(Now100ns() >> 32));
-        if (e.period_ms > 0) {
-            e.deadline += int64_t(e.period_ms) * 1000000;
-            g_timers.push(e);
-        } else {
-            g_timer_seq.erase(e.timer.get());
+        if (!stop.StopRequested()) {
+            const int64_t now = Now100ns();
+            const uint32_t low = uint32_t(now), high = uint32_t(uint64_t(now) >> 32);
+            if (e.dpc) QueueDpc(e.dpc, low, high);
+            if (auto t = e.apc_thread.lock(); t && e.apc_routine)
+                QueueApc(*t, e.apc_routine, e.apc_context, low, high);
         }
     }
 }
 
-void SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, std::shared_ptr<Thread> apc_thread,
+bool SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, std::shared_ptr<Thread> apc_thread,
               uint32_t apc_routine, uint32_t apc_context) {
+    if (!timer || !KernelWorkersAccepting()) return false;
     std::lock_guard<std::mutex> lock(g_timer_lock);
+    if (!KernelWorkersAccepting()) return false;
     if (!g_timer_thread) {
+        if (!StartKernelWorker(TimerLoop)) return false;
         g_timer_thread = true;
-        std::thread(TimerLoop).detach();
     }
     {
         std::lock_guard<std::mutex> dl(g_dispatch);
         SetSignal(*timer, 0);
     }
     uint64_t seq = g_seq++;
-    g_timer_seq[timer.get()] = seq;
-    g_timers.push({ToDeadline(due), seq, timer, period_ms, dpc, apc_thread, apc_routine, apc_context});
+    try {
+        g_timer_seq[timer.get()] = seq;
+        g_timers.push({ToDeadline(due), seq, timer, period_ms, dpc, apc_thread, apc_routine, apc_context});
+    } catch (const std::bad_alloc&) {
+        g_timer_seq.erase(timer.get());
+        return false;
+    }
     g_timer_cv.notify_all();
+    return true;
 }
 
 bool CancelTimer(Object& timer) {

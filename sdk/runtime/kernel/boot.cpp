@@ -7,6 +7,7 @@
 #include "kernel/clock_worker.h"
 #include "kernel/kernel.h"
 #include "kernel/kernel_thunks.h"
+#include "kernel/worker_lifecycle.h"
 #include "kernel/startup_data.h"
 #include "cpu/dispatch_table.h"
 
@@ -121,6 +122,11 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
 
     bool filesystem_mounted = false;
     auto rollback_image = [&] {
+        StopKernelClockWorker();
+        if (!StopKernelWorkers()) {
+            LOGE("boot: kernel workers could not be quiesced; retaining image and dispatch state");
+            return;
+        }
         dispatch::Reset();
         if (filesystem_mounted) {
             ClearFilesystemMappings();
@@ -233,6 +239,7 @@ void Relaunch(const char* exe) {
         LOGE("relaunch: cannot start %s.exe (%lu)", exe, GetLastError());
     }
     StopKernelClockWorker();
+    StopKernelWorkers();
     std::_Exit(0);
 #else
     char self[4096] = {};
@@ -240,6 +247,7 @@ void Relaunch(const char* exe) {
     std::string path = std::string(self, n > 0 ? size_t(n) : 0);
     path = path.substr(0, path.find_last_of('/') + 1) + exe;
     StopKernelClockWorker();
+    StopKernelWorkers();
     execl(path.c_str(), path.c_str(), nullptr);
     std::_Exit(0);
 #endif
@@ -247,6 +255,7 @@ void Relaunch(const char* exe) {
 
 void Shutdown(int code) {
     StopKernelClockWorker();
+    if (!StopKernelWorkers()) LOGE("kernel: shutdown requested from an owned worker; process exit will stop it");
     LOGR("Exit (%d)", code);
     logx::Flush();
     std::_Exit(code);

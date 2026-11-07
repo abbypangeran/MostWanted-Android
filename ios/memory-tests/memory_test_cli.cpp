@@ -5,6 +5,7 @@ extern "C" int RunCheckedFileTransferTests();
 extern "C" int RunFileTransferExportTests();
 extern "C" int RunCheckedGpuTransferTests();
 extern "C" int RunClockWorkerTests();
+extern "C" int RunWorkerLifecycleTests();
 extern "C" int RunDispatchTableTests();
 extern "C" int RunKernelThunkTests();
 extern "C" int RunFilesystemSetupTests();
@@ -16,6 +17,7 @@ int main(int argc, char** argv) {
     failures += RunFileTransferExportTests();
     failures += RunCheckedGpuTransferTests();
     failures += RunClockWorkerTests();
+    failures += RunWorkerLifecycleTests();
     failures += RunDispatchTableTests();
     failures += RunKernelThunkTests();
     failures += RunFilesystemSetupTests();

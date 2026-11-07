@@ -7,6 +7,7 @@ add_executable(mostwanted_memory_tests
     ../../sdk/runtime/kernel/crypto.cpp
     ../../sdk/runtime/kernel/memory.cpp
     ../../sdk/runtime/kernel/clock_worker.cpp
+    ../../sdk/runtime/kernel/worker_lifecycle.cpp
     ../../sdk/runtime/kernel/kernel_data_init.cpp
     ../../sdk/runtime/cpu/dispatch_table.cpp
     ../../sdk/runtime/kernel/kernel_thunks.cpp
@@ -25,6 +26,7 @@ add_executable(mostwanted_memory_tests
     file_transfer_export_tests.cpp
     checked_gpu_transfer_tests.cpp
     clock_worker_tests.cpp
+    worker_lifecycle_tests.cpp
     dispatch_table_tests.cpp
     kernel_thunk_tests.cpp
     filesystem_setup_tests.cpp
@@ -34,6 +36,8 @@ target_compile_features(mostwanted_memory_tests PRIVATE cxx_std_20)
 target_compile_definitions(mostwanted_memory_tests PRIVATE
     MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS=1
     MOSTWANTED_FILE_TRANSFER_TEST_STUBS=1
+    MOSTWANTED_KERNEL_WORKER_TESTS=1
+    MOSTWANTED_GUEST_PAGE_LEASE_TESTS=1
 )
 target_include_directories(mostwanted_memory_tests PRIVATE ../../sdk/runtime)
 add_test(NAME mostwanted_memory_tests COMMAND mostwanted_memory_tests)

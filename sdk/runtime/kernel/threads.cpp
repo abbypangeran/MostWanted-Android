@@ -8,6 +8,7 @@
 
 #include "kernel/kernel.h"
 #include "kernel/thread_memory.h"
+#include "kernel/worker_lifecycle.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -154,8 +155,13 @@ void Unregister(Thread* t) {
                     g_threads.end());
 }
 
-void MarkExited(Thread& t, uint32_t code) {
+void MarkExited(Thread& t, uint32_t code, ThreadState state = ThreadState::kExited) {
     t.exit_code = code;
+    {
+        std::lock_guard<std::mutex> apcs(t.apc_lock);
+        t.state = state;
+        t.apcs.clear();
+    }
     std::lock_guard<std::mutex> lock(DispatchLock());
     SetSignal(t, 1);
     SignalChanged();
@@ -326,8 +332,12 @@ uint32_t PrepareSystemThreadEx(uint32_t handle_out, uint32_t stack_size, uint32_
 
 bool CancelPreparedThread(const ThreadRef& t) {
     if (!t) return false;
-    ThreadState expected = ThreadState::kPrepared;
-    if (!t->state.compare_exchange_strong(expected, ThreadState::kCancelled)) return false;
+    {
+        std::lock_guard<std::mutex> lock(t->apc_lock);
+        ThreadState expected = ThreadState::kPrepared;
+        if (!t->state.compare_exchange_strong(expected, ThreadState::kCancelled)) return false;
+        t->apcs.clear();
+    }
     if (t->published_handle) CloseHandle(t->published_handle);
     ClearPublishedOutputs(*t);
     Unbind(std::static_pointer_cast<Object>(t));
@@ -346,27 +356,55 @@ bool StartThread(ThreadRef t) {
         t->state = ThreadState::kPrepared;
         return false;
     }
-    if (!Spawn([t] {
+    if (!StartKernelWorker([t](WorkerStopToken stop) {
         t_current = t;
         char name[32];
         std::snprintf(name, sizeof(name), "guest %X", t->id);
         NameHostThread(name);
         X86Context ctx;
         InitContext(*t, ctx);
+        WorkerStopCallback wake(stop, [t] {
+            t->stop_requested = true;
+            {
+                std::lock_guard<std::mutex> lock(t->apc_lock);
+                t->apcs.clear();
+            }
+            t->resume_cv.notify_all();
+            SignalChanged();
+        });
+        if (!wake.Ready()) {
+            MarkExited(*t, 0, ThreadState::kCancelled);
+            t->ctx = nullptr;
+            Unregister(t.get());
+            t_current.reset();
+            return;
+        }
         {
             std::unique_lock<std::mutex> lock(t->apc_lock);
-            t->resume_cv.wait(lock, [&] { return t->suspend.load() <= 0; });
+            t->resume_cv.wait(lock, [&] { return t->suspend.load() <= 0 || stop.StopRequested(); });
+        }
+        if (stop.StopRequested()) {
+            MarkExited(*t, 0, ThreadState::kCancelled);
+            t->ctx = nullptr;
+            Unregister(t.get());
+            t_current.reset();
+            return;
         }
         LOGI("thread %X starts at %08X (%08X, %08X)", t->id,
              t->system_routine ? t->system_routine : t->start_routine, t->start_routine, t->start_context);
-        uint32_t code;
-        if (t->system_routine)
-            code = CallGuest(ctx, t->system_routine, {t->start_routine, t->start_context});
-        else
-            code = CallGuest(ctx, t->start_routine, {t->start_context});
+        GuestDispatchLease dispatch_lease;
+        if (!dispatch_lease.Allowed()) {
+            MarkExited(*t, 0, ThreadState::kCancelled);
+            t->ctx = nullptr;
+            Unregister(t.get());
+            t_current.reset();
+            return;
+        }
+        const uint32_t code = t->system_routine
+                                  ? CallGuest(ctx, t->system_routine, {t->start_routine, t->start_context})
+                                  : CallGuest(ctx, t->start_routine, {t->start_context});
         LOGI("thread %X returned %08X", t->id, code);
         MarkExited(*t, code);
-        t->state = ThreadState::kExited;
         t->ctx = nullptr;
         Unregister(t.get());
         t_current.reset();
@@ -420,12 +458,57 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {
     }
 }
 
+bool StartManagedHostThread(const char* name, std::function<void(X86Context&, WorkerStopToken)> fn) {
+    ThreadRef t;
+    try {
+        t = std::make_shared<Thread>();
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    t->id = g_next_id.fetch_add(4);
+    if (!SetupGuestBlocks(*t, 0x20000, 0x100)) return false;
+    if (!TryBind(t, t->ethread)) {
+        FreeGuestBlocks(*t);
+        return false;
+    }
+    std::string n;
+    try {
+        n = name;
+    } catch (const std::bad_alloc&) {
+        Unbind(t);
+        FreeGuestBlocks(*t);
+        return false;
+    }
+    t->state = ThreadState::kActive;
+    if (!StartKernelWorker([t, fn = std::move(fn), n = std::move(n)](WorkerStopToken stop) {
+            struct ReleaseHostThread {
+                ThreadRef thread;
+                ~ReleaseHostThread() {
+                    MarkExited(*thread, thread->exit_code);
+                    thread->ctx = nullptr;
+                    t_current.reset();
+                    Unbind(thread);
+                    FreeGuestBlocks(*thread);
+                }
+            } release{t};
+            t_current = t;
+            NameHostThread(n.c_str());
+            X86Context ctx;
+            InitContext(*t, ctx);
+            fn(ctx, stop);
+        })) {
+        Unbind(t);
+        FreeGuestBlocks(*t);
+        return false;
+    }
+    return true;
+}
+
 void ExitThread(uint32_t code) {
     Thread* t = Current();
     if (t) {
         LOGI("thread %X exits with %08X", t->id, code);
         MarkExited(*t, code);
-        t->state = ThreadState::kExited;
         t->ctx = nullptr;
         Unregister(t);
     }
@@ -438,28 +521,48 @@ void ExitThread(uint32_t code) {
 }
 
 void Resume(Thread& t) {
-    std::lock_guard<std::mutex> lock(t.apc_lock);
-    if (t.suspend > 0) t.suspend--;
+    {
+        std::lock_guard<std::mutex> lock(t.apc_lock);
+        if (t.suspend > 0) t.suspend--;
+    }
     t.resume_cv.notify_all();
+    SignalChanged();
 }
 
 uint32_t Suspend(Thread& t) {
-    uint32_t prev = uint32_t(t.suspend++);
+    uint32_t prev;
+    {
+        std::lock_guard<std::mutex> lock(t.apc_lock);
+        prev = uint32_t(t.suspend++);
+    }
+    t.resume_cv.notify_all();
+    SignalChanged();
     if (&t == Current()) SuspendPoint();
     return prev;
 }
 
 void SuspendPoint() {
     Thread* t = Current();
-    if (!t || t->suspend.load() <= 0) return;
+    if (!t || t->suspend.load() <= 0 || t->stop_requested.load()) return;
     std::unique_lock<std::mutex> lock(t->apc_lock);
-    t->resume_cv.wait(lock, [&] { return t->suspend.load() <= 0; });
+    t->resume_cv.wait(lock, [&] { return t->suspend.load() <= 0 || t->stop_requested.load(); });
 }
 
-void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3) {
-    std::lock_guard<std::mutex> lock(t.apc_lock);
-    t.apcs.push_back({routine, a1, a2, a3});
+bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3) {
+    if (!KernelWorkersAccepting()) return false;
+    {
+        std::lock_guard<std::mutex> lock(t.apc_lock);
+        const ThreadState state = t.state.load();
+        if (!KernelWorkersAccepting() || state == ThreadState::kExited || state == ThreadState::kCancelled) return false;
+        try {
+            t.apcs.push_back({routine, a1, a2, a3});
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+    }
+    t.resume_cv.notify_all();
     SignalChanged();
+    return true;
 }
 
 bool RunApcs(Thread& t) {
@@ -468,10 +571,15 @@ bool RunApcs(Thread& t) {
         std::array<uint32_t, 4> a;
         {
             std::lock_guard<std::mutex> lock(t.apc_lock);
-            if (t.apcs.empty()) break;
+            if (!KernelWorkersAccepting() || t.apcs.empty()) {
+                t.apcs.clear();
+                break;
+            }
             a = t.apcs.front();
             t.apcs.pop_front();
         }
+        GuestDispatchLease dispatch_lease;
+        if (!dispatch_lease.Allowed()) break;
         CallGuest(*t.ctx, a[0], {a[1], a[2], a[3]});
         ran = true;
     }

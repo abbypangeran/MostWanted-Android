@@ -1138,3 +1138,67 @@ All generated XBE/C++ and build outputs remain in ignored `.local/ios-port/` dir
 | Android | `:app:assembleDebug` passed with Java 21 and NDK 28.2.13676358; the existing SDK XML v4 compatibility notices were nonfatal. |
 
 **Integration and release status:** changes remain on `feature/ios-port`; no merge to `main`, release, real XBE execution, guest callback, thread activation, or physical-device installation occurred. The task authorizes a normal fast-forward push. **Next action:** preserve the Apple guard and do not start a restricted guest-execution experiment until callback page lifetime, worker shutdown/join, non-transactional file-status semantics, scatter/gather, and later HLE access boundaries receive separate review and tests.
+
+## Phase 2C-11 worker quiescence and IOSB lifetime
+
+This checkpoint adds an owned worker lifecycle for guest-thread, DPC, and timer workers. It rejects registrations once shutdown starts, signals cancellation, wakes waits (including guest delays and dispatcher waits), drains or invalidates queued callbacks, joins accepted workers, and supports a later clean runtime cycle. Explicit states cover prepared, running, stop-requested, quiescing, joining, joined, and resources-released. Naturally exited workers are reaped on later registration, including registration from another managed worker, without retaining native thread resources until shutdown. A shared join state prevents two callers from joining the same worker. Thread completion and APC queueing synchronize on the per-thread APC lock, and completion clears pending APCs. The clock worker remains separately owned and joined by the memory lifecycle; an earlier clock update failure no longer prevents teardown after the worker has joined. Android-compatible public kernel exports and thread-start behavior are unchanged. A small stop-token/callback implementation replaces `std::stop_token`, which the configured NDK 28.2 libc++ does not provide; callback registration failure exits the affected wait worker safely.
+
+| Worker family | Phase 2C-11 result | Boundary |
+| --- | --- | --- |
+| Guest-thread workers | Managed; stop wakes suspended threads and drops queued APCs. | Active guest instructions are not interrupted. Teardown waits for the callback to return. |
+| DPC workers | Managed; scheduling is rejected during shutdown and queued DPCs are cleared. | DPC structure fields, routine, and context remain raw guest VAs. |
+| Timer worker | Managed; scheduling is rejected and timer queue/sequence state is cleared. | Expiry may queue APC/DPC VAs; pages are not pinned for later callback use. |
+| Kernel clock | Separately joined before guest-memory unmap. | Not a callback-dispatch worker. |
+| DirectSound and vertical-blank workers | Excluded and inventoried. | Detached `StartHostThread` loops retain guest buffers or dispatch guest callbacks. |
+| Input poller, XNet pump, GPU render thread, XAudio2 output | Excluded and inventoried. | Detached workers can write guest state, retain guest buffers, or outlive renderer state. |
+
+`GuestDispatchLease` prevents managed workers from starting new guest dispatch after shutdown and makes teardown wait for active dispatch. It does not forcibly interrupt a thread already executing guest instructions. The worker tests use synthetic host callbacks and deterministic barriers; they cover creation failure, pre-activation and suspended cancellation, managed-child reaping including a verified join-wait/reaper race, queue invalidation, post-shutdown rejection, concurrent submit/shutdown, external join during self-join rejection, repeated lifecycle cycles, and memory/dispatch teardown ordering. The simulator fixture also exercises the production dispatcher wait: suspension pauses a waiting host worker until resume, and shutdown drops a queued APC and returns cancellation without dispatching its routine. Completion rejects later APC registration. These tests do not call `CallGuest`; they do not directly execute the guest `KeDelayExecutionThread` export.
+
+Contiguous `NtReadFile`/`NtWriteFile` exports now acquire an RAII writable-page lease for the nonzero 8-byte IOSB before resetting the event or performing host I/O. The lease blocks protection changes, decommit, virtual free, and memory shutdown until the status/byte-count pair is published. It does not hold the global memory mutex across host I/O. Completion signaling occurs after checked publication, and the lease releases on every return path. Real export tests cover preflight rejection, concurrent decommit/protection, short read, EOF, injected host errors, repeated operations, and shutdown while I/O is paused. Shutdown waits for that I/O to finish; there is no mid-I/O cancellation API. Host file effects and cursor changes are not transactional and are not rolled back after an error. Scatter/gather remains outside this phase.
+
+### Phase 2C-11 integration regression
+
+| Platform/check | Result |
+| --- | --- |
+| macOS ARM64 memory and worker lifecycle | Debug and Release CTest passed 1/1 each; direct assertion runs reported 395 `PASS` lines in each configuration, with no `FAIL` lines. |
+| Generated recompiler and kernel ABI fixtures | Debug and Release CTest passed 2/2 each. |
+| iOS Simulator | iPhone 18 Pro ran the Debug memory/preparation app to completion: 803 `PASS` lines and no `FAIL` lines. |
+| Unsigned iPhoneOS ARM64 | Debug memory-test app compiled and linked as an arm64 Mach-O; `codesign` reports the app is unsigned. It was not installed on hardware. |
+| Android | `:app:assembleDebug` reached native linking with Java 21 and NDK 28.2.13676358, then failed on undefined `X86FuncMappingCount` and `X86ContinuationCount`. The `generated/game` link points to ignored `.local/ios-port/generated/game`, whose mapping file lacks those count definitions although the current recompiler generator emits them. Generated C++ was left untouched and uncommitted. |
+
+The Android C++ compilation succeeded, including the changed runtime sources; linking then failed because this checkout's ignored generated mapping omits the two count definitions. The first Android attempt also exposed the NDK's missing `std::stop_token`; the portable lifecycle token resolved that compile error. The first macOS Debug run caught a timing-sensitive assertion in the new repeated-cycle test; it now synchronizes task entry before shutdown. Android platform regression remains **BLOCKED** until a current generated mapping is supplied.
+
+The final commands were run from the repository root:
+
+```sh
+cmake --build .local/ios-port/phase2c11-worker --config Debug --parallel
+ctest --test-dir .local/ios-port/phase2c11-worker -C Debug --output-on-failure
+.local/ios-port/phase2c11-worker/Debug/mostwanted_memory_tests
+cmake --build .local/ios-port/phase2c11-worker --config Release --parallel
+ctest --test-dir .local/ios-port/phase2c11-worker -C Release --output-on-failure
+.local/ios-port/phase2c11-worker/Release/mostwanted_memory_tests
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Debug --parallel
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Debug --output-on-failure
+cmake --build .local/ios-port/recompiler-fixtures-xcode --config Release --parallel
+ctest --test-dir .local/ios-port/recompiler-fixtures-xcode -C Release --output-on-failure
+cmake --build .local/ios-port/ios-simulator --config Debug --target mostwanted_memory_tests --parallel
+xcrun simctl install 43A6197F-AD68-48D4-84DB-6A147D89B8DC .local/ios-port/ios-simulator/Debug-iphonesimulator/mostwanted_memory_tests.app
+xcrun simctl launch --console-pty --terminate-running-process 43A6197F-AD68-48D4-84DB-6A147D89B8DC com.racas.mostwanted.memorytests
+cmake --build .local/ios-port/ios-device --config Debug --target mostwanted_memory_tests --parallel
+file .local/ios-port/ios-device/Debug-iphoneos/mostwanted_memory_tests.app/mostwanted_memory_tests
+codesign -dv --verbose=2 .local/ios-port/ios-device/Debug-iphoneos/mostwanted_memory_tests.app
+env JAVA_HOME=/opt/homebrew/opt/openjdk@21 ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk PATH=/opt/homebrew/opt/openjdk@21/bin:/Users/abbypangeran/Library/Android/sdk/platform-tools:/Users/abbypangeran/Library/Android/sdk/cmdline-tools/latest/bin:$PATH bash ./gradlew :app:assembleDebug
+```
+
+Android's terminal failure was `ld.lld: error: undefined symbol: X86FuncMappingCount` and `ld.lld: error: undefined symbol: X86ContinuationCount`, referenced from `dispatch.cpp:80-81`; compilation completed before this link error. `codesign -dv` returned status 1 with `code object is not signed at all`, which confirms the required unsigned artifact.
+
+### Phase 2C-11 gates and delivery decision
+
+- **KERNEL_WORKER_QUIESCENCE: PASS for guest-thread, DPC, timer, and clock worker categories only.** Tests include managed-child reaping and production dispatcher wait suspension/APC cancellation. Detached DirectSound, vblank, input, XNet, render, and XAudio2 workers remain excluded.
+- **THREAD_PREPARATION_REGRESSION: PASS.** Preparation/rollback and no-worker activation assertions pass in the memory and synthetic fixture suites.
+- **IOSB_LIFETIME: PASS for contiguous file-export completion publication.** Concurrent page mutation and shutdown cannot invalidate the leased IOSB before publication. Host I/O effects are still non-transactional; explicit I/O cancellation is unsupported.
+- **CALLBACK_OWNERSHIP_AUDIT: PASS for the complete lifecycle/dependency inventory.** This does not authorize execution: callback targets/arguments remain guest VAs without full target validation or page pinning.
+- **PLATFORM_REGRESSION: macOS, generated fixtures, iOS Simulator, and unsigned iPhoneOS ARM64 PASS; Android BLOCKED by stale ignored generated output.**
+- **GUEST_EXECUTION_READINESS: NO-GO.** Preserve the Apple `Boot()` guard. Do not authorize `CallGuest` through thread/APC/DPC/timer callbacks.
+
+**Phase 2C-12 decision: NO-GO.** The next acceptance work must bound callback target/argument lifetime, address the excluded detached workers, and restore Android's generated mapping before any restricted guest-execution proposal. No main merge, real XBE execution, physical iPhone installation, IPA, or release was performed. The authorized delivery route remains a normal fast-forward push of the reviewed feature branch.

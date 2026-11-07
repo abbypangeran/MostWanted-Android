@@ -51,6 +51,7 @@ add_executable(checked_recompiler_tests
     ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
     ${XBE_SDK}/runtime/core/log.cpp
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
@@ -64,6 +65,7 @@ add_executable(checked_fault_handler_tests
     ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
     ${XBE_SDK}/runtime/core/log.cpp
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
     ${XBE_SDK}/runtime/kernel/guest_strings.cpp

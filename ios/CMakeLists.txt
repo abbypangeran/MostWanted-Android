@@ -38,6 +38,7 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     ../sdk/runtime/kernel/crypto.cpp
     ../sdk/runtime/kernel/memory.cpp
     ../sdk/runtime/kernel/clock_worker.cpp
+    ../sdk/runtime/kernel/worker_lifecycle.cpp
     ../sdk/runtime/kernel/kernel_data_init.cpp
     ../sdk/runtime/cpu/dispatch_table.cpp
     ../sdk/runtime/kernel/kernel_thunks.cpp
@@ -55,6 +56,7 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     memory-tests/file_transfer_export_tests.cpp
     memory-tests/checked_gpu_transfer_tests.cpp
     memory-tests/clock_worker_tests.cpp
+    memory-tests/worker_lifecycle_tests.cpp
     memory-tests/dispatch_table_tests.cpp
     memory-tests/kernel_thunk_tests.cpp
     memory-tests/filesystem_setup_tests.cpp
@@ -84,7 +86,11 @@ if(MOSTWANTED_CHECKED_FIXTURE_DIR)
     )
 endif()
 target_compile_features(mostwanted_memory_tests PRIVATE cxx_std_20)
-target_compile_definitions(mostwanted_memory_tests PRIVATE MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS=1)
+target_compile_definitions(mostwanted_memory_tests PRIVATE
+    MOSTWANTED_FILE_TRANSFER_EXPORT_TESTS=1
+    MOSTWANTED_KERNEL_WORKER_TESTS=1
+    MOSTWANTED_GUEST_PAGE_LEASE_TESTS=1
+)
 if(NOT MOSTWANTED_CHECKED_FIXTURE_DIR)
     target_compile_definitions(mostwanted_memory_tests PRIVATE MOSTWANTED_FILE_TRANSFER_TEST_STUBS=1)
 endif()

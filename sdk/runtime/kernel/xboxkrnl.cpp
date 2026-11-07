@@ -8,6 +8,7 @@
 #include "kernel/clock_worker.h"
 #include "kernel/crypto.h"
 #include "kernel/kernel_data_init.h"
+#include "kernel/worker_lifecycle.h"
 #include "kernel/exports.h"
 #include "xbe/image_loader.h"
 #include "xbe/xbe.h"
@@ -284,20 +285,30 @@ KERNEL_EXPORT(99, KeDelayExecutionThread, 3) {
     Thread* t = Current();
     if (alertable && t && RunApcs(*t)) return kUserApc;
     int64_t deadline = ToDeadline(interval);
-    auto now = [] {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    };
     SuspendPoint();
+    if (t && t->stop_requested.load()) return kAlerted;
     if (interval == 0) {
         std::this_thread::yield();
         return kSuccess;
     }
-    while (now() < deadline) {
-        int64_t left = deadline - now();
-        std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<int64_t>(left, 2000000)));
+    const auto until = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(deadline));
+    while (std::chrono::steady_clock::now() < until) {
+        if (t && t->stop_requested.load()) return kAlerted;
         if (alertable && t && RunApcs(*t)) return kUserApc;
+        if (!t) {
+            std::this_thread::sleep_until(until);
+            break;
+        }
+        std::unique_lock<std::mutex> lock(t->apc_lock);
+        t->resume_cv.wait_until(lock, until, [&] {
+            return t->stop_requested.load() || t->suspend.load() > 0 || (alertable && !t->apcs.empty());
+        });
+        if (t->stop_requested.load()) return kAlerted;
+        const bool suspended = t->suspend.load() > 0;
+        lock.unlock();
+        if (suspended) SuspendPoint();
     }
-    return kSuccess;
+    return t && t->stop_requested.load() ? kAlerted : kSuccess;
 }
 
 static int64_t DaysFromCivil(int64_t y, unsigned m, unsigned d) {
@@ -732,21 +743,21 @@ KERNEL_EXPORT(113, KeInitializeTimerEx, 2) {
 }
 
 KERNEL_EXPORT(150, KeSetTimerEx, 5) {
+    if (!KernelWorkersAccepting()) return 0;
     ObjectRef t = FromPointer(a[0]);
     bool was = CancelTimer(*t);
     int64_t due = int64_t(uint64_t(a[1]) | uint64_t(a[2]) << 32);
     W32(a[0] + 0x20, a[4]);  // KTIMER.Dpc
     W32(a[0] + 0x24, a[3]);  // KTIMER.Period
-    SetTimer(t, due, int32_t(a[3]), a[4]);
-    return was;
+    return SetTimer(t, due, int32_t(a[3]), a[4]) && was;
 }
 
 KERNEL_EXPORT(149, KeSetTimer, 4) {
+    if (!KernelWorkersAccepting()) return 0;
     ObjectRef t = FromPointer(a[0]);
     bool was = CancelTimer(*t);
     int64_t due = int64_t(uint64_t(a[1]) | uint64_t(a[2]) << 32);
-    SetTimer(t, due, 0, a[3]);
-    return was;
+    return SetTimer(t, due, 0, a[3]) && was;
 }
 
 KERNEL_EXPORT(97, KeCancelTimer, 1) { return CancelTimer(*FromPointer(a[0])); }
@@ -769,13 +780,15 @@ KERNEL_EXPORT(194, NtCreateTimer, 3) {
 
 // timer, due, apc routine, apc mode, apc context, resume, period ms, previous state
 KERNEL_EXPORT(229, NtSetTimerEx, 8) {
+    if (!KernelWorkersAccepting()) return kUnsuccessful;
     ObjectRef o = FromHandle(a[0]);
     if (!o) return kInvalidHandle;
     if (o->type != ObjType::Timer) return kObjectTypeMismatch;
     if (a[7]) G<uint8_t>(a[7]) = o->signal > 0;
     CancelTimer(*o);
-    SetTimer(o, int64_t(R64(a[1])), int32_t(a[6]), 0, a[2] ? CurrentRef() : nullptr, a[2], a[4]);
-    return kSuccess;
+    return SetTimer(o, int64_t(R64(a[1])), int32_t(a[6]), 0, a[2] ? CurrentRef() : nullptr, a[2], a[4])
+               ? kSuccess
+               : kUnsuccessful;
 }
 
 KERNEL_EXPORT(185, NtCancelTimer, 2) {
@@ -799,7 +812,10 @@ KERNEL_EXPORT(119, KeInsertQueueDpc, 3) {
     uint32_t d = a[0];
     if (G<uint8_t>(d + 2)) return 0;  // already Inserted
     G<uint8_t>(d + 2) = 1;
-    QueueDpc(d, a[1], a[2]);
+    if (!QueueDpc(d, a[1], a[2])) {
+        G<uint8_t>(d + 2) = 0;
+        return 0;
+    }
     return 1;
 }
 
@@ -892,8 +908,7 @@ KERNEL_EXPORT(254, PsCreateSystemThread, 5) {
 KERNEL_EXPORT(206, NtQueueApcThread, 5) {
     ObjectRef o = FromHandle(a[0]);
     if (!o || o->type != ObjType::Thread) return kInvalidHandle;
-    QueueApc(static_cast<Thread&>(*o), a[1], a[2], a[3], a[4]);
-    return kSuccess;
+    return QueueApc(static_cast<Thread&>(*o), a[1], a[2], a[3], a[4]) ? kSuccess : kUnsuccessful;
 }
 
 KERNEL_EXPORT(148, KeSetPriorityThread, 2) {

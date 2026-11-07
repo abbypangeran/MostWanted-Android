@@ -1,7 +1,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -24,10 +26,73 @@ namespace mem {
 
 static uint8_t* g_base = nullptr;
 static bool g_poisoned = false;
-// shortcut: one lock serializes checked access and page changes; use page pins when concurrent throughput matters.
+// Page mutations mark and wait without g_lock so leased users can publish through checked memory access.
 static std::recursive_mutex g_lock;
+static std::recursive_mutex g_virtual_ranges_lock;
+constexpr uint32_t kGuestPageCount = 1u << 20;
+static std::mutex g_page_lease_lock;
+static std::condition_variable g_page_lease_changed;
+static std::vector<uint32_t> g_page_leases(kGuestPageCount, 0);
+static std::vector<uint8_t> g_page_mutating(kGuestPageCount, 0);
+#ifdef MOSTWANTED_GUEST_PAGE_LEASE_TESTS
+static std::atomic<PageMutationWaitHook> g_page_mutation_wait_hook{nullptr};
+#endif
+
+namespace {
+
+class ScopedPageMutation {
+public:
+    ScopedPageMutation(uint32_t first, uint32_t count) : first_(first), count_(count) {
+        if (!count_) return;
+        std::unique_lock lock(g_page_lease_lock);
+        g_page_lease_changed.wait(lock, [&] {
+            for (uint32_t p = first_; p < first_ + count_; ++p)
+                if (g_page_mutating[p]) return false;
+            return true;
+        });
+        for (uint32_t p = first_; p < first_ + count_; ++p) g_page_mutating[p] = 1;
+#ifdef MOSTWANTED_GUEST_PAGE_LEASE_TESTS
+        auto pinned = [&] {
+            for (uint32_t p = first_; p < first_ + count_; ++p)
+                if (g_page_leases[p]) return true;
+            return false;
+        };
+        if (pinned())
+            if (auto hook = g_page_mutation_wait_hook.load()) hook();
+        g_page_lease_changed.wait(lock, [&] { return !pinned(); });
+#else
+        g_page_lease_changed.wait(lock, [&] {
+            for (uint32_t p = first_; p < first_ + count_; ++p)
+                if (g_page_leases[p]) return false;
+            return true;
+        });
+#endif
+        active_ = true;
+    }
+
+    ~ScopedPageMutation() {
+        if (!active_) return;
+        {
+            std::lock_guard lock(g_page_lease_lock);
+            for (uint32_t p = first_; p < first_ + count_; ++p) g_page_mutating[p] = 0;
+        }
+        g_page_lease_changed.notify_all();
+    }
+
+private:
+    uint32_t first_;
+    uint32_t count_;
+    bool active_ = false;
+};
+
+}  // namespace
+
 ScopedLock::ScopedLock() : lock_(g_lock) {}
 ScopedLock::~ScopedLock() = default;
+void ScopedLock::Unlock() { if (lock_.owns_lock()) lock_.unlock(); }
+void ScopedLock::Lock() { if (!lock_.owns_lock()) lock_.lock(); }
+ScopedVirtualRangeLock::ScopedVirtualRangeLock() : lock_(g_virtual_ranges_lock) {}
+ScopedVirtualRangeLock::~ScopedVirtualRangeLock() = default;
 #ifdef _WIN32
 static HANDLE g_ram_mapping = nullptr;
 #endif
@@ -65,8 +130,7 @@ bool Init() {
     kernel::KernelMemoryLifecycle lifecycle;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_base) {
-        lifecycle.SetReady(!g_poisoned);
-        return !g_poisoned;
+        return lifecycle.SetReady(!g_poisoned);
     }
     const uint64_t size = 1ull << 32;
 #ifdef _WIN32
@@ -141,7 +205,7 @@ bool Init() {
         LOGE("memory: could not reserve the 4 GB guest space");
         return false;
     }
-    lifecycle.SetReady(true);
+    if (!lifecycle.SetReady(true)) return false;
     LOGI("memory: guest space at %p", static_cast<void*>(g_base));
     return true;
 }
@@ -151,12 +215,14 @@ static std::vector<uint8_t> g_committed(0x100000, 0);
 static std::vector<uint8_t> g_permissions(0x100000, kNoAccess);
 
 bool Commit(uint32_t va, uint32_t size) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (!size) return true;
-    if (!g_base || g_poisoned) return false;
     uint64_t requested_end = uint64_t(va) + size;
     if (requested_end > (1ull << 32)) return false;
     if (OverlapsPhysical(va, requested_end)) return IsPhysicalRange(va, requested_end);
+    std::unique_lock<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock, std::defer_lock);
+    if (va < kUserHigh && requested_end > kUserLow) ranges_lock.lock();
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!g_base || g_poisoned) return false;
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
 #ifdef __APPLE__
@@ -193,14 +259,15 @@ bool Commit(uint32_t va, uint32_t size) {
 }
 
 bool Decommit(uint32_t va, uint32_t size) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (!size) return true;
-    if (!g_base || g_poisoned) return false;
     uint64_t requested_end = uint64_t(va) + size;
     if (requested_end > (1ull << 32)) return false;
     if (OverlapsPhysical(va, requested_end)) return IsPhysicalRange(va, requested_end);
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
+    ScopedPageMutation mutation(first >> 12, uint32_t((end - first) >> 12));
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!g_base || g_poisoned) return false;
 #ifdef __APPLE__
     static const uint64_t host_page = uint64_t(sysconf(_SC_PAGESIZE));
     if (host_page < kPage || (host_page & (host_page - 1))) return false;
@@ -284,6 +351,62 @@ AccessStatus CheckAccess(uint32_t va, std::size_t size, uint8_t permissions) {
     return CheckAccessLocked(va, size, permissions);
 }
 
+ScopedPageLease::~ScopedPageLease() { Release(); }
+
+ScopedPageLease::ScopedPageLease(ScopedPageLease&& other) noexcept
+    : first_page_(std::exchange(other.first_page_, 0)),
+      page_count_(std::exchange(other.page_count_, 0)),
+      active_(std::exchange(other.active_, false)) {}
+
+ScopedPageLease& ScopedPageLease::operator=(ScopedPageLease&& other) noexcept {
+    if (this == &other) return *this;
+    Release();
+    first_page_ = std::exchange(other.first_page_, 0);
+    page_count_ = std::exchange(other.page_count_, 0);
+    active_ = std::exchange(other.active_, false);
+    return *this;
+}
+
+AccessStatus ScopedPageLease::Acquire(uint32_t va, std::size_t size, uint8_t permissions) {
+    Release();
+    if (!size) return CheckAccess(va, 0, permissions);
+    if (size > (1ull << 32) - va) return AccessStatus::kInvalidAddress;
+    const uint32_t first = va >> 12;
+    const uint64_t end = uint64_t(va) + size;
+    const uint32_t count = uint32_t(((end - 1) >> 12) - first + 1);
+    {
+        std::unique_lock lock(g_page_lease_lock);
+        g_page_lease_changed.wait(lock, [&] {
+            for (uint32_t p = first; p < first + count; ++p)
+                if (g_page_mutating[p]) return false;
+            return true;
+        });
+        for (uint32_t p = first; p < first + count; ++p) ++g_page_leases[p];
+    }
+    first_page_ = first;
+    page_count_ = count;
+    active_ = true;
+    const AccessStatus status = CheckAccess(va, size, permissions);
+    if (status != AccessStatus::kOk) Release();
+    return status;
+}
+
+void ScopedPageLease::Release() {
+    if (!active_) return;
+    {
+        std::lock_guard lock(g_page_lease_lock);
+        for (uint32_t p = first_page_; p < first_page_ + page_count_; ++p)
+            if (g_page_leases[p]) --g_page_leases[p];
+    }
+    active_ = false;
+    first_page_ = page_count_ = 0;
+    g_page_lease_changed.notify_all();
+}
+
+#ifdef MOSTWANTED_GUEST_PAGE_LEASE_TESTS
+void SetPageMutationWaitHookForTest(PageMutationWaitHook hook) { g_page_mutation_wait_hook.store(hook); }
+#endif
+
 const char* StatusName(AccessStatus status) {
     switch (status) {
         case AccessStatus::kOk: return "ok";
@@ -297,13 +420,14 @@ const char* StatusName(AccessStatus status) {
 }
 
 AccessStatus Protect(uint32_t va, uint32_t size, uint8_t permissions) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (permissions & ~(kRead | kWrite | kExecute)) return AccessStatus::kPermissionDenied;
     if (!size || uint64_t(va) + size > (1ull << 32)) return AccessStatus::kInvalidAddress;
     const uint64_t end = uint64_t(va) + size;
     if (OverlapsPhysical(va, end)) return AccessStatus::kInvalidAddress;
     const uint64_t first = va & ~(uint64_t(kPage) - 1);
     const uint64_t last = (end + kPage - 1) & ~(uint64_t(kPage) - 1);
+    ScopedPageMutation mutation(uint32_t(first >> 12), uint32_t((last - first) >> 12));
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     AccessStatus status = CheckAccessLocked(uint32_t(first), size_t(last - first), kNoAccess);
     if (status != AccessStatus::kOk) return status;
     for (uint64_t p = first; p < last; p += kPage) g_permissions[size_t(p >> 12)] = permissions;
@@ -513,7 +637,12 @@ static void EnsureRanges() {
 
 void Shutdown() {
     kernel::KernelMemoryLifecycle lifecycle;
-    lifecycle.StopWorker();
+    if (!lifecycle.StopWorker()) {
+        LOGE("memory: kernel workers could not be joined; guest memory remains mapped");
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock);
+    ScopedPageMutation mutation(0, kGuestPageCount);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (!g_base) return;
     const uint64_t size = 1ull << 32;
@@ -551,6 +680,7 @@ void Shutdown() {
 }
 
 bool ReserveImage(uint32_t base, uint32_t size) {
+    std::lock_guard<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
     uint64_t requested_end = uint64_t(base) + size;
@@ -581,6 +711,7 @@ static Reservation* FindReservation(uint32_t addr, uint32_t* start) {
 }
 
 uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t protect) {
+    std::lock_guard<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
     if (!size) return 0xC000000D;  // STATUS_INVALID_PARAMETER
@@ -653,28 +784,36 @@ uint32_t AllocateVirtual(uint32_t& base, uint32_t& size, uint32_t type, uint32_t
 }
 
 uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t start;
-    Reservation* r = FindReservation(base, &start);
-    if (!r) return 0xC000009F;  // STATUS_MEMORY_NOT_ALLOCATED
-    if (type & kMemRelease) {
-        uint32_t sz = r->size;
-        if (!Decommit(start, sz)) return 0xC0000017;  // STATUS_NO_MEMORY
-        g_reserved.erase(start);
-        g_user.Release(start, sz);
-        base = start;
-        size = sz;
-        return 0;
+    std::lock_guard ranges_lock(g_virtual_ranges_lock);
+    uint32_t start, first, end, reserved_size;
+    const bool release = type & kMemRelease;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_lock);
+        Reservation* r = FindReservation(base, &start);
+        if (!r) return 0xC000009F;  // STATUS_MEMORY_NOT_ALLOCATED
+        reserved_size = r->size;
+        first = release || !size ? start : base & ~(kPage - 1);
+        uint64_t end64 = release || !size ? uint64_t(start) + r->size
+                                         : (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1);
+        if (end64 > uint64_t(start) + r->size || end64 < first) return 0xC0000018;
+        end = uint32_t(end64);
     }
-    uint32_t first = size ? base & ~(kPage - 1) : start;
-    uint64_t end64 = size ? (uint64_t(base) + size + kPage - 1) & ~uint64_t(kPage - 1)
-                          : uint64_t(start) + r->size;
-    if (end64 > uint64_t(start) + r->size || end64 < first) return 0xC0000018;
-    uint32_t end = uint32_t(end64);
     if (!Decommit(first, end - first)) return 0xC0000017;  // STATUS_NO_MEMORY
-    for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 0;
-    base = first;
-    size = end - first;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_lock);
+        Reservation* r = FindReservation(start, &start);
+        if (!r) return 0xC000009F;
+        if (release) {
+            g_reserved.erase(start);
+            g_user.Release(start, reserved_size);
+            base = start;
+            size = reserved_size;
+        } else {
+            for (uint32_t p = first; p < end; p += kPage) r->commit[(p - start) / kPage] = 0;
+            base = first;
+            size = end - first;
+        }
+    }
     return 0;
 }
 
@@ -750,7 +889,6 @@ uint32_t AllocSystem(uint32_t size, uint32_t align) {
         return 0;
     }
     if (Fill(a, 0, size) != AccessStatus::kOk) {
-        Decommit(a, size);
         g_system.Free(a);
         return 0;
     }
@@ -763,6 +901,7 @@ void FreeSystem(uint32_t va) {
 }
 
 uint32_t AllocStack(uint32_t size) {
+    std::lock_guard<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     EnsureRanges();
     size = (size + 0xFFFF) & ~0xFFFFu;
@@ -778,12 +917,19 @@ uint32_t AllocStack(uint32_t size) {
 }
 
 void FreeStack(uint32_t top) {
+    std::lock_guard<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock);
+    uint32_t start, size;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_lock);
+        auto it = g_stack_tops.find(top);
+        if (it == g_stack_tops.end()) return;
+        start = it->second;
+        size = g_stacks.SizeOf(start);
+    }
+    if (!size || !Decommit(start, size)) return;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     auto it = g_stack_tops.find(top);
-    if (it == g_stack_tops.end()) return;
-    uint32_t start = it->second;
-    uint32_t size = g_stacks.SizeOf(start);
-    if (size && Decommit(start, size) && g_stacks.Free(start)) g_stack_tops.erase(it);
+    if (it != g_stack_tops.end() && it->second == start && g_stacks.Free(start)) g_stack_tops.erase(it);
 }
 
 uint32_t AllocationSize(uint32_t va) {

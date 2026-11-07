@@ -9,6 +9,7 @@ extern int RunCheckedFileTransferTests(void);
 extern int RunFileTransferExportTests(void);
 extern int RunCheckedGpuTransferTests(void);
 extern int RunClockWorkerTests(void);
+extern int RunWorkerLifecycleTests(void);
 extern int RunDispatchTableTests(void);
 extern int RunKernelThunkTests(void);
 extern int RunFilesystemSetupTests(void);
@@ -32,6 +33,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     failures += RunFileTransferExportTests();
     failures += RunCheckedGpuTransferTests();
     failures += RunClockWorkerTests();
+    failures += RunWorkerLifecycleTests();
     failures += RunDispatchTableTests();
     failures += RunKernelThunkTests();
     failures += RunFilesystemSetupTests();
