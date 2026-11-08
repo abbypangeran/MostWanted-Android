@@ -1640,3 +1640,107 @@ Focused tests added: unsupervised `--child execute` refusal, supervised token/fd
 - `REAL_EXECUTION_READINESS`: **GO for one bounded micro-execution** after explicit approval. **NO-GO** past `002B5CE0`, for any import/callback/worker, or for boot.
 - `REAL_GUEST_EXECUTION`: **NO-GO throughout Phase 2C-16.** No real XBE instruction ran.
 - Integration and release: work remains on `feature/ios-port`; no merge to `main`, physical-device install, IPA, deployment, or release occurred.
+
+## Phase 2C-17 first real-XBE micro-execution
+
+Authorised run of the Phase 2C-16 binary at `f3a39ec3fed639999bda30a6fe797962457a63b2`, one supervised `--run-once --execute-real` invocation. **REAL_XBE_MICRO_EXECUTION: PASS.** This is genuine game instruction execution on macOS, not an iOS game boot.
+
+### Observed outcomes (ignored evidence: `.local/ios-port/phase2c17-evidence/`)
+
+| Item | Observed |
+| --- | --- |
+| First / last PC | `002B3916` / `002B5CDF` |
+| Instructions | 49 |
+| Direct calls | 1 (`002B396A` → `002B5CA7`) |
+| Branches | entry `002B392A` `JNB` taken; helper `002B5CAF` `JNZ` not taken |
+| Import reads | 0 |
+| Workers / active threads | 0 / 0 |
+| Guest memory | 9 changes, including `[004EDC74]=00000094` and `[004DF78C]=FFFFFFDB` |
+| Exit status | 0 |
+| Teardown | `system_used=0 contiguous_used=0 virtual_committed=0 workers=0 initialized=0` |
+
+### Reporting-label correction (no re-run)
+
+The step hook records **pre-instruction** registers. `STEP 002B3916 ... ecx=00000000` is therefore the state *before* `002B3916 mov ecx,[0x10118]`; the value `00010184` first appears at `STEP 002B391C`, which is the state before the next instruction. The trace is correct; the first line's register set must be read as "before instruction". The Phase 2C-18 report labels the trace accordingly. No game execution was repeated to adjust evidence.
+
+### Decision
+
+- `REAL_GUEST_EXECUTION`: **PASS** for the 49-instruction prefix.
+- `IOS_GAME_BOOT`: **NO-GO** — nothing was built, installed or run on iOS in this phase.
+- Next reachable blocker: `002B5CE0 CALL [003C9E68]`, ordinal 255, which Phase 2C-16 deliberately refused.
+
+## Phase 2C-18 ordinal-255 import boundary
+
+Baseline: `f3a39ec3fed639999bda30a6fe797962457a63b2` on `feature/ios-port`. The probe route gains exactly one guest instruction, `002B5CE0 CALL dword ptr [003C9E68]` (`FF 15 68 9E 3C 00`), and the mandatory stop moves to the first PC that must never run, `002B5CE6`. **No real XBE instruction was executed in this phase.**
+
+### Extended route and mapping
+
+| Check | Result |
+| --- | --- |
+| Reviewed route | **51/51** instructions; 152 bytes; FNV-1a `0x08207c9bb6b0e42c` |
+| Identity | SHA-1 `f636a16af04171089f879a4bed646e185c734233`, title `4541007B`, entry `002B3916`, base `00010000` |
+| Generated mapping | 2 functions, 0 continuations, 51 `ProbeStep` hooks, one `ProbeStop_0x002B5CE0` |
+| Import call line | `x86_checked_indirect_call(ctx, base, 0x3C9E68u, 0x2B5CE6u, 0x2B5CE0u)`, exactly once |
+| Stop ordering | stop hook after the checked import call; no instruction or label at `002B5CE6` |
+| Function end | `0x002B5CE6`, so the call is the last decoded instruction |
+
+The generated source is rejected if it contains any other `0x3C9E68u`, a second indirect call, `x86_icall`/`x86_kernel`/`x86_resume`, code beyond the call, or anything but the two reviewed functions.
+
+### Authentic import arguments
+
+The reviewed helper's pushes are validated against authentic image data and the freshly committed stack:
+
+| # | Value | Source |
+| --- | --- | --- |
+| 0 `handle_out` | `D001FFD4` (`esp + 0x34`) | `lea eax,[ebp+0x0C]` |
+| 1 `extension` | `00000000` | `push 0` |
+| 2 `stack_size` | `00010000` | `[0x10130]` |
+| 3 `tls_size` | `00000094` | `[0x4EDC74]`, written at `002B394E` |
+| 4 `id_out` | `00000000` | `push [ebp+0x1C]`, zero stack slot |
+| 5 `start_routine` | `002B38A2` | `push 002B38A2` |
+| 6 `start_context` | `00000000` | `push [ebp+0x14]` |
+| 7 `suspended` | `00000000` | `([ebp+0x18] >> 2) & FFFFFF01` |
+| 8 `debugger` | `00000000` | `push 0` |
+| 9 `system_routine` | `002B5C0F` | `push 002B5C0F` |
+
+Call-site ESP is `D001FFA0` (`initial ESP - 0x50`); the checked call pushes return PC `002B5CE6`, resolves through `[003C9E68]`, and the ten-argument stdcall returns ESP to `D001FFC8`. The reviewed stack slots `+0x38`–`+0x44` must be zero before the run, and the preflight fails otherwise.
+
+### Real-image memory preparation
+
+The image is loaded through checked XBE preparation and starts read-only; `.text` becomes RX, `.data` RW. The import page `003C9000` is made **read-only** and only the authentic slot `003C9E68 = 800000FF` is patched, to `dispatch::KernelThunkAddress(255) = FE0003FC`, using the production import-patching convention. The authentic value, the probe value, the patched address and the restored value are printed. Teardown restores `800000FF` before freeing the image and verifies the readback. All reviewed pointer spans and the argument block are checked for overflow, import-page overlap, commitment, read/write permission, image containment and stack containment before any dereference.
+
+### Test-only ordinal-255 service
+
+`sdk/runtime/cpu/dispatch.cpp`'s existing `MOSTWANTED_CHECKED_KERNEL_ABI_TESTS` bridge admits only the registered `PsCreateSystemThreadEx` thunk. The probe registers a test handler that validates all ten arguments, calls `kernel::PrepareSystemThreadEx` with the authentic values, keeps the returned `ThreadRef`, and returns `kSuccess`. It never calls `StartThread`, never activates a worker, and never enters `002B38A2`, `002B5C0F`, `002B5CE6` or any downstream instruction. Cancellation runs after the postconditions and must close the handle, zero the published output, free the guest stack/system blocks and return `mem::Query()` to the pre-run baseline.
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| Real preflight, macOS Debug | **PASS** — 51/51 route, mapping, authentic globals and args, spans, stack, permissions, import restore, zero teardown |
+| Real preflight, macOS Release | **PASS** — same report |
+| Real self-test, Debug | **PASS** — 20 preflight/postcondition cases + supervision checks |
+| Real self-test, Release | **PASS** — same set |
+| Synthetic probe, Debug | **PASS** — 27 isolated scenarios, all closed failures tear down cleanly |
+| Synthetic probe, Release | **PASS** — same set |
+| Synthetic coverage | both entry branches; prepared-thread success + cancellation; unpatched/wrong-ordinal/unpermitted import; wrong export name; bad return span; bad stdcall cleanup; modified return address; uncommitted argument span; injected preparation failure; start-thread attempt; second import read; post-import entry; budgets, deadline, fault, re-entry, timeout |
+| Direct `--child execute` | Rejected without the supervised parent token |
+| Android | Not rebuilt; only `ios/` test sources, the ignored probe config and the test-only bridge macros changed |
+
+No Apple `Boot()`, callback gate or kernel-thunk production guard changed. Android protection-export behaviour is unaffected by construction; the residual risk is unchanged from Phase 2C-13 and no shared runtime code was modified.
+
+### Proposed next real-XBE command (not run)
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_real_preflight \
+  --preflight
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_real_preflight \
+  --run-once --execute-real
+```
+
+Expected: 50 instructions, one direct call, one import operand read, entry `JNB` taken, helper `JNZ` not taken, stop after `002B5CE0` and before `002B5CE6`, `[004EDC74]=0x94`, `[004DF78C]=0xFFFFFFDB`, the ten authentic arguments, a published inactive thread handle, no worker, and zero retained resources. Any other PC, call target, argument, permission, branch, timeout or postcondition aborts before the next instruction.
+
+### Decision
+
+- `ORDINAL_255_BOUNDARY`: **READY** — route, mapping, arguments and bridge are validated without game execution.
+- `REAL_EXECUTION`: **GO only for one additional bounded run** with the command above, after explicit approval. **NO-GO** for `002B5CE6`, `002B38A2`, `002B5C0F`, `StartThread`, any other import, callbacks, workers or boot.

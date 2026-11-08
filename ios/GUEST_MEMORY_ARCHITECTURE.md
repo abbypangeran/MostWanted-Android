@@ -250,3 +250,23 @@ Memory preparation preserves the loaded image and reads its authentic globals: `
 The same disposable child harness and 64/1/256/0/0/0 limits apply. Debug/Release synthetic suites pass 5/5; the real preflight and 12 negative checks pass; iOS Simulator memory tests pass 935/0; unsigned iPhoneOS is arm64. **No real XBE instruction has run.** The execution path (`--run-once --execute-real`) is built and refused without both flags; Phase 2C-16 recommends GO only for that single bounded run.
 
 Real execution is supervised: the parent passes a random token through inherited fd 3 and the environment, keeps the 15-second watchdog, and the child adds a 12-second alarm. Direct `--child execute` exits 2 without the handshake. A normal stop succeeds only with 49 instructions, one direct call, entry `JNB` taken, helper `JNZ` not taken, the authentic helper/IDIV register values, no import read or worker, `[0x004EDC74]=0x94`, the `0x4DF78C` store equal to the preflight result, the last trace PC at `002B5CDF`, and zero-resource teardown. Postcondition negatives are covered without executing game code.
+
+## Phase 2C-17 real execution evidence
+
+The 49-instruction real prefix ran in the disposable child and stopped before `002B5CE0`: entry `002B3916`, last `002B5CDF`, one direct call, entry `JNB` taken, helper `JNZ` not taken, `[004EDC74]=0x94`, `[004DF78C]=0xFFFFFFDB`, no import read, no worker, zero-resource teardown. Step registers are pre-instruction values; the `ecx=0x10184` produced at `002B3916` first appears on the `002B391C` line.
+
+## Phase 2C-18 ordinal-255 memory boundary
+
+The reviewed route now ends with `002B5CE0 call [003C9E68]` (6 bytes), so the route is 51 PCs / 152 bytes and the mandatory stop is after that instruction, at the never-executed `002B5CE6`.
+
+Memory policy changes are deliberately narrow:
+
+- The import page `003C9000` is now **read-only** rather than no-access, because the checked call must fetch its operand once.
+- The observer admits exactly one 4-byte read, only at `pc=002B5CE0` and `address=003C9E68`; a second read, a write, a read from another PC or any other import-page byte fails the run. `ImportReads()` must equal 1.
+- The authentic slot is `800000FF`; preparation patches it to `FE0003FC` (`dispatch::KernelThunkAddress(255)`) after protecting the page read/write, then restores read-only. Teardown restores `800000FF` and verifies the readback before freeing the image.
+- The image stays R, `.text` RX and `.data` RW; the import page is never executable and never writable during the run.
+- The argument block is `esp=D001FFA0`, 40 bytes inside the owned 64 KB stack, plus the handle output at `esp+0x34`. Both spans are checked for stack containment and read/write permission before the call.
+- The checked ABI validates the ten arguments, the return PC `002B5CE6` inside the generated code span, the stack write and the exact 10-argument stdcall cleanup before returning.
+- The ordinal-255 bridge prepares an inactive guest thread through `PrepareSystemThreadEx`; it never starts a worker. Cancellation must return `mem::Query()` to the pre-run baseline and free the prepared stack/system blocks.
+
+Synthetic fixtures additionally exercise the denied cases: unpatched ordinal encoding, wrong ordinal, wrong export name, uncommitted argument span, return PC outside generated code, wrong cleanup, modified return address, injected preparation failure, a start-thread attempt, a second import read, and entry at `002B5CE6`. All fail closed and tear down at zero resources. No real instruction beyond `002B5CE0` has run.

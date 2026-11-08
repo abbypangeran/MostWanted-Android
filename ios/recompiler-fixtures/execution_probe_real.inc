@@ -14,6 +14,31 @@ constexpr uint32_t kRealTargetPage = 0x004DF000;
 constexpr uint32_t kRealStackRequest = 0x4000;
 constexpr uint32_t kRealStackCommitted = 0x10000;  // AllocStack rounds the request to 64 KB
 constexpr uint32_t kRealStackHeadroom = 0x100;
+constexpr uint32_t kImportArgumentBytes = 10 * sizeof(uint32_t);
+
+// the reviewed route's stack slots in the helper frame; verified zero before
+// the run because the stack is freshly committed.
+constexpr uint32_t kImportStackSlots = 4;  // +0x38 a5, +0x3C a6, +0x40 a7, +0x44 a4
+
+// the prepared image's import slot is patched exactly once, to the reviewed
+// ordinal-255 thunk, and restored before teardown.
+uint32_t g_real_import_slot = 0;
+uint32_t g_real_import_original = 0;
+
+uint32_t g_real_worker_baseline = 0;
+
+void RestoreImportSlot() {
+    if (!g_real_import_slot) return;
+    uint32_t restored = 0;
+    bool ok = ProtectRange(kRealImportPage, mem::kPage, mem::kRead | mem::kWrite) &&
+              mem::Write(g_real_import_slot, &g_real_import_original, sizeof(g_real_import_original)) ==
+                  mem::AccessStatus::kOk &&
+              ProtectRange(kRealImportPage, mem::kPage, mem::kRead) &&
+              mem::Read(g_real_import_slot, &restored, sizeof(restored)) == mem::AccessStatus::kOk &&
+              restored == g_real_import_original;
+    std::printf("IMPORT restored=%08X ok=%d\n", restored, int(ok));
+    g_real_import_slot = 0;
+}
 
 struct RealFacts {
     uint32_t base = 0, image_size = 0, header_size = 0, sections = 0;
@@ -27,6 +52,10 @@ struct RealFacts {
     uint32_t counter_after = 0;
     uint32_t q = 0, q_before = 0, q_after = 0;
     uint32_t stack_base = 0, stack_top = 0, esp = 0;
+    uint32_t import_authentic = 0, import_target = 0;
+    uint32_t import_esp = 0, import_arg0 = 0, import_return = 0;
+    std::array<uint32_t, 10> import_args{};
+    uint32_t baseline_system = 0, baseline_contiguous = 0, baseline_virtual = 0;
     std::vector<Span> spans;
     std::vector<uint32_t> snapshot_pages;
 };
@@ -123,6 +152,14 @@ bool ValidateRealRouteText(const xbe::Image& image, std::string& error) {
                 error = std::string("route call target mismatch at ") + std::to_string(step.pc);
                 return false;
             }
+        } else if (step.kind == StepKind::kKernelCall) {
+            if (operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY || operands[0].mem.base != ZYDIS_REGISTER_NONE ||
+                operands[0].mem.index != ZYDIS_REGISTER_NONE || operands[0].size != 32 ||
+                operands[0].mem.disp.value != int64_t(kImportSlot) || step.pc != kImportCall ||
+                step.next != kImportReturn) {
+                error = "route import call mismatch";
+                return false;
+            }
         }
     }
 
@@ -131,20 +168,12 @@ bool ValidateRealRouteText(const xbe::Image& image, std::string& error) {
         return false;
     }
 
-    const int64_t stop_offset = image.Offset(kStopBefore);
-    const size_t stop_span = image.FileSpan(kStopBefore);
-    ZydisDecodedInstruction stop_instruction;
-    ZydisDecodedOperand stop_operands[ZYDIS_MAX_OPERAND_COUNT];
-    if (stop_offset < 0 ||
-        !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, image.file.data() + stop_offset, stop_span, &stop_instruction,
-                                             stop_operands)) ||
-        stop_instruction.mnemonic != ZYDIS_MNEMONIC_CALL || stop_operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY ||
-        stop_operands[0].mem.disp.value != int64_t(kRealImportSlot)) {
-        error = "stop instruction is not the expected import call";
+    if (FindStep(kStopBefore)) {
+        error = "stop PC is part of the reviewed route";
         return false;
     }
     uint32_t import = 0;
-    if (!image.Read32(kRealImportSlot, import) || import != kImportEncoding) {
+    if (!image.Read32(kImportSlot, import) || import != kImportEncoding) {
         error = "import slot is not the ordinal-255 encoding";
         return false;
     }
@@ -170,22 +199,30 @@ bool ValidateHookCoverageText(const std::string& header, const std::string& sour
         error = "generated hook counts are not exactly the reviewed set";
         return false;
     }
-    const size_t step_call = source.find("ProbeStep_0x002B5CDF(ctx");
-    const size_t stop_call = source.find("ProbeStop_0x002B5CDF(ctx");
+    const size_t step_call = source.find("ProbeStep_0x002B5CE0(ctx");
+    const size_t stop_call = source.find("ProbeStop_0x002B5CE0(ctx");
     if (step_call == std::string::npos || stop_call == std::string::npos || step_call > stop_call) {
-        error = "stop hook is not after the last reviewed instruction";
+        error = "stop hook is not after the reviewed import call";
         return false;
     }
-    const size_t stop_pc = source.find("2B5CE0");
-    if (stop_pc != std::string::npos && stop_call > stop_pc) {
-        error = "stop hook is not before the forbidden import call";
+    const std::string import_call =
+        "x86_checked_indirect_call(ctx, base, 0x3C9E68u, 0x2B5CE6u, 0x2B5CE0u)";
+    const size_t import_at = source.find(import_call);
+    if (import_at == std::string::npos || CountOccurrences(source, "x86_checked_indirect_call") != 1 ||
+        CountOccurrences(source, "0x3C9E68u") != 1) {
+        error = "generated source does not contain exactly the reviewed import call";
         return false;
     }
-    if (source.find("3C9E68") != std::string::npos) {
-        error = "generated source contains the forbidden import slot";
+    if (stop_call < import_at) {
+        error = "stop hook is not after the checked import call";
         return false;
     }
-    for (const char* forbidden : {"x86_checked_indirect_call", "x86_icall", "x86_kernel", "x86_resume"}) {
+    // the function must end at the call: no instruction or label beyond 0x2B5CE0
+    if (source.find("// 002B5CE6") != std::string::npos || source.find("loc_002B5CE6") != std::string::npos) {
+        error = "generated source contains code after the import call";
+        return false;
+    }
+    for (const char* forbidden : {"x86_icall", "x86_kernel", "x86_resume"}) {
         if (source.find(forbidden) != std::string::npos) {
             error = std::string("generated source contains ") + forbidden;
             return false;
@@ -315,6 +352,28 @@ bool ValidateStack(uint32_t base, uint32_t top, uint32_t esp, std::string& error
     return true;
 }
 
+bool ValidateStackSpan(const RealFacts& facts, uint32_t address, uint32_t size, const char* name, std::string& error) {
+    if (address < facts.stack_base || uint64_t(address) + size > facts.stack_top) {
+        error = std::string(name) + " is outside the reviewed guest stack";
+        return false;
+    }
+    if (mem::CheckAccess(address, size, mem::kReadWrite) != mem::AccessStatus::kOk) {
+        error = std::string(name) + " is not writable";
+        return false;
+    }
+    return true;
+}
+
+bool ValidateImportArguments(const RealFacts& facts, uint32_t esp, std::string& error) {
+    if (esp != facts.import_esp) {
+        error = "ordinal-255 argument address does not match the reviewed stack";
+        return false;
+    }
+    if (!ValidateStackSpan(facts, esp, kImportArgumentBytes, "import argument block", error)) return false;
+    if (!ValidateStackSpan(facts, facts.import_arg0, 4, "import handle output", error)) return false;
+    return true;
+}
+
 bool ValidatePagePermissions(const RealFacts& facts, std::string& error) {
     const RouteStep* first = FindStep(kEntry);
     const RouteStep* helper = FindStep(kCallTarget);
@@ -343,10 +402,29 @@ bool ValidatePagePermissions(const RealFacts& facts, std::string& error) {
         error = "the helper store pointer is not writable";
         return false;
     }
-    if (mem::CheckAccess(kRealImportPage, 4, mem::kRead) == mem::AccessStatus::kOk) {
-        error = "the ordinal-255 import page is readable";
+    if (mem::CheckAccess(kRealImportPage, 4, mem::kRead) != mem::AccessStatus::kOk) {
+        error = "the ordinal-255 import page is not readable";
         return false;
     }
+    if (mem::CheckAccess(kRealImportPage, 1, mem::kWrite) == mem::AccessStatus::kOk) {
+        error = "the ordinal-255 import page is writable";
+        return false;
+    }
+    if (mem::CheckAccess(kImportSlot, 4, mem::kExecute) == mem::AccessStatus::kOk) {
+        error = "the ordinal-255 import page is executable";
+        return false;
+    }
+    if (mem::CheckAccess(kImportReturn, 1, mem::kExecute) != mem::AccessStatus::kOk) {
+        error = "the import call return PC is not executable";
+        return false;
+    }
+    if (kImportReturn < X86CodeBase || kImportReturn >= X86CodeEnd) {
+        error = "the import call return PC is outside the generated code";
+        return false;
+    }
+    if (!ValidateStackSpan(facts, facts.import_esp, kImportArgumentBytes, "import argument block", error))
+        return false;
+    if (!ValidateStackSpan(facts, facts.import_arg0, 4, "import handle output", error)) return false;
     if (mem::CheckAccess(kEntry & ~(mem::kPage - 1), 1, mem::kWrite) == mem::AccessStatus::kOk) {
         error = "the reviewed code page is writable";
         return false;
@@ -433,10 +511,31 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
         error = "could not protect the reviewed data section writable";
         return false;
     }
-    if (!ProtectRange(kRealImportPage, mem::kPage, mem::kNoAccess)) {
-        error = "could not protect the ordinal-255 import page";
+    if (!ProtectRange(kRealImportPage, mem::kPage, mem::kRead | mem::kWrite)) {
+        error = "could not open the ordinal-255 import page for its reviewed patch";
         return false;
     }
+    uint32_t authentic_import = 0;
+    if (mem::Read(kImportSlot, &authentic_import, sizeof(authentic_import)) != mem::AccessStatus::kOk ||
+        authentic_import != kImportEncoding) {
+        error = "import slot is not the authentic ordinal-255 encoding";
+        return false;
+    }
+    const uint32_t import_target = dispatch::KernelThunkAddress(kImportOrdinal);
+    if (!import_target || mem::Write(kImportSlot, &import_target, sizeof(import_target)) != mem::AccessStatus::kOk) {
+        error = "could not patch the import slot to the reviewed ordinal-255 thunk";
+        return false;
+    }
+    if (!ProtectRange(kRealImportPage, mem::kPage, mem::kRead)) {
+        error = "could not protect the ordinal-255 import page read-only";
+        return false;
+    }
+    g_real_import_slot = kImportSlot;
+    g_real_import_original = authentic_import;
+    facts.import_authentic = authentic_import;
+    facts.import_target = import_target;
+    g_real_worker_baseline = kernel::ThreadWorkerLaunchCountForTest();
+    if (!PrepareKernelBridge(true, error)) return false;
 
     facts.base = image.base;
     facts.image_size = image.image_size;
@@ -496,6 +595,34 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
     facts.esp = stack_top - 16;
     if (!ValidateStack(facts.stack_base, facts.stack_top, facts.esp, error)) return false;
 
+    // The reviewed route pushes the ten authentic arguments; the only slots it
+    // does not write itself must still be the zero-filled stack.
+    facts.import_esp = facts.esp - kImportStackBytes;
+    facts.import_arg0 = facts.import_esp + kImportArg0Offset;
+    facts.import_return = kImportReturn;
+    facts.import_args = {facts.import_arg0,
+                         0,
+                         facts.g10130,
+                         facts.counter_after,
+                         0,
+                         kStartRoutine,
+                         0,
+                         0,
+                         0,
+                         kSystemRoutine};
+    if (!ValidateImportArguments(facts, facts.import_esp, error)) return false;
+    g_expected_kernel_args = facts.import_args;
+    g_have_expected_kernel_args = true;
+    std::array<uint32_t, kImportStackSlots> initial_slots{};
+    if (mem::Read(facts.import_esp + 0x38, initial_slots.data(), sizeof(initial_slots)) != mem::AccessStatus::kOk)
+        return false;
+    for (uint32_t value : initial_slots) {
+        if (value != 0) {
+            error = "reviewed import stack slots are not the zero-filled stack";
+            return false;
+        }
+    }
+
     facts.spans.clear();
     AddSpan(facts.spans, kRealImageBase, kRealImageBase + kRealHeaderSize, false);
     AddSpan(facts.spans, kRealRdataPage, kRealRdataPage + mem::kPage, false);
@@ -518,9 +645,16 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
 
     if (!ValidatePagePermissions(facts, error)) return false;
 
+    const mem::Stats baseline = mem::Query();
+    facts.baseline_system = baseline.system_used;
+    facts.baseline_contiguous = baseline.contiguous_used;
+    facts.baseline_virtual = baseline.virtual_committed;
+
     options = Options{};
     options.start_pc = kEntry;
     options.initial_esp = facts.esp;
+    options.allow_kernel_call = true;
+    options.require_kernel_success = true;
     options.allowed_spans = facts.spans;
     options.snapshot_pages = facts.snapshot_pages;
     options.image_base = image.base;
@@ -534,9 +668,9 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
 void PrintRealFacts(const RealFacts& facts) {
     std::printf("PREFLIGHT identity: base=%08X image=%X header=%X sections=%u\n", facts.base, facts.image_size,
                 facts.header_size, facts.sections);
-    std::printf("PREFLIGHT route: 50/50 instructions matched, stop=%08X, import=%08X:%08X\n", kStopBefore,
-                kRealImportSlot, kImportEncoding);
-    std::printf("PREFLIGHT mapping: functions=2 continuations=0 hooks=50 stop_hooks=1\n");
+    std::printf("PREFLIGHT route: 51/51 instructions matched, stop=%08X, import=%08X:%08X\n", kStopBefore,
+                kImportSlot, kImportEncoding);
+    std::printf("PREFLIGHT mapping: functions=2 continuations=0 hooks=51 stop_hooks=1\n");
     std::printf("PREFLIGHT globals: 10108=%08X 10118=%08X 10130=%08X 3ED3EC=%08X 3ED3F0=%08X 3ED3F4=%08X "
                 "3ED3FC=%08X 4EDC74=%08X\n",
                 facts.g10108, facts.g10118, facts.g10130, facts.g3ec, facts.g3f0, facts.g3f4, facts.g3fc,
@@ -552,8 +686,17 @@ void PrintRealFacts(const RealFacts& facts) {
                 facts.counter_after, facts.q_after, facts.entry_taken ? "taken" : "not-taken");
     std::printf("PREFLIGHT stack: base=%08X top=%08X esp=%08X requested=%X committed=%X\n", facts.stack_base,
                 facts.stack_top, facts.esp, kRealStackRequest, kRealStackCommitted);
-    std::printf("PREFLIGHT pages: entry=RX helper=RX header=R rdata=R data=RW import=NOACCESS\n");
-    std::printf("PREFLIGHT limits: instructions=64 direct_calls=1 memory=256 imports=0 callbacks=0 workers=0\n");
+    std::printf("PREFLIGHT import: slot=%08X authentic=%08X probe=%08X esp=%08X handle=%08X return=%08X\n",
+                kImportSlot, facts.import_authentic, facts.import_target, facts.import_esp, facts.import_arg0,
+                facts.import_return);
+    std::printf("PREFLIGHT args: handle=%08X ext=%08X stack=%08X tls=%08X id=%08X start=%08X context=%08X "
+                "suspended=%08X debug=%08X system=%08X\n",
+                facts.import_args[0], facts.import_args[1], facts.import_args[2], facts.import_args[3],
+                facts.import_args[4], facts.import_args[5], facts.import_args[6], facts.import_args[7],
+                facts.import_args[8], facts.import_args[9]);
+    std::printf("PREFLIGHT pages: entry=RX helper=RX header=R rdata=R data=RW import=R\n");
+    std::printf("PREFLIGHT limits: instructions=64 direct_calls=1 kernel_calls=1 memory=256 imports=1 callbacks=0 "
+                "workers=0\n");
     std::printf("PREFLIGHT spans:");
     for (const Span& span : facts.spans)
         std::printf(" %08X-%08X:%s", span.begin, span.end, span.write ? "RW" : "R");
@@ -587,12 +730,16 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
         if (step.pc == 0x002B5CD9) helper_value = &step;
         if (step.pc == 0x002B3956) idiv_result = &step;
     }
-    if (g_probe.executed != 49) {
-        error = "expected 49 instructions, got " + std::to_string(g_probe.executed);
+    if (g_probe.executed != 50) {
+        error = "expected 50 instructions, got " + std::to_string(g_probe.executed);
         return false;
     }
     if (g_probe.direct_calls != 1) {
         error = "expected one direct call, got " + std::to_string(g_probe.direct_calls);
+        return false;
+    }
+    if (g_probe.kernel_calls != 1) {
+        error = "expected one kernel call, got " + std::to_string(g_probe.kernel_calls);
         return false;
     }
     if (!facts.entry_taken || !entry_branch || !entry_branch->branch_valid || !entry_branch->branch_taken) {
@@ -611,11 +758,23 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
         error = "IDIV register mismatch";
         return false;
     }
-    if (ImportReads() != 0) {
-        error = "the ordinal-255 import slot was read";
+    const MemoryRecord* import = nullptr;
+    unsigned import_records = 0;
+    for (const MemoryRecord& record : g_probe.memory) {
+        if (!InImportPage(record.address, uint64_t(record.address) + record.size)) continue;
+        import = &record;
+        ++import_records;
+    }
+    if (ImportReads() != 1 || g_probe.import_reads != 1 || import_records != 1) {
+        error = "ordinal-255 import slot read count is not one";
         return false;
     }
-    if (kernel::KernelWorkerCountForTest() != 0) {
+    if (import->pc != kImportCall || import->address != kImportSlot || import->size != 4 || import->write) {
+        error = "the import operand read is not the reviewed call";
+        return false;
+    }
+    if (kernel::KernelWorkerCountForTest() != 0 ||
+        kernel::ThreadWorkerLaunchCountForTest() != g_probe.worker_launch_baseline) {
         error = "a worker was activated";
         return false;
     }
@@ -629,8 +788,45 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
         error = "result postcondition failed at the reviewed store";
         return false;
     }
-    if (g_probe.trace.empty() || g_probe.trace.back().pc != kLastInstruction) {
-        error = "mandatory stop was not at 002B5CDF";
+    if (!g_probe.have_stop || g_probe.stop.pc != kImportCall) {
+        error = "mandatory stop was not after 002B5CE0";
+        return false;
+    }
+    if (g_probe.stop.esp != facts.import_esp + 0x28) {
+        error = "post-call ESP does not match the reviewed stdcall cleanup";
+        return false;
+    }
+    if (g_probe.stop.eax != kernel::kSuccess) {
+        error = "ordinal-255 service did not report success";
+        return false;
+    }
+    if (g_kernel255_calls != 1 || g_kernel255_esp != facts.import_esp - 4 ||
+        g_kernel255_return != facts.import_return) {
+        error = "ordinal-255 call frame mismatch";
+        return false;
+    }
+    if (g_kernel255_args != facts.import_args) {
+        error = "ordinal-255 arguments do not match the authentic preflight values";
+        return false;
+    }
+    if (!g_prepared_thread || g_prepared_thread->state.load() != kernel::ThreadState::kPrepared) {
+        error = "no inactive thread was prepared";
+        return false;
+    }
+    if (g_prepared_thread->start_routine != facts.import_args[5] ||
+        g_prepared_thread->start_context != facts.import_args[6] ||
+        g_prepared_thread->system_routine != facts.import_args[9] || g_prepared_thread->suspend.load() != 0) {
+        error = "the prepared thread does not carry the authentic routines";
+        return false;
+    }
+    uint32_t handle = 0;
+    if (mem::Read(facts.import_args[0], &handle, sizeof(handle)) != mem::AccessStatus::kOk || !handle ||
+        kernel::FromHandle(handle).get() != g_prepared_thread.get()) {
+        error = "the prepared thread handle was not published";
+        return false;
+    }
+    if (!kernel::Threads().empty()) {
+        error = "a guest thread became active";
         return false;
     }
     return true;
@@ -638,8 +834,12 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
 
 void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) {
     g_probe = ProbeState{};
-    g_probe.executed = 49;
+    g_probe.executed = 50;
     g_probe.direct_calls = 1;
+    g_probe.kernel_calls = 1;
+    g_probe.import_reads = 1;
+    g_probe.worker_launch_baseline = kernel::ThreadWorkerLaunchCountForTest();
+    g_probe.memory.push_back({kImportCall, kImportSlot, 4, false});
     StepRecord entry{};
     entry.pc = 0x002B392A;
     entry.branch_valid = true;
@@ -661,6 +861,48 @@ void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) 
     StepRecord last{};
     last.pc = kLastInstruction;
     g_probe.trace.push_back(last);
+    g_probe.stop = last;
+    g_probe.stop.eax = kernel::kSuccess;
+    g_probe.stop.esp = facts.import_esp + 0x28;
+    g_probe.have_stop = true;
+}
+
+// restores the authentic import slot before releasing the image
+bool TeardownReal(const Options& options) {
+    RestoreImportSlot();
+    return Teardown(options);
+}
+
+bool CancelRealPreparedThread(const RealFacts& facts, std::string& error) {
+    if (!g_prepared_thread) {
+        error = "no prepared thread to cancel";
+        return false;
+    }
+    const kernel::ThreadRef thread = g_prepared_thread;
+    g_prepared_thread.reset();
+    uint32_t handle = 0;
+    const bool handle_read =
+        mem::Read(facts.import_args[0], &handle, sizeof(handle)) == mem::AccessStatus::kOk;
+    const uint32_t stack_top = thread->stack_top;
+    const bool prepared = handle_read && handle && kernel::FromHandle(handle).get() == thread.get() &&
+                          kernel::Threads().empty() &&
+                          kernel::ThreadWorkerLaunchCountForTest() == g_real_worker_baseline;
+    const bool cancelled = kernel::CancelPreparedThread(thread);
+    uint32_t cleared = 1;
+    const bool cleared_ok =
+        mem::Read(facts.import_args[0], &cleared, sizeof(cleared)) == mem::AccessStatus::kOk && cleared == 0;
+    const bool stack_freed = !mem::IsCommitted(stack_top - 1);
+    const mem::Stats stats = mem::Query();
+    const bool resources = stats.system_used == facts.baseline_system &&
+                           stats.contiguous_used == facts.baseline_contiguous &&
+                           stats.virtual_committed == facts.baseline_virtual;
+    const bool ok = prepared && cancelled && cleared_ok && stack_freed && !kernel::FromHandle(handle) &&
+                    kernel::Threads().empty() && resources;
+    std::printf("CANCEL prepared=%d cancelled=%d output_cleared=%d stack_freed=%d resources=%d workers=%zu\n",
+                int(prepared), int(cancelled), int(cleared_ok), int(stack_freed), int(resources),
+                kernel::KernelWorkerCountForTest());
+    if (!ok) error = "prepared thread cancellation did not roll back all resources";
+    return ok;
 }
 
 int RealChild(const std::string& scenario) {
@@ -689,6 +931,9 @@ int RealChild(const std::string& scenario) {
             } else {
                 std::string post_error;
                 if (!VerifyRealPostconditions(facts, post_error)) {
+                    std::printf("RESULT fail reason=\"%s\"\n", post_error.c_str());
+                    exit_code = 3;
+                } else if (!CancelRealPreparedThread(facts, post_error)) {
                     std::printf("RESULT fail reason=\"%s\"\n", post_error.c_str());
                     exit_code = 3;
                 } else {
@@ -726,7 +971,7 @@ int RealChild(const std::string& scenario) {
         if (!ok) std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
         exit_code = ok ? 5 : 3;
     } else if (scenario == "incomplete-hooks" || scenario == "unexpected-target" || scenario == "extra-hook" ||
-               scenario == "pre-import-stop") {
+               scenario == "post-import-instruction") {
         std::vector<uint8_t> header_bytes, source_bytes;
         const std::string header_path = std::string(EXECUTION_PROBE_REAL_GENERATED_DIR) + "/x86_recomp_shared.h";
         const std::string source_path = std::string(EXECUTION_PROBE_REAL_GENERATED_DIR) + "/x86_recomp.0.cpp";
@@ -746,8 +991,7 @@ int RealChild(const std::string& scenario) {
             } else if (scenario == "extra-hook") {
                 source += "\nProbeStep_0x002B3916(ctx, base);\n";
             } else {
-                const size_t at = source.find("ProbeStop_0x002B5CDF(ctx, base);");
-                if (at != std::string::npos) source.insert(at, "3C9E68 ");
+                source += "\nloc_002B5CE6:;\n";
             }
             ok = ValidateHookCoverageText(header, source, error);
         } else {
@@ -784,7 +1028,7 @@ int RealChild(const std::string& scenario) {
             if (scenario == "postcondition-count") g_probe.executed = 48;
             else if (scenario == "postcondition-branch") g_probe.trace[0].branch_taken = false;
             else if (scenario == "postcondition-import")
-                g_probe.memory.push_back({kStopBefore, kRealImportSlot, 4, false});
+                g_probe.memory.push_back({kImportCall, kImportSlot, 4, false});
             else if (scenario == "postcondition-result") Write32(kCounterAddress, facts.counter_after);
             std::string post_error;
             ok = VerifyRealPostconditions(facts, post_error);
@@ -794,6 +1038,41 @@ int RealChild(const std::string& scenario) {
             std::printf("SETUP fail %s\n", error.c_str());
             exit_code = 4;
         }
+    } else if (scenario == "import-slot-mismatch") {
+        const std::string path = TempRealCopy("import");
+        bool copied = ValidateRealIdentity(EXECUTION_PROBE_REAL_XBE, image, error);
+        const int64_t offset = copied ? image.Offset(kImportSlot) : -1;
+        copied = copied && offset >= 0 && CopyAndPatch(EXECUTION_PROBE_REAL_XBE, path, offset, 0x01);
+        xbe::Image patched;
+        std::vector<uint8_t> patched_bytes;
+        std::string patched_error;
+        const bool parsed = copied && ReadFile(path.c_str(), patched_bytes) &&
+                            patched.Parse(std::move(patched_bytes), patched_error);
+        const bool accepted = parsed && ValidateRealRouteText(patched, patched_error);
+        std::remove(path.c_str());
+        if (accepted) error = "patched import slot was accepted";
+        else if (!parsed) error = "could not prepare the import-slot copy";
+        else error = patched_error;
+        std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
+        exit_code = 3;
+    } else if (scenario == "import-page-writable") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (ok) {
+            ok = ProtectRange(kRealImportPage, mem::kPage, mem::kRead | mem::kWrite) &&
+                 ValidatePagePermissions(facts, error);
+            ProtectRange(kRealImportPage, mem::kPage, mem::kRead);
+        }
+        if (!ok) std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
+        exit_code = ok ? 5 : 3;
+    } else if (scenario == "argument-span") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (ok) {
+            RealFacts bad = facts;
+            bad.import_arg0 = facts.stack_top;
+            ok = ValidateImportArguments(bad, bad.import_esp, error);
+        }
+        if (!ok) std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
+        exit_code = ok ? 5 : 3;
     } else if (scenario == "execute-permission") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (ok) {
@@ -815,19 +1094,21 @@ int RealChild(const std::string& scenario) {
     const bool execute_success = scenario == "execute" && exit_code == 0;
     bool teardown_ok = false;
     if (scenario == "preflight" || scenario == "execute-permission" || scenario == "execute" ||
-        scenario == "postcondition-counter" || scenario == "postcondition-result") {
-        teardown_ok = Teardown(options);
+        scenario == "postcondition-counter" || scenario == "postcondition-result" ||
+        scenario == "import-page-writable" || scenario == "argument-span") {
+        teardown_ok = TeardownReal(options);
     } else {
-        teardown_ok = Teardown(Options{});
+        teardown_ok = TeardownReal(Options{});
     }
     if (!teardown_ok) {
         if (scenario == "execute") std::printf("RESULT fail reason=\"teardown retained resources\"\n");
         exit_code = 5;
     } else if (execute_success) {
-        std::printf("REAL_EXEC ok instructions=%u direct_calls=%u import_reads=%u workers=%zu stop=%08X "
-                    "counter=%08X result=%08X\n",
-                    g_probe.executed, g_probe.direct_calls, ImportReads(), kernel::KernelWorkerCountForTest(),
-                    kStopBefore, execute_counter, execute_result);
+        std::printf("REAL_EXEC ok instructions=%u direct_calls=%u kernel_calls=%u import_reads=%u workers=%zu "
+                    "last=%08X stop=%08X counter=%08X result=%08X\n",
+                    g_probe.executed, g_probe.direct_calls, g_probe.kernel_calls, ImportReads(),
+                    kernel::KernelWorkerCountForTest(), kLastInstruction, kStopBefore, execute_counter,
+                    execute_result);
     }
     alarm(0);
     return exit_code;
@@ -956,12 +1237,15 @@ int RealParent(const std::string& mode, bool execute_real) {
         {"incomplete-hooks", false, "hook coverage"},
         {"unexpected-target", false, "call"},
         {"extra-hook", false, "hook coverage"},
+        {"post-import-instruction", false, "code after the import call"},
         {"overlapping-spans", false, "overlap"},
         {"pointer-uncommitted", false, "not committed"},
         {"invalid-stack", false, "stack"},
         {"execute-permission", false, "not executable"},
-        {"pre-import-stop", false, "forbidden import slot"},
-        {"postcondition-count", false, "expected 49 instructions"},
+        {"import-slot-mismatch", false, "import slot is not the ordinal-255 encoding"},
+        {"import-page-writable", false, "import page is writable"},
+        {"argument-span", false, "outside the reviewed guest stack"},
+        {"postcondition-count", false, "expected 50 instructions"},
         {"postcondition-branch", false, "entry JNB"},
         {"postcondition-import", false, "import slot"},
         {"postcondition-counter", false, "counter postcondition"},

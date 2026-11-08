@@ -79,7 +79,7 @@ constexpr Instruction kInstructions[] = {
     {0x002B5CDA, {0x6A, 0x00}, 2},                                      // push 0
     {0x002B5CDC, {0x8D, 0x45, 0x0C}, 3},                                // lea eax, [ebp+0xC]
     {0x002B5CDF, {0x50}, 1},                                            // push eax
-    {0x002B5CE0, {0xFF, 0x15, 0x68, 0x9E, 0x3C, 0x00}, 6},              // call [0x3C9E68] - forbidden
+    {0x002B5CE0, {0xFF, 0x15, 0x68, 0x9E, 0x3C, 0x00}, 6},              // call [0x3C9E68] - ordinal 255
 };
 
 void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
@@ -140,7 +140,7 @@ bool WriteConfig(const char* path) {
               "end = 0x002B396F\n\n"
               "[[function]]\n"
               "at = 0x002B5CA7\n"
-              "end = 0x002B5CE0\n";
+              "end = 0x002B5CE6\n";
     for (const auto& step : execution_probe::kRoute) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc

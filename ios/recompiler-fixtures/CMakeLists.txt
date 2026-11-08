@@ -79,7 +79,10 @@ add_executable(execution_probe_tests
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/memory_protection.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
     ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/xbe/image_loader.cpp
     ${PROBE_GENERATED_SOURCE}
@@ -90,6 +93,8 @@ target_compile_features(execution_probe_tests PRIVATE cxx_std_20)
 target_include_directories(execution_probe_tests PRIVATE ${XBE_SDK}/runtime ${PROBE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(execution_probe_tests PRIVATE
     MOSTWANTED_EXECUTION_PROBE_TESTS=1
+    MOSTWANTED_CHECKED_KERNEL_ABI_TESTS=1
+    MOSTWANTED_THREAD_PREPARATION_TESTS=1
     EXECUTION_PROBE_MODE_SYNTHETIC=1
     EXECUTION_PROBE_FIXTURE_XBE="${PROBE_FIXTURE_XBE}"
     EXECUTION_PROBE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
@@ -131,7 +136,10 @@ add_executable(execution_probe_real_preflight
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/memory_protection.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
     ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/xbe/image_loader.cpp
     ${REAL_PROBE_GENERATED_SOURCE}
@@ -142,6 +150,8 @@ target_compile_features(execution_probe_real_preflight PRIVATE cxx_std_20)
 target_include_directories(execution_probe_real_preflight PRIVATE ${XBE_SDK}/runtime ${REAL_PROBE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(execution_probe_real_preflight PRIVATE
     MOSTWANTED_EXECUTION_PROBE_TESTS=1
+    MOSTWANTED_CHECKED_KERNEL_ABI_TESTS=1
+    MOSTWANTED_THREAD_PREPARATION_TESTS=1
     EXECUTION_PROBE_MODE_REAL=1
     EXECUTION_PROBE_REAL_XBE="${EXECUTION_PROBE_REAL_XBE}"
     EXECUTION_PROBE_REAL_GENERATED_DIR="${REAL_PROBE_GENERATED_DIR}"

@@ -77,7 +77,6 @@ using Clock = std::chrono::steady_clock;
 constexpr const char* kRealSha1 = "f636a16af04171089f879a4bed646e185c734233";
 constexpr uint32_t kRealEntry = 0x002B3916;
 constexpr uint32_t kRealTitle = 0x4541007B;
-constexpr uint32_t kRealImportSlot = 0x003C9E68;
 
 int failures = 0;
 
@@ -120,7 +119,13 @@ struct Options {
     uint32_t start_pc = kEntry;
     uint32_t instruction_budget = kMaximumInstructions;
     uint32_t direct_call_budget = kMaximumDirectCalls;
+    uint32_t kernel_call_budget = kMaximumKernelCalls;
     bool allow_call_target = true;
+    bool allow_kernel_call = false;
+    bool require_kernel_success = false;
+    bool import_unpatched = false;
+    uint32_t import_target = 0;  // 0 means the reviewed ordinal-255 thunk
+    uint32_t helper_value = 0;
     bool allow_counter_page = true;
     bool decommit_global = false;
     bool entry_read_only = false;
@@ -146,11 +151,17 @@ struct ProbeState {
     Options options;
     uint32_t executed = 0;
     uint32_t direct_calls = 0;
+    uint32_t kernel_calls = 0;
+    uint32_t import_reads = 0;
+    uint32_t worker_launch_baseline = 0;
+    size_t thread_baseline = 0;
     bool running = false;
     bool in_step = false;
     bool first_step = true;
     uint32_t previous_pc = 0;
     bool have_previous = false;
+    StepRecord stop{};
+    bool have_stop = false;
     std::vector<StepRecord> trace;
     std::vector<MemoryRecord> memory;
     Clock::time_point deadline{};
@@ -244,6 +255,20 @@ void ProbeStep(uint32_t pc, X86Context& ctx) {
         ++g_probe.direct_calls;
     }
 
+    if (step->kind == StepKind::kKernelCall) {
+        if (!g_probe.options.allow_kernel_call) Fail("ordinal-255 import call is not permitted", pc);
+        if (g_probe.kernel_calls >= g_probe.options.kernel_call_budget) Fail("kernel call budget exhausted", pc);
+        if (pc != kImportCall) Fail("kernel call is not the reviewed import call", pc);
+        if (dispatch::ResolveTarget(dispatch::KernelThunkAddress(kImportOrdinal)).kind !=
+            dispatch::TargetKind::kKernelThunk)
+            Fail("ordinal-255 kernel thunk is not registered", pc);
+        if (kImportReturn < X86CodeBase || kImportReturn >= X86CodeEnd)
+            Fail("kernel call return PC is outside the generated code", pc);
+        if (mem::CheckAccess(kImportReturn, 1, mem::kExecute) != mem::AccessStatus::kOk)
+            Fail("kernel call return PC is not executable", pc);
+        ++g_probe.kernel_calls;
+    }
+
     if (g_probe.options.delay.count() && g_probe.options.delay_pc == pc)
         std::this_thread::sleep_for(g_probe.options.delay);
 
@@ -260,10 +285,115 @@ void ProbeStep(uint32_t pc, X86Context& ctx) {
     g_probe.have_previous = true;
 }
 
-void ProbeStopHook() {
+// Test-only ordinal-255 service.  It prepares an inactive guest thread with the
+// authentic arguments and never starts it; the probe cancels it during teardown.
+enum class KernelBridgeMode : uint8_t { kPrepare, kFail, kBadCleanup, kBadReturn, kStartAttempt };
+KernelBridgeMode g_kernel_bridge_mode = KernelBridgeMode::kPrepare;
+uint32_t g_kernel255_calls = 0;
+uint32_t g_kernel255_status = 0;
+uint32_t g_kernel255_esp = 0;
+uint32_t g_kernel255_return = 0;
+std::array<uint32_t, 10> g_kernel255_args{};
+std::array<uint32_t, 10> g_expected_kernel_args{};
+bool g_have_expected_kernel_args = false;
+kernel::ThreadRef g_prepared_thread;
+
+void ProbeKernel255Handler(X86Context& ctx, uint8_t*) {
+    ++g_kernel255_calls;
+    g_kernel255_esp = ctx.esp;
+    g_kernel255_return = kernel::R32(ctx.esp);
+    std::array<uint32_t, 10> args{};
+    if (mem::Read(ctx.esp + 4, args.data(), sizeof(args)) != mem::AccessStatus::kOk) {
+        g_kernel255_status = kernel::kAccessViolation;
+        kernel::Return(ctx, g_kernel255_status, 10);
+        return;
+    }
+    g_kernel255_args = args;
+    if (g_have_expected_kernel_args && args != g_expected_kernel_args) {
+        g_kernel255_status = kernel::kInvalidParameter;
+        kernel::Return(ctx, g_kernel255_status, 10);
+        return;
+    }
+    if (g_kernel_bridge_mode == KernelBridgeMode::kBadCleanup) {
+        // deliberately wrong stdcall cleanup; the checked ABI must trap it
+        g_kernel255_status = kernel::kSuccess;
+        ctx.eax = kernel::kSuccess;
+        ctx.esp += 4;
+        return;
+    }
+    if (g_kernel_bridge_mode == KernelBridgeMode::kBadReturn) {
+        g_kernel255_status = kernel::kSuccess;
+        kernel::Return(ctx, g_kernel255_status, 10);
+        const uint32_t invalid = 0xDEADBEEF;
+        mem::Write(ctx.esp - 44, &invalid, sizeof(invalid));
+        return;
+    }
+    if (g_kernel_bridge_mode == KernelBridgeMode::kFail) {
+        g_kernel255_status = kernel::kNoMemory;
+        kernel::Return(ctx, g_kernel255_status, 10);
+        return;
+    }
+    kernel::ThreadRef prepared;
+    g_kernel255_status = kernel::PrepareSystemThreadEx(args[0], args[2] ? args[2] : 0x10000, args[3], args[4],
+                                                       args[5], args[6], args[7] & 0xFF, args[9], prepared);
+    if (g_kernel255_status != kernel::kSuccess) {
+        if (prepared) kernel::CancelPreparedThread(prepared);
+    } else if (g_kernel_bridge_mode == KernelBridgeMode::kStartAttempt) {
+        // must be refused: the authentic routines are not mapped callbacks
+        if (!kernel::StartThread(prepared)) g_kernel255_status = kernel::kNoMemory;
+        if (prepared) kernel::CancelPreparedThread(prepared);
+    } else {
+        g_prepared_thread = std::move(prepared);
+    }
+    kernel::Return(ctx, g_kernel255_status, 10);
+}
+
+bool PrepareKernelBridge(bool exact_name, std::string& error) {
+    kernel::RegisterExport(kImportOrdinal, exact_name ? "PsCreateSystemThreadEx" : "WrongExportName",
+                           ProbeKernel255Handler);
+    if (!dispatch::SetKernel255FixtureBridge(true)) {
+        error = "ordinal-255 test bridge was not authorized";
+        return false;
+    }
+    return true;
+}
+
+void ReleaseKernelBridge() {
+    if (g_prepared_thread) kernel::CancelPreparedThread(g_prepared_thread);
+    g_prepared_thread.reset();
+    dispatch::SetKernel255FixtureBridge(false);
+}
+
+void ProbeStopHook(X86Context& ctx) {
     if (!g_probe.running) Fail("mandatory stop outside a probe run", kStopBefore);
     if (!g_probe.have_previous || g_probe.previous_pc != kLastInstruction)
         Fail("mandatory stop ran before the last reviewed instruction", kStopBefore);
+    if (g_probe.kernel_calls != 1) Fail("mandatory stop without the reviewed kernel call", kStopBefore);
+    if (g_kernel255_calls != 1) Fail("ordinal-255 service was not called exactly once", kStopBefore);
+    if (g_probe.options.require_kernel_success && g_kernel255_status != kernel::kSuccess)
+        Fail("ordinal-255 thread preparation failed", kStopBefore);
+    if (!kernel::Threads().empty()) Fail("a guest thread became active", kStopBefore);
+    if (kernel::ThreadWorkerLaunchCountForTest() != g_probe.worker_launch_baseline)
+        Fail("a kernel worker was activated", kStopBefore);
+    g_probe.stop.pc = g_probe.previous_pc;
+    g_probe.stop.eax = ctx.eax;
+    g_probe.stop.ecx = ctx.ecx;
+    g_probe.stop.edx = ctx.edx;
+    g_probe.stop.ebx = ctx.ebx;
+    g_probe.stop.esp = ctx.esp;
+    g_probe.stop.ebp = ctx.ebp;
+    g_probe.stop.esi = ctx.esi;
+    g_probe.stop.edi = ctx.edi;
+    g_probe.stop.cf = ctx.cf;
+    g_probe.stop.zf = ctx.zf;
+    g_probe.stop.sf = ctx.sf;
+    g_probe.stop.of = ctx.of;
+    g_probe.stop.pf = ctx.pf;
+    g_probe.stop.af = ctx.af;
+    g_probe.stop.kind = StepKind::kKernelCall;
+    g_probe.stop.branch_valid = false;
+    g_probe.stop.branch_taken = false;
+    g_probe.have_stop = true;
     throw ProbeNormalStop{};
 }
 
@@ -276,7 +406,7 @@ void ProbeStopHook() {
 EXECUTION_PROBE_ROUTE(DEFINE_PROBE_STEP)
 #undef DEFINE_PROBE_STEP
 
-void ProbeStop_0x002B5CDF(X86Context&, uint8_t*) { ProbeStopHook(); }
+void ProbeStop_0x002B5CE0(X86Context& ctx, uint8_t*) { ProbeStopHook(ctx); }
 
 // Test-only replacements for the production handlers.  The probe target does
 // not link sdk/runtime/cpu/memory_fault.cpp; these turn a fault into a structured
@@ -307,8 +437,16 @@ void execution_probe_memory_access(uint32_t instruction, uint32_t address, std::
         Fail("memory-operation budget exhausted", instruction, address, true);
 
     g_probe.memory.push_back({instruction, address, uint32_t(size), write});
-    if (InImportPage(address, end))
-        Fail("ordinal-255 import slot access is forbidden", instruction, address, true);
+    if (InImportPage(address, end)) {
+        // exactly one reviewed read: the checked import call's operand fetch.
+        if (instruction != kImportCall || address != kImportSlot || size != 4 || write)
+            Fail("unreviewed ordinal-255 import slot access", instruction, address, true);
+        if (!g_probe.options.allow_kernel_call)
+            Fail("ordinal-255 import operand read is not permitted", instruction, address, true);
+        if (g_probe.import_reads >= 1) Fail("ordinal-255 import slot read twice", instruction, address, true);
+        ++g_probe.import_reads;
+        return;
+    }
 
     bool allowed = false;
     for (const Span& span : g_probe.options.allowed_spans) {
@@ -378,6 +516,15 @@ void PrintTrace(bool full) {
         if (step.branch_valid) std::printf(" branch=%s", step.branch_taken ? "taken" : "not-taken");
         std::printf("\n");
     }
+}
+
+void PrintStop() {
+    if (!g_probe.have_stop) return;
+    const StepRecord& stop = g_probe.stop;
+    std::printf("STOP %08X eax=%08X ecx=%08X edx=%08X ebx=%08X esp=%08X ebp=%08X esi=%08X edi=%08X "
+                "flags=%u%u%u%u%u%u\n",
+                stop.pc, stop.eax, stop.ecx, stop.edx, stop.ebx, stop.esp, stop.ebp, stop.esi, stop.edi, stop.cf, stop.zf,
+                stop.sf, stop.of, stop.pf, stop.af);
 }
 
 uint32_t ImportReads() {
@@ -454,7 +601,7 @@ bool PrepareData(Options& options) {
     Write32(kEntryValue, 0x1000);
     Write32(kEntryPointer, entry_pointer);
     Write32(kDataPage, 0);
-    Write32(kHelperValue, 0);
+    Write32(kHelperValue, options.helper_value);
     Write32(kPointerPage, 0xFFFFFFFF);
     Write32(kAllocationPage, 0);
     Write32(kGlobalReadA, 0x1000);
@@ -462,8 +609,14 @@ bool PrepareData(Options& options) {
     Write32(kGlobalLength, 0x100);
     Write32(kGlobalStore, kAllocationPage);
     Write32(kCounterAddress, 0);
-    Write32(kImportSlot, kImportEncoding);
-    if (!ProtectRange(kImportPage, mem::kPage, mem::kNoAccess)) return false;
+    const uint32_t import_target = options.import_unpatched
+                                        ? kImportEncoding
+                                        : (options.import_target ? options.import_target
+                                                                 : dispatch::KernelThunkAddress(kImportOrdinal));
+    Write32(kImportSlot, import_target);
+    // the checked import call must read this page once; nothing may write it or
+    // execute from it during the probe.
+    if (!ProtectRange(kImportPage, mem::kPage, mem::kRead)) return false;
     if (options.decommit_global && !mem::Decommit(kGlobalPage, mem::kPage)) return false;
 
     options.allowed_spans = {{kDataPage, kDataPage + mem::kPage, true},
@@ -502,6 +655,8 @@ Report RunProbe(const Options& options) {
     g_probe.options = options;
     g_probe.running = true;
     g_probe.first_step = true;
+    g_probe.worker_launch_baseline = kernel::ThreadWorkerLaunchCountForTest();
+    g_probe.thread_baseline = kernel::Threads().size();
     if (options.deadline.count()) {
         g_probe.deadline = Clock::now() + options.deadline;
         g_probe.deadline_set = true;
@@ -553,8 +708,12 @@ Report RunProbe(const Options& options) {
         }
     }
     g_probe.running = false;
+    // the step hook runs before the instruction, so every STEP line is the
+    // guest state the instruction is about to consume, not its result.
+    std::printf("TRACE registers are read before each instruction\n");
     if (report.normal_stop) PrintTrace(true);
     else PrintTrace(false);
+    PrintStop();
     PrintMemoryDiff(snapshot);
     return report;
 }
@@ -562,11 +721,12 @@ Report RunProbe(const Options& options) {
 void PrintFailure(const ProbeFailure& failure) {
     std::printf("RESULT fail reason=\"%s\" pc=%08X", failure.reason.c_str(), failure.pc);
     if (failure.has_address) std::printf(" address=%08X", failure.address);
-    std::printf(" instructions=%u direct_calls=%u import_reads=%u\n", g_probe.executed, g_probe.direct_calls,
-                ImportReads());
+    std::printf(" instructions=%u direct_calls=%u kernel_calls=%u import_reads=%u\n", g_probe.executed,
+                g_probe.direct_calls, g_probe.kernel_calls, ImportReads());
 }
 
 bool Teardown(const Options& options) {
+    ReleaseKernelBridge();
     kernel::StopKernelWorkers();
     dispatch::Reset();
     if (options.free_image) {
@@ -586,13 +746,108 @@ bool Teardown(const Options& options) {
 }
 
 #if defined(EXECUTION_PROBE_MODE_SYNTHETIC)
+// cancels the thread the ordinal-255 service prepared and checks the rollback
+bool CancelPreparedThreadForProbe() {
+    if (!g_prepared_thread) return false;
+    const kernel::ThreadRef thread = g_prepared_thread;
+    g_prepared_thread.reset();
+    const uint32_t handle_slot = g_kernel255_args[0];
+    uint32_t handle = 0;
+    const bool handle_read = mem::Read(handle_slot, &handle, sizeof(handle)) == mem::AccessStatus::kOk;
+    const uint32_t stack_top = thread->stack_top;
+    const bool prepared = thread->state.load() == kernel::ThreadState::kPrepared && handle_read && handle != 0 &&
+                          kernel::FromHandle(handle).get() == thread.get() && mem::IsCommitted(stack_top - 1) &&
+                          kernel::Threads().empty() &&
+                          kernel::ThreadWorkerLaunchCountForTest() == g_probe.worker_launch_baseline;
+    const bool cancelled = kernel::CancelPreparedThread(thread);
+    uint32_t cleared = 1;
+    const bool cleared_ok =
+        mem::Read(handle_slot, &cleared, sizeof(cleared)) == mem::AccessStatus::kOk && cleared == 0;
+    const bool stack_freed = !mem::IsCommitted(stack_top - 1);
+    const bool ok = prepared && cancelled && cleared_ok && stack_freed && !kernel::FromHandle(handle) &&
+                    kernel::Threads().empty();
+    std::printf("CANCEL prepared=%d cancelled=%d output_cleared=%d stack_freed=%d workers=%zu\n", int(prepared),
+                int(cancelled), int(cleared_ok), int(stack_freed), kernel::KernelWorkerCountForTest());
+    return ok;
+}
+
+bool VerifySyntheticPostconditions(std::string& error) {
+    if (!g_probe.have_stop || g_probe.stop.pc != kLastInstruction) {
+        error = "mandatory stop did not follow the import call";
+        return false;
+    }
+    if (g_probe.direct_calls != 1) {
+        error = "expected one direct call";
+        return false;
+    }
+    if (g_probe.kernel_calls != 1) {
+        error = "expected one kernel call";
+        return false;
+    }
+    if (ImportReads() != 1 || g_probe.import_reads != 1) {
+        error = "expected exactly one import operand read";
+        return false;
+    }
+    if (g_probe.stop.eax != kernel::kSuccess) {
+        error = "ordinal-255 preparation did not report success";
+        return false;
+    }
+    if (!g_prepared_thread || g_prepared_thread->state.load() != kernel::ThreadState::kPrepared) {
+        error = "no thread was prepared";
+        return false;
+    }
+    if (!kernel::Threads().empty() || kernel::ThreadWorkerLaunchCountForTest() != g_probe.worker_launch_baseline) {
+        error = "a guest thread or worker became active";
+        return false;
+    }
+    return true;
+}
+
 int RunChild(const std::string& scenario) {
     Options options;
-    bool import_probe = false;
-    bool guards = false;
+    enum class Mode { kRun, kImportProbe, kSecondRead, kGuards, kCheckedCall } mode = Mode::kRun;
+    bool exact_name = true;
     if (scenario == "taken") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
     } else if (scenario == "not-taken") {
         options.not_taken = true;
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+    } else if (scenario == "import-not-permitted") {
+    } else if (scenario == "import-unpatched") {
+        options.allow_kernel_call = true;
+        options.import_unpatched = true;
+    } else if (scenario == "import-wrong-ordinal") {
+        options.allow_kernel_call = true;
+        options.import_target = dispatch::KernelThunkAddress(254);
+    } else if (scenario == "import-wrong-name") {
+        options.allow_kernel_call = true;
+        exact_name = false;
+    } else if (scenario == "import-bad-cleanup") {
+        options.allow_kernel_call = true;
+        g_kernel_bridge_mode = KernelBridgeMode::kBadCleanup;
+    } else if (scenario == "import-bad-return") {
+        options.allow_kernel_call = true;
+        g_kernel_bridge_mode = KernelBridgeMode::kBadReturn;
+    } else if (scenario == "import-bad-return-span" || scenario == "import-arg-span") {
+        options.allow_kernel_call = true;
+        mode = Mode::kCheckedCall;
+    } else if (scenario == "import-prepare-failure") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        options.helper_value = UINT32_MAX;
+    } else if (scenario == "import-start-attempt") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        g_kernel_bridge_mode = KernelBridgeMode::kStartAttempt;
+    } else if (scenario == "import-read") {
+        mode = Mode::kImportProbe;
+    } else if (scenario == "import-second-read") {
+        options.allow_kernel_call = true;
+        mode = Mode::kSecondRead;
+    } else if (scenario == "post-import-entry") {
+        options.start_pc = kStopBefore;
     } else if (scenario == "entry-not-executable") {
         options.entry_read_only = true;
     } else if (scenario == "helper-not-executable") {
@@ -617,13 +872,11 @@ int RunChild(const std::string& scenario) {
         options.delay_pc = kEntry;
     } else if (scenario == "memory-fault") {
         options.decommit_global = true;
-    } else if (scenario == "import-read") {
-        import_probe = true;
     } else if (scenario == "re-entry") {
         options.reenter = true;
         options.reenter_pc = 0x002B3940;
     } else if (scenario == "guards") {
-        guards = true;
+        mode = Mode::kGuards;
     } else {
         std::printf("SETUP fail unknown scenario %s\n", scenario.c_str());
         return 4;
@@ -634,7 +887,7 @@ int RunChild(const std::string& scenario) {
         return 4;
     }
     bool teardown_ok = false;
-    if (guards) {
+    if (mode == Mode::kGuards) {
         const bool raw_guard = mem::Base() == nullptr;
         const size_t workers = kernel::KernelWorkerCountForTest();
         teardown_ok = Teardown(Options{});
@@ -668,17 +921,66 @@ int RunChild(const std::string& scenario) {
         }
     }
 
-    if (import_probe) {
+    if (mode == Mode::kRun || mode == Mode::kCheckedCall) {
+        if (!PrepareKernelBridge(exact_name, error)) {
+            ProbeFailure failure;
+            failure.reason = error;
+            failure.pc = kImportCall;
+            PrintFailure(failure);
+            teardown_ok = Teardown(options);
+            return teardown_ok ? 3 : 5;
+        }
+    }
+
+    if (mode == Mode::kImportProbe || mode == Mode::kSecondRead) {
         g_probe = ProbeState{};
+        g_probe.options = options;
         g_probe.running = true;
         try {
-            (void)x86_mem_read<uint32_t>(kStopBefore, kImportSlot);
-            std::printf("RESULT fail reason=\"import read was not rejected\" pc=%08X\n", kStopBefore);
+            if (mode == Mode::kImportProbe) {
+                (void)x86_mem_read<uint32_t>(kStopBefore, kImportSlot);
+            } else {
+                (void)x86_mem_read<uint32_t>(kImportCall, kImportSlot);
+                (void)x86_mem_read<uint32_t>(kImportCall, kImportSlot);
+            }
+            std::printf("RESULT fail reason=\"import read was not rejected\" pc=%08X\n", kImportCall);
             g_probe.running = false;
             Teardown(options);
             return 3;
         } catch (const ProbeFailure& failure) {
             g_probe.running = false;
+            PrintFailure(failure);
+            teardown_ok = Teardown(options);
+            return teardown_ok ? 3 : 5;
+        }
+    }
+
+    if (mode == Mode::kCheckedCall) {
+        g_probe = ProbeState{};
+        g_probe.options = options;
+        g_probe.running = true;
+        X86Context ctx{};
+        const bool bad_args = scenario == "import-arg-span";
+        ctx.esp = bad_args ? kStackTop : kStackTop - 16;
+        const uint32_t return_address = bad_args ? kImportReturn : 0x00090000;
+        try {
+            x86_checked_indirect_call(ctx, nullptr, kImportSlot, return_address, kImportCall);
+            std::printf("RESULT fail reason=\"checked call was not rejected\" pc=%08X\n", kImportCall);
+            g_probe.running = false;
+            Teardown(options);
+            return 3;
+        } catch (const ProbeFailure& failure) {
+            g_probe.running = false;
+            PrintFailure(failure);
+            teardown_ok = Teardown(options);
+            return teardown_ok ? 3 : 5;
+        } catch (const X86MemoryFault& fault) {
+            g_probe.running = false;
+            ProbeFailure failure;
+            failure.reason = std::string("guest memory fault: ") + mem::StatusName(fault.status);
+            failure.pc = fault.instruction;
+            failure.address = fault.address;
+            failure.has_address = true;
             PrintFailure(failure);
             teardown_ok = Teardown(options);
             return teardown_ok ? 3 : 5;
@@ -691,11 +993,22 @@ int RunChild(const std::string& scenario) {
         teardown_ok = Teardown(options);
         return teardown_ok ? 3 : 5;
     }
-    std::printf("RESULT ok instructions=%u direct_calls=%u import_reads=%u workers=%zu stop=%08X\n",
-                g_probe.executed, g_probe.direct_calls, ImportReads(), kernel::KernelWorkerCountForTest(),
-                kStopBefore);
+    std::string post_error;
+    if (!VerifySyntheticPostconditions(post_error)) {
+        ProbeFailure failure;
+        failure.reason = post_error;
+        failure.pc = kImportCall;
+        PrintFailure(failure);
+        teardown_ok = Teardown(options);
+        return teardown_ok ? 3 : 5;
+    }
+    const bool cancel_ok = CancelPreparedThreadForProbe();
+    std::printf("RESULT ok instructions=%u direct_calls=%u kernel_calls=%u import_reads=%u workers=%zu stop=%08X "
+                "cancelled=%d\n",
+                g_probe.executed, g_probe.direct_calls, g_probe.kernel_calls, ImportReads(),
+                kernel::KernelWorkerCountForTest(), kStopBefore, int(cancel_ok));
     teardown_ok = Teardown(options);
-    return teardown_ok ? 0 : 5;
+    return (teardown_ok && cancel_ok) ? 0 : 5;
 }
 #endif  // EXECUTION_PROBE_MODE_SYNTHETIC
 
@@ -751,28 +1064,27 @@ bool StaticValidateReal(const std::string& path, std::string& report) {
                 report += "\ndirect call target mismatch";
                 return false;
             }
+        } else if (step.kind == StepKind::kKernelCall) {
+            if (operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY || operands[0].mem.base != ZYDIS_REGISTER_NONE ||
+                operands[0].mem.index != ZYDIS_REGISTER_NONE || operands[0].size != 32 ||
+                operands[0].mem.disp.value != int64_t(kImportSlot)) {
+                report += "\nimport call operand mismatch";
+                return false;
+            }
         }
     }
 
-    const int64_t stop_offset = image.Offset(kStopBefore);
-    const size_t stop_span = image.FileSpan(kStopBefore);
-    ZydisDecodedInstruction stop_instruction;
-    ZydisDecodedOperand stop_operands[ZYDIS_MAX_OPERAND_COUNT];
-    if (stop_offset < 0 ||
-        !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, image.file.data() + stop_offset, stop_span, &stop_instruction,
-                                             stop_operands)) ||
-        stop_instruction.mnemonic != ZYDIS_MNEMONIC_CALL || stop_operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY ||
-        stop_operands[0].mem.disp.value != int64_t(kRealImportSlot)) {
-        report += "\nstop instruction is not the expected import call";
+    if (FindStep(kStopBefore)) {
+        report += "\nstop PC is part of the reviewed route";
         return false;
     }
     uint32_t import = 0;
-    if (!image.Read32(kRealImportSlot, import) || import != kImportEncoding) {
+    if (!image.Read32(kImportSlot, import) || import != kImportEncoding) {
         report += "\nimport slot is not the ordinal-255 encoding";
         return false;
     }
     std::snprintf(line, sizeof(line), "real: route=%zu instructions decoded, stop=%08X, import=%08X:%08X",
-                  kRouteCount, kStopBefore, kRealImportSlot, import);
+                  kRouteCount, kStopBefore, kImportSlot, import);
     report += "\n";
     report += line;
     return true;
@@ -879,8 +1191,8 @@ int main(int argc, char** argv) {
 
     const Case cases[] = {
         {"guards", true, "RESULT ok guards=1", 5000, false},
-        {"taken", true, "RESULT ok instructions=49", 5000, false},
-        {"not-taken", true, "RESULT ok instructions=50", 5000, false},
+        {"taken", true, "RESULT ok instructions=50", 5000, false},
+        {"not-taken", true, "RESULT ok instructions=51", 5000, false},
         {"entry-not-executable", false, "entry page is not executable", 5000, false},
         {"helper-not-executable", false, "direct call target page is not executable", 5000, false},
         {"call-target-not-permitted", false, "direct call target is not permitted", 5000, false},
@@ -890,7 +1202,19 @@ int main(int argc, char** argv) {
         {"budget", false, "instruction budget exhausted", 5000, false},
         {"deadline", false, "instruction deadline exceeded", 5000, false},
         {"memory-fault", false, "guest memory fault", 5000, false},
-        {"import-read", false, "ordinal-255 import slot access is forbidden", 5000, false},
+        {"import-read", false, "unreviewed ordinal-255 import slot access", 5000, false},
+        {"import-second-read", false, "ordinal-255 import slot read twice", 5000, false},
+        {"import-not-permitted", false, "ordinal-255 import call is not permitted", 5000, false},
+        {"import-unpatched", false, "checked CALL target 800000FF rejected", 5000, false},
+        {"import-wrong-ordinal", false, "kernel export thunk", 5000, false},
+        {"import-wrong-name", false, "ordinal-255 test bridge was not authorized", 5000, false},
+        {"import-bad-cleanup", false, "stdcall", 5000, false},
+        {"import-bad-return", false, "return address was modified", 5000, false},
+        {"import-bad-return-span", false, "return address", 5000, false},
+        {"import-arg-span", false, "guest memory fault", 5000, false},
+        {"import-prepare-failure", false, "ordinal-255 thread preparation failed", 5000, false},
+        {"import-start-attempt", false, "ordinal-255 thread preparation failed", 5000, false},
+        {"post-import-entry", false, "start PC is not in the reviewed route", 5000, false},
         {"re-entry", false, "re-entry during a step", 5000, false},
         {"parent-timeout", false, "", 800, true},
     };
@@ -932,6 +1256,13 @@ int main(int argc, char** argv) {
     Check(taken.output.find("branch=not-taken") != std::string::npos &&
               taken.output.find("MEM pc=002B392C address=00020000") != std::string::npos,
           "not-taken entry branch records the conditional path and its guest-memory write");
+
+    // the success path prepares and cancels an inactive thread and stops after the import call
+    const ChildResult success = SpawnChild(self, "taken", std::chrono::milliseconds(5000));
+    Check(success.output.find("CANCEL prepared=1 cancelled=1 output_cleared=1 stack_freed=1") != std::string::npos &&
+              success.output.find("STOP 002B5CE0") != std::string::npos &&
+              success.output.find("kernel_calls=1 import_reads=1") != std::string::npos,
+          "successful probe stops after the import call, prepares a thread, and cancels it");
 
     std::printf("execution probe: %s\n", failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;

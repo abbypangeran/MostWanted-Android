@@ -3,17 +3,21 @@
 #include <cstddef>
 #include <cstdint>
 
-// Phase 2C-15 audited startup prefix.
+// Phase 2C-15 audited startup prefix, extended by Phase 2C-18 by one
+// instruction: the ordinal-255 import call at 0x002B5CE0.
 //
 // The route mirrors the instruction shapes recorded in PORT_STATUS.md for
-// 0x002B3916 -> 0x002B396A -> 0x002B5CA7, stopping before 0x002B5CE0.  The
-// synthetic fixture builder and the execution probe both consume this table, so
-// the allowed PCs, lengths, transitions and direct-call target stay in one
-// place.  The addresses are real; the fixture bytes and their data values are
-// synthetic and are not evidence about the retail image.
+// 0x002B3916 -> 0x002B396A -> 0x002B5CA7 -> 0x002B5CE0, stopping after the
+// import call and before 0x002B5CE6.  The synthetic fixture builder and the
+// execution probe both consume this table, so the allowed PCs, lengths,
+// transitions and the two call targets stay in one place.  The addresses are
+// real; the fixture bytes and their data values are synthetic and are not
+// evidence about the retail image.
 namespace execution_probe {
 
-enum class StepKind : uint8_t { kSequential, kConditional, kCall, kStop };
+// kKernelCall is the reviewed indirect call through the import slot; it is
+// admissible only through the test-only ordinal-255 bridge.
+enum class StepKind : uint8_t { kSequential, kConditional, kCall, kKernelCall };
 
 struct RouteStep {
     uint32_t pc;
@@ -74,7 +78,8 @@ struct RouteStep {
     X(0x002B5CD9, 1, kSequential, 0x002B5CDA, 0)                                             \
     X(0x002B5CDA, 2, kSequential, 0x002B5CDC, 0)                                             \
     X(0x002B5CDC, 3, kSequential, 0x002B5CDF, 0)                                             \
-    X(0x002B5CDF, 1, kStop, 0x002B5CE0, 0)
+    X(0x002B5CDF, 1, kSequential, 0x002B5CE0, 0)                                             \
+    X(0x002B5CE0, 6, kKernelCall, 0x002B5CE6, 0)
 
 inline constexpr RouteStep kRoute[] = {
 #define EXECUTION_PROBE_ROUTE_STEP(pc, len, kind, next, alt) {pc, len, StepKind::kind, next, alt},
@@ -86,14 +91,26 @@ inline constexpr size_t kRouteCount = sizeof(kRoute) / sizeof(kRoute[0]);
 inline constexpr uint32_t kEntry = 0x002B3916;
 inline constexpr uint32_t kCallSite = 0x002B396A;
 inline constexpr uint32_t kCallTarget = 0x002B5CA7;
-inline constexpr uint32_t kLastInstruction = 0x002B5CDF;
-inline constexpr uint32_t kStopBefore = 0x002B5CE0;
+inline constexpr uint32_t kImportCall = 0x002B5CE0;
+inline constexpr uint32_t kImportReturn = 0x002B5CE6;  // first PC the probe never executes
+inline constexpr uint32_t kLastInstruction = kImportCall;
+inline constexpr uint32_t kStopBefore = kImportReturn;
 inline constexpr uint32_t kImportSlot = 0x003C9E68;
 inline constexpr uint32_t kImportOrdinal = 255;
 inline constexpr uint32_t kImportEncoding = 0x800000FF;
 
+// authentic arguments the reviewed helper pushes; both routines are data here
+// and are never entered.
+inline constexpr uint32_t kStartRoutine = 0x002B38A2;
+inline constexpr uint32_t kSystemRoutine = 0x002B5C0F;
+
+// stack the reviewed route consumes between the initial ESP and 0x002B5CE0.
+inline constexpr uint32_t kImportStackBytes = 0x50;
+inline constexpr uint32_t kImportArg0Offset = 0x34;  // lea eax, [ebp+0x0C] with ebp = esp + 0x28
+
 inline constexpr uint32_t kMaximumInstructions = 64;
 inline constexpr uint32_t kMaximumDirectCalls = 1;
+inline constexpr uint32_t kMaximumKernelCalls = 1;
 inline constexpr uint32_t kMaximumMemoryOperations = 256;
 inline constexpr uint32_t kMaximumTraceRecords = kMaximumInstructions;
 
