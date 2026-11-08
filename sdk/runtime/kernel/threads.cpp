@@ -345,11 +345,18 @@ bool CancelPreparedThread(const ThreadRef& t) {
     t->published_handle = t->handle_out = t->id_out = 0;
     t->handle_published = t->id_published = false;
     t->system_routine = t->start_routine = t->start_context = 0;
+    t->system_routine_ticket = t->start_routine_ticket = {};
     return true;
 }
 
 bool StartThread(ThreadRef t) {
     if (!t) return false;
+    GuestCallbackTicket start_ticket, system_ticket;
+    if (PrepareGuestCallback(t->start_routine, start_ticket) != GuestCallbackStatus::kReady ||
+        (t->system_routine && PrepareGuestCallback(t->system_routine, system_ticket) != GuestCallbackStatus::kReady))
+        return false;
+    t->start_routine_ticket = start_ticket;
+    t->system_routine_ticket = system_ticket;
     ThreadState expected = ThreadState::kPrepared;
     if (!t->state.compare_exchange_strong(expected, ThreadState::kActive)) return false;
     if (!Register(t)) {
@@ -392,17 +399,24 @@ bool StartThread(ThreadRef t) {
         }
         LOGI("thread %X starts at %08X (%08X, %08X)", t->id,
              t->system_routine ? t->system_routine : t->start_routine, t->start_routine, t->start_context);
-        GuestDispatchLease dispatch_lease;
-        if (!dispatch_lease.Allowed()) {
+        const std::array<uint32_t, 2> system_arguments{t->start_routine, t->start_context};
+        const std::array<uint32_t, 1> start_arguments{t->start_context};
+        const uint32_t stack_base = t->stack_top - t->stack_size;
+        uint32_t code = 0;
+        const GuestCallbackStatus callback_status =
+            t->system_routine
+                ? CallGuestCallback(ctx, t->system_routine_ticket, t->system_routine, system_arguments, stack_base,
+                                    t->stack_size, code)
+                : CallGuestCallback(ctx, t->start_routine_ticket, t->start_routine, start_arguments, stack_base,
+                                    t->stack_size, code);
+        if (callback_status != GuestCallbackStatus::kInvoked) {
+            LOGI("thread %X callback rejected: %u", t->id, unsigned(callback_status));
             MarkExited(*t, 0, ThreadState::kCancelled);
             t->ctx = nullptr;
             Unregister(t.get());
             t_current.reset();
             return;
         }
-        const uint32_t code = t->system_routine
-                                  ? CallGuest(ctx, t->system_routine, {t->start_routine, t->start_context})
-                                  : CallGuest(ctx, t->start_routine, {t->start_context});
         LOGI("thread %X returned %08X", t->id, code);
         MarkExited(*t, code);
         t->ctx = nullptr;
@@ -549,13 +563,25 @@ void SuspendPoint() {
 }
 
 bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3) {
+    GuestCallbackTicket ticket;
+    if (PrepareGuestCallback(routine, ticket) != GuestCallbackStatus::kReady) return false;
+    return QueueApcWithTicket(t, routine, a1, a2, a3, ticket);
+}
+
+bool QueueApcWithTicket(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3,
+                        const GuestCallbackTicket& expected) {
     if (!KernelWorkersAccepting()) return false;
+    GuestCallbackTicket ticket;
+    if (PrepareGuestCallback(routine, ticket) != GuestCallbackStatus::kReady ||
+        expected.target != ticket.target || expected.dispatch_generation != ticket.dispatch_generation)
+        return false;
+    ticket = expected;
     {
         std::lock_guard<std::mutex> lock(t.apc_lock);
         const ThreadState state = t.state.load();
         if (!KernelWorkersAccepting() || state == ThreadState::kExited || state == ThreadState::kCancelled) return false;
         try {
-            t.apcs.push_back({routine, a1, a2, a3});
+            t.apcs.push_back({ticket, {a1, a2, a3}});
         } catch (const std::bad_alloc&) {
             return false;
         }
@@ -568,20 +594,22 @@ bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3
 bool RunApcs(Thread& t) {
     bool ran = false;
     for (;;) {
-        std::array<uint32_t, 4> a;
+        Thread::ApcRecord apc;
         {
             std::lock_guard<std::mutex> lock(t.apc_lock);
             if (!KernelWorkersAccepting() || t.apcs.empty()) {
                 t.apcs.clear();
                 break;
             }
-            a = t.apcs.front();
+            apc = t.apcs.front();
             t.apcs.pop_front();
         }
-        GuestDispatchLease dispatch_lease;
-        if (!dispatch_lease.Allowed()) break;
-        CallGuest(*t.ctx, a[0], {a[1], a[2], a[3]});
-        ran = true;
+        uint32_t result = 0;
+        const GuestCallbackStatus status =
+            CallGuestCallback(*t.ctx, apc.callback, apc.callback.target, apc.arguments, t.stack_top - t.stack_size,
+                              t.stack_size, result);
+        if (status == GuestCallbackStatus::kInvoked) ran = true;
+        if (status == GuestCallbackStatus::kCancelled) break;
     }
     return ran;
 }

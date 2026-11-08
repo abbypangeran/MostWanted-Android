@@ -16,6 +16,7 @@
 
 #include "core/log.h"
 #include "cpu/x86_ops.h"
+#include "kernel/guest_callback.h"
 #include "kernel/memory.h"
 #include "kernel/worker_lifecycle.h"
 
@@ -213,7 +214,9 @@ int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status);
 int32_t ReleaseMutant(Object& o, uint32_t& status);
 int64_t Now100ns();                           // system time, 100 ns since 1601
 int64_t ToDeadline(int64_t due_100ns);        // relative or absolute to a steady clock deadline in ns
-bool QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2);
+bool QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2, const GuestCallbackTicket* expected = nullptr,
+              uint32_t expected_context = 0);
+bool RemoveQueuedDpc(uint32_t dpc);
 struct Thread;
 // apc_routine runs on apc_thread with (apc_context, due low, due high) each time the timer fires
 bool SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, std::shared_ptr<Thread> apc_thread = nullptr,
@@ -226,6 +229,7 @@ struct Thread : Object {
     uint32_t id = 0;
     uint32_t kpcr = 0, ethread = 0, stack_top = 0, stack_size = 0, tls = 0;
     uint32_t system_routine = 0, start_routine = 0, start_context = 0, published_handle = 0;
+    GuestCallbackTicket system_routine_ticket, start_routine_ticket;
     uint32_t handle_out = 0, id_out = 0;
     bool handle_published = false, id_published = false;
     uint32_t exit_code = 0;
@@ -234,7 +238,11 @@ struct Thread : Object {
     std::atomic<int> suspend{0};
     std::atomic<bool> stop_requested{false};
     std::mutex apc_lock;
-    std::deque<std::array<uint32_t, 4>> apcs;  // routine, arg1, arg2, arg3
+    struct ApcRecord {
+        GuestCallbackTicket callback;
+        std::array<uint32_t, 3> arguments;
+    };
+    std::deque<ApcRecord> apcs;
     std::condition_variable resume_cv;
     X86Context* ctx = nullptr;
     Thread() : Object(ObjType::Thread) {}
@@ -268,6 +276,8 @@ uint32_t Suspend(Thread& t);  // previous count; another thread stops at its nex
 void SuspendPoint();           // blocks the current thread while it is suspended
 bool RunApcs(Thread& t);
 bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
+bool QueueApcWithTicket(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3,
+                        const GuestCallbackTicket& expected);
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
 using WaitBlockedHook = void (*)(Thread*);
 using WaitSuspendHook = void (*)(Thread*);

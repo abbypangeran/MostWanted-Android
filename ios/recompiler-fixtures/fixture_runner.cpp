@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <cstring>
 #include <bit>
+#include <condition_variable>
 #include <exception>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -32,6 +34,16 @@ struct FixtureStop {};
 int failures = 0;
 int faults = 0;
 int traps = 0;
+std::atomic<uint32_t> g_callback_fake_calls{0};
+std::atomic<bool> g_callback_fake_stack_ok{false};
+std::mutex g_callback_fake_lock;
+std::condition_variable g_callback_fake_changed;
+bool g_callback_fake_pause = false;
+bool g_callback_fake_entered = false;
+bool g_callback_fake_release = false;
+size_t g_callback_page_mutation_waits = 0;
+std::array<uint32_t, 17> g_callback_fake_stack{};
+size_t g_callback_fake_stack_words = 0;
 X86MemoryFault last_fault{};
 uint32_t last_trap_pc = 0;
 std::string last_trap_reason;
@@ -89,6 +101,262 @@ __attribute__((noinline)) void LocalCopy(void* destination, const void* source, 
 void Check(bool condition, const char* message) {
     std::printf("%s: %s\n", condition ? "PASS" : "FAIL", message);
     if (!condition) ++failures;
+}
+
+void SyntheticGuestCallback(X86Context& ctx, uint8_t*) {
+    ++g_callback_fake_calls;
+    g_callback_fake_stack_ok.store(g_callback_fake_stack_words <= g_callback_fake_stack.size() &&
+                                   mem::Read(ctx.esp, g_callback_fake_stack.data(),
+                                             g_callback_fake_stack_words * sizeof(uint32_t)) == mem::AccessStatus::kOk);
+    std::unique_lock lock(g_callback_fake_lock);
+    if (g_callback_fake_pause) {
+        g_callback_fake_entered = true;
+        g_callback_fake_changed.notify_all();
+        g_callback_fake_changed.wait(lock, [] { return g_callback_fake_release; });
+    }
+    ctx.eax = 0xAABBCCDD;
+}
+
+void CallbackPageMutationWaiting() {
+    std::lock_guard lock(g_callback_fake_lock);
+    ++g_callback_page_mutation_waits;
+    g_callback_fake_changed.notify_all();
+}
+
+void CheckGuestCallbackContract() {
+    constexpr uint32_t code_page = 0x90000;
+    constexpr uint32_t target = code_page + 0x10;
+    constexpr uint32_t stack_size = 0x4000;
+    const uint32_t stack_top = mem::AllocStack(stack_size);
+    const uint32_t stack_base = stack_top ? stack_top - stack_size : 0;
+    Check(stack_top && mem::Commit(code_page, mem::kPage) &&
+              mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+          "synthetic callback code and stack pages prepare");
+    if (!stack_top || !mem::IsCommitted(code_page)) return;
+
+    static const X86FuncMapping functions[] = {{target, SyntheticGuestCallback}};
+    static const uint32_t continuations[] = {target + 8};
+    const dispatch::Metadata metadata{code_page, code_page + mem::kPage, target, functions, continuations};
+    std::string error;
+    Check(dispatch::Init(metadata, error), "synthetic callback dispatch map initializes");
+    Check(kernel::RestartKernelWorkers(), "callback test opens worker dispatch gate");
+
+    kernel::GuestCallbackTicket ticket;
+    Check(kernel::PrepareGuestCallback(target, ticket) == kernel::GuestCallbackStatus::kReady,
+          "mapped executable generated callback registers");
+    kernel::GuestCallbackTicket rejected;
+    Check(kernel::PrepareGuestCallback(target + 4, rejected) == kernel::GuestCallbackStatus::kRejectedTarget &&
+              kernel::PrepareGuestCallback(target + 8, rejected) == kernel::GuestCallbackStatus::kRejectedTarget,
+          "unmapped entry and continuation targets reject");
+
+    X86Context ctx{};
+    ctx.esp = stack_top - 16;
+    constexpr std::array<uint32_t, 2> arguments{0x12345678, 0x87654321};
+    g_callback_fake_stack_words = arguments.size() + 1;
+    uint32_t result = 0;
+    Check(kernel::CallGuestCallbackForTest(ctx, ticket, target + 4, arguments, stack_base, stack_size, result) ==
+              kernel::GuestCallbackStatus::kTargetChanged,
+          "queued target mutation rejects before invocation");
+    Check(kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result) ==
+                  kernel::GuestCallbackStatus::kInvoked &&
+              result == 0xAABBCCDD && g_callback_fake_stack_ok.load() &&
+              g_callback_fake_stack[0] == 0xFFFFFFF0 && g_callback_fake_stack[1] == arguments[0] &&
+              g_callback_fake_stack[2] == arguments[1],
+          "synthetic callback writes checked sentinel and arguments then invokes host substitute");
+
+    Check(mem::Protect(code_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result) ==
+                  kernel::GuestCallbackStatus::kCodePageDenied &&
+              mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+          "queued callback rejects execute-protection change");
+    Check(mem::Decommit(code_page, mem::kPage) &&
+              kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result) ==
+                  kernel::GuestCallbackStatus::kCodePageDenied &&
+              mem::Commit(code_page, mem::kPage) &&
+              mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+          "queued callback rejects target decommit before dispatch");
+
+    const uint32_t calls_before_failures = g_callback_fake_calls.load();
+    std::array<uint32_t, 17> too_many{};
+    Check(kernel::CallGuestCallbackForTest(ctx, ticket, target, too_many, stack_base, stack_size, result) ==
+                  kernel::GuestCallbackStatus::kTooManyArguments &&
+              kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, 8, result) ==
+                  kernel::GuestCallbackStatus::kInvalidStack,
+          "oversized argument list and invalid stack reject");
+    const uint32_t stack_page = (ctx.esp - uint32_t((arguments.size() + 1) * sizeof(uint32_t))) & ~(mem::kPage - 1);
+    Check(mem::Protect(stack_page, mem::kPage, mem::kRead) == mem::AccessStatus::kOk &&
+              kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result) ==
+                  kernel::GuestCallbackStatus::kStackWriteDenied &&
+              mem::Protect(stack_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              g_callback_fake_calls.load() == calls_before_failures,
+          "stack write denial rejects without invoking callback");
+
+    const uint64_t old_generation = ticket.dispatch_generation;
+    Check(dispatch::Init(metadata, error), "callback mapping can be replaced after queueing");
+    Check(kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result) ==
+                  kernel::GuestCallbackStatus::kStaleDispatch &&
+              ticket.dispatch_generation == old_generation,
+          "queued callback ticket rejects a reset dispatch generation");
+    Check(kernel::PrepareGuestCallback(target, ticket) == kernel::GuestCallbackStatus::kReady,
+          "callback ticket refreshes against replacement dispatch map");
+
+    constexpr uint32_t timer_dpc = 0xA0000;
+    constexpr uint32_t timer_dpc_context = 0xA1234;
+    std::array<uint8_t, 0x1C> timer_dpc_bytes{};
+    std::memcpy(timer_dpc_bytes.data() + 0x0C, &target, sizeof(target));
+    std::memcpy(timer_dpc_bytes.data() + 0x10, &timer_dpc_context, sizeof(timer_dpc_context));
+    const bool timer_dpc_ready = mem::Commit(timer_dpc, mem::kPage) &&
+                                 mem::Write(timer_dpc, timer_dpc_bytes.data(), timer_dpc_bytes.size()) ==
+                                     mem::AccessStatus::kOk;
+    const kernel::GuestCallbackTicket stale_timer_ticket = ticket;
+    Check(timer_dpc_ready && dispatch::Init(metadata, error),
+          "timer DPC fixture is ready before dispatch-generation replacement");
+    const bool stale_timer_queued = timer_dpc_ready &&
+                                    kernel::QueueDpc(timer_dpc, 1, 2, &stale_timer_ticket, timer_dpc_context);
+    uint8_t timer_dpc_inserted = 1;
+    const bool timer_dpc_state_read =
+        mem::Read(timer_dpc + 2, &timer_dpc_inserted, sizeof(timer_dpc_inserted)) == mem::AccessStatus::kOk;
+    Check(!stale_timer_queued && timer_dpc_state_read && timer_dpc_inserted == 0,
+          "timer DPC rejects a stale dispatch ticket before queueing");
+    Check(kernel::PrepareGuestCallback(target, ticket) == kernel::GuestCallbackStatus::kReady,
+          "callback ticket refreshes after stale timer DPC rejection");
+
+    {
+        std::lock_guard lock(g_callback_fake_lock);
+        g_callback_fake_pause = true;
+        g_callback_fake_entered = false;
+        g_callback_fake_release = false;
+        g_callback_page_mutation_waits = 0;
+    }
+    mem::SetPageMutationWaitHookForTest(CallbackPageMutationWaiting);
+    std::atomic<kernel::GuestCallbackStatus> active_status{kernel::GuestCallbackStatus::kCancelled};
+    std::thread active([&] {
+        active_status = kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result);
+    });
+    bool entered = false;
+    {
+        std::unique_lock lock(g_callback_fake_lock);
+        entered = g_callback_fake_changed.wait_for(lock, std::chrono::seconds(3), [] { return g_callback_fake_entered; });
+    }
+    std::atomic<bool> reset_started{false}, reset_done{false};
+    std::thread resetter([&] {
+        reset_started = true;
+        dispatch::Reset();
+        reset_done = true;
+    });
+    std::thread stack_mutator([&] {
+        mem::Protect(stack_base, mem::kPage, mem::kRead);
+    });
+    std::thread code_mutator([&] {
+        mem::Decommit(code_page, mem::kPage);
+    });
+    while (!reset_started.load()) std::this_thread::yield();
+    bool mutations_waited = false;
+    {
+        std::unique_lock lock(g_callback_fake_lock);
+        mutations_waited = g_callback_fake_changed.wait_for(lock, std::chrono::seconds(3), [] {
+            return g_callback_page_mutation_waits >= 2;
+        });
+    }
+    Check(entered && mutations_waited && dispatch::ResetWouldBlockForTest() && !reset_done.load(),
+          "active callback leases block code and stack mutation and dispatch reset");
+    {
+        std::lock_guard lock(g_callback_fake_lock);
+        g_callback_fake_release = true;
+        g_callback_fake_pause = false;
+    }
+    g_callback_fake_changed.notify_all();
+    active.join();
+    resetter.join();
+    stack_mutator.join();
+    code_mutator.join();
+    mem::SetPageMutationWaitHookForTest(nullptr);
+    Check(reset_done.load() && active_status.load() == kernel::GuestCallbackStatus::kInvoked &&
+              mem::Commit(code_page, mem::kPage) &&
+              mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+              mem::Protect(stack_base, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "callback return releases code-range and full-stack leases before page mutations finish");
+    Check(dispatch::Init(metadata, error) && kernel::PrepareGuestCallback(target, ticket) ==
+                                                   kernel::GuestCallbackStatus::kReady,
+          "dispatch map restores and fresh callback ticket registers");
+
+    std::barrier start(2);
+    std::atomic<kernel::GuestCallbackStatus> registration_status{kernel::GuestCallbackStatus::kCancelled};
+    std::thread registrar([&] {
+        start.arrive_and_wait();
+        kernel::GuestCallbackTicket concurrent_ticket;
+        registration_status = kernel::PrepareGuestCallback(target, concurrent_ticket);
+    });
+    start.arrive_and_wait();
+    Check(kernel::StopKernelWorkers(), "shutdown closes callback admission gate");
+    registrar.join();
+    const uint32_t before_shutdown_dispatch = g_callback_fake_calls.load();
+    Check((registration_status.load() == kernel::GuestCallbackStatus::kReady ||
+           registration_status.load() == kernel::GuestCallbackStatus::kCancelled) &&
+              kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result) ==
+                  kernel::GuestCallbackStatus::kCancelled &&
+              g_callback_fake_calls.load() == before_shutdown_dispatch,
+          "concurrent registration cannot dispatch after shutdown");
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        Check(kernel::RestartKernelWorkers() && kernel::StopKernelWorkers(),
+              "callback worker gate completes repeated setup and teardown");
+    }
+    Check(kernel::RestartKernelWorkers(), "final callback shutdown test opens worker gate");
+
+    std::atomic<bool> checked_boundary_done{false};
+    std::atomic<kernel::GuestCallbackStatus> checked_boundary_status{kernel::GuestCallbackStatus::kCancelled};
+    const uint32_t calls_before_disabled_boundary = g_callback_fake_calls.load();
+    Check(kernel::StartManagedHostThread("callback-execution-gate-test", [&](X86Context& worker_ctx,
+                                                                              kernel::WorkerStopToken) {
+              worker_ctx.esp = stack_top - 16;
+              uint32_t ignored = 0;
+              checked_boundary_status =
+                  kernel::CallGuestCallback(worker_ctx, ticket, target, arguments, stack_base, stack_size, ignored);
+              checked_boundary_done = true;
+          }), "managed synthetic worker reaches production callback gate");
+    const auto boundary_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!checked_boundary_done.load() && std::chrono::steady_clock::now() < boundary_deadline)
+        std::this_thread::yield();
+    Check(checked_boundary_done.load() &&
+              checked_boundary_status.load() == kernel::GuestCallbackStatus::kExecutionDisabled &&
+              g_callback_fake_calls.load() == calls_before_disabled_boundary,
+          "Apple production callback gate validates then rejects execution without invoking host substitute");
+    Check(kernel::StopKernelWorkers() && kernel::RestartKernelWorkers(),
+          "callback gate worker joins before the next lifecycle phase");
+
+    {
+        std::lock_guard lock(g_callback_fake_lock);
+        g_callback_fake_pause = true;
+        g_callback_fake_entered = false;
+        g_callback_fake_release = false;
+    }
+    std::thread final_callback([&] {
+        active_status = kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result);
+    });
+    {
+        std::unique_lock lock(g_callback_fake_lock);
+        entered = g_callback_fake_changed.wait_for(lock, std::chrono::seconds(3), [] { return g_callback_fake_entered; });
+    }
+    std::atomic<bool> memory_shutdown_done{false};
+    std::thread memory_shutdown([&] {
+        mem::Shutdown();
+        memory_shutdown_done = true;
+    });
+    const auto shutdown_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (kernel::KernelWorkersAccepting() && std::chrono::steady_clock::now() < shutdown_deadline)
+        std::this_thread::yield();
+    Check(entered && !kernel::KernelWorkersAccepting() && !memory_shutdown_done.load(),
+          "memory teardown waits for active callback lifetime");
+    {
+        std::lock_guard lock(g_callback_fake_lock);
+        g_callback_fake_release = true;
+        g_callback_fake_pause = false;
+    }
+    g_callback_fake_changed.notify_all();
+    final_callback.join();
+    memory_shutdown.join();
+    Check(memory_shutdown_done.load() && active_status.load() == kernel::GuestCallbackStatus::kInvoked,
+          "memory teardown starts only after active synthetic callback exits");
 }
 
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE_CLI
@@ -1845,6 +2113,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     RunReleaseBenchmarks(source, destination);
 #endif
 
+    CheckGuestCallbackContract();
     mem::Shutdown();
     return failures ? 1 : 0;
 }

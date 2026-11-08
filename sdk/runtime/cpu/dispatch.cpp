@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -17,6 +19,7 @@ namespace {
 
 dispatch::Table g_dispatch;
 std::shared_mutex g_dispatch_lock;
+uint64_t g_dispatch_generation = 1;
 thread_local size_t g_call_lease_depth = 0;
 constexpr uint32_t kHostThunkBase = 0xFD000000;
 std::vector<X86Func*> g_host_thunks;
@@ -65,6 +68,7 @@ namespace dispatch {
 
 bool Init(const Metadata& metadata, std::string& error) {
     std::unique_lock<std::shared_mutex> lock(g_dispatch_lock);
+    if (++g_dispatch_generation == 0) ++g_dispatch_generation;
     if (!g_dispatch.Initialize(metadata, error)) {
         g_dispatch.Reset();
         lock.unlock();
@@ -85,6 +89,7 @@ bool Init(std::string& error) {
 void Reset() {
     std::unique_lock<std::shared_mutex> lock(g_dispatch_lock);
     g_dispatch.Reset();
+    if (++g_dispatch_generation == 0) ++g_dispatch_generation;
 }
 
 X86Func* Find(uint32_t guest) {
@@ -148,9 +153,24 @@ CallLease::~CallLease() { --g_call_lease_depth; }
 
 ResolvedTarget CallLease::Resolve(uint32_t guest) const { return ResolveTargetLocked(guest); }
 
+uint64_t CallLease::Generation() const { return g_dispatch_generation; }
+uint32_t CallLease::CodeBase() const { return g_dispatch.CodeBase(); }
+uint32_t CallLease::CodeEnd() const { return g_dispatch.CodeEnd(); }
+
+#ifdef MOSTWANTED_GUEST_CALLBACK_TESTS
+bool ResetWouldBlockForTest() {
+    std::unique_lock<std::shared_mutex> lock(g_dispatch_lock, std::try_to_lock);
+    return !lock.owns_lock();
+}
+#endif
+
 }  // namespace dispatch
 
 void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
+#if defined(__APPLE__) && !defined(MOSTWANTED_GUEST_CALLBACK_TESTS)
+    (void)base;
+    x86_trap(ctx, target, "guest indirect execution is disabled in Phase 2C-12");
+#else
     ctx.last_icall = target;
     dispatch::CallLease lease;
     const dispatch::ResolvedTarget resolved = lease.Resolve(target);
@@ -167,6 +187,7 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
     LOGE("indirect call to %08X has no recompiled function (return address %08X, esp %08X)", target, ret, ctx.esp);
     LOGE("add 0x%X to [functions] in the image's config/*.toml and rebuild", target);
     x86_trap(ctx, ret, "indirect call to unknown code");
+#endif
 }
 
 namespace {
@@ -313,6 +334,11 @@ const char* ExportName(uint32_t ordinal) { return ordinal < 400 && g_exports[ord
 bool HasExport(uint32_t ordinal) { return ordinal < 400 && (g_exports[ordinal].fn || g_exports[ordinal].data); }
 
 uint32_t CallGuest(X86Context& ctx, uint32_t fn, const uint32_t* args, size_t count) {
+#if defined(__APPLE__) && !defined(MOSTWANTED_GUEST_CALLBACK_TESTS)
+    (void)args;
+    (void)count;
+    x86_trap(ctx, fn, "CallGuest execution is disabled in Phase 2C-12");
+#else
     // the D3D and DirectSound hooks call this several times a draw: no heap, only the registers put back are kept
     struct {
         uint32_t eax, ecx, edx, ebx, esi, edi, ebp;
@@ -345,7 +371,149 @@ uint32_t CallGuest(X86Context& ctx, uint32_t fn, const uint32_t* args, size_t co
     ctx.ebp = saved.ebp;
     ctx.esp = esp;
     return result;
+#endif
 }
+
+namespace {
+
+constexpr size_t kMaximumCallbackArguments = 16;
+constexpr uint32_t kHostCallbackReturn = 0xFFFFFFF0;
+
+GuestCallbackStatus ValidateMappedCallback(uint32_t target, dispatch::CallLease& lease, X86Func*& function) {
+    const dispatch::ResolvedTarget resolved = lease.Resolve(target);
+    if (resolved.kind != dispatch::TargetKind::kGeneratedFunction || !resolved.function)
+        return GuestCallbackStatus::kRejectedTarget;
+    function = resolved.function;
+    return GuestCallbackStatus::kReady;
+}
+
+GuestCallbackStatus ValidateCallbackTicket(const GuestCallbackTicket& ticket, uint32_t target,
+                                           dispatch::CallLease& lease, X86Func*& function,
+                                           mem::ScopedPageLease& code_lease) {
+    if (!ticket.target) return GuestCallbackStatus::kNullTarget;
+    if (target != ticket.target) return GuestCallbackStatus::kTargetChanged;
+    if (!ticket.dispatch_generation || ticket.dispatch_generation != lease.Generation())
+        return GuestCallbackStatus::kStaleDispatch;
+    const GuestCallbackStatus mapped = ValidateMappedCallback(target, lease, function);
+    if (mapped != GuestCallbackStatus::kReady) return mapped;
+    const uint32_t code_base = lease.CodeBase();
+    const uint32_t code_end = lease.CodeEnd();
+    return code_end > code_base &&
+                   code_lease.Acquire(code_base, code_end - code_base, mem::kExecute) == mem::AccessStatus::kOk
+               ? GuestCallbackStatus::kReady
+               : GuestCallbackStatus::kCodePageDenied;
+}
+
+GuestCallbackStatus ValidateCallbackStack(X86Context& ctx, uint32_t stack_base, uint32_t stack_size,
+                                          std::span<const uint32_t> arguments, uint32_t& stack_pointer,
+                                          mem::ScopedPageLease& stack_lease) {
+    if (arguments.size() > kMaximumCallbackArguments) return GuestCallbackStatus::kTooManyArguments;
+    const uint64_t stack_end = uint64_t(stack_base) + stack_size;
+    const uint64_t frame_size = (arguments.size() + 1) * sizeof(uint32_t);
+    if (!stack_size || stack_end > (uint64_t{1} << 32) || ctx.esp > stack_end ||
+        uint64_t(ctx.esp) < uint64_t(stack_base) + frame_size)
+        return GuestCallbackStatus::kInvalidStack;
+    stack_pointer = ctx.esp - uint32_t(frame_size);
+    return stack_lease.Acquire(stack_base, stack_size, mem::kWrite) == mem::AccessStatus::kOk
+               ? GuestCallbackStatus::kReady
+               : GuestCallbackStatus::kStackWriteDenied;
+}
+
+}  // namespace
+
+GuestCallbackStatus PrepareGuestCallback(uint32_t target, GuestCallbackTicket& ticket) {
+    ticket = {};
+    if (!target) return GuestCallbackStatus::kNullTarget;
+#if defined(__APPLE__) || defined(MOSTWANTED_GUEST_CALLBACK_TESTS)
+    if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
+    dispatch::CallLease lease;
+    X86Func* function = nullptr;
+    const GuestCallbackStatus mapped = ValidateMappedCallback(target, lease, function);
+    if (mapped != GuestCallbackStatus::kReady) return mapped;
+    mem::ScopedPageLease code_lease;
+    if (code_lease.Acquire(target, 1, mem::kExecute) != mem::AccessStatus::kOk)
+        return GuestCallbackStatus::kCodePageDenied;
+    if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
+    ticket = {target, lease.Generation()};
+    return GuestCallbackStatus::kReady;
+#else
+    ticket = {target, 0};
+    return GuestCallbackStatus::kReady;
+#endif
+}
+
+GuestCallbackStatus CallGuestCallback(X86Context& ctx, const GuestCallbackTicket& ticket, uint32_t current_target,
+                                      std::span<const uint32_t> arguments, uint32_t stack_base, uint32_t stack_size,
+                                      uint32_t& result) {
+    result = 0;
+    if (!ticket.target) return GuestCallbackStatus::kNullTarget;
+    if (current_target != ticket.target) return GuestCallbackStatus::kTargetChanged;
+    if (arguments.size() > kMaximumCallbackArguments) return GuestCallbackStatus::kTooManyArguments;
+#if defined(__APPLE__)
+    if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
+    GuestDispatchLease dispatch_gate;
+    if (!dispatch_gate.Allowed()) return GuestCallbackStatus::kCancelled;
+    dispatch::CallLease dispatch_lease;
+    X86Func* function = nullptr;
+    mem::ScopedPageLease code_lease;
+    const GuestCallbackStatus target_status =
+        ValidateCallbackTicket(ticket, current_target, dispatch_lease, function, code_lease);
+    if (target_status != GuestCallbackStatus::kReady) return target_status;
+    (void)function;
+    uint32_t stack_pointer = 0;
+    mem::ScopedPageLease stack_lease;
+    const GuestCallbackStatus stack_status =
+        ValidateCallbackStack(ctx, stack_base, stack_size, arguments, stack_pointer, stack_lease);
+    if (stack_status != GuestCallbackStatus::kReady) return stack_status;
+    return GuestCallbackStatus::kExecutionDisabled;
+#else
+    if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
+    GuestDispatchLease dispatch_gate;
+    if (!dispatch_gate.Allowed()) return GuestCallbackStatus::kCancelled;
+    const uint32_t no_arguments = 0;
+    result = CallGuest(ctx, current_target, arguments.empty() ? &no_arguments : arguments.data(), arguments.size());
+    return GuestCallbackStatus::kInvoked;
+#endif
+}
+
+#ifdef MOSTWANTED_GUEST_CALLBACK_TESTS
+GuestCallbackStatus CallGuestCallbackForTest(X86Context& ctx, const GuestCallbackTicket& ticket,
+                                             uint32_t current_target, std::span<const uint32_t> arguments,
+                                             uint32_t stack_base, uint32_t stack_size, uint32_t& result) {
+    result = 0;
+    if (arguments.size() > kMaximumCallbackArguments) return GuestCallbackStatus::kTooManyArguments;
+    if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
+    GuestDispatchLease dispatch_gate;
+    if (!dispatch_gate.Allowed()) return GuestCallbackStatus::kCancelled;
+    dispatch::CallLease dispatch_lease;
+    X86Func* function = nullptr;
+    mem::ScopedPageLease code_lease;
+    const GuestCallbackStatus target_status =
+        ValidateCallbackTicket(ticket, current_target, dispatch_lease, function, code_lease);
+    if (target_status != GuestCallbackStatus::kReady) return target_status;
+    uint32_t stack_pointer = 0;
+    mem::ScopedPageLease stack_lease;
+    const GuestCallbackStatus stack_status =
+        ValidateCallbackStack(ctx, stack_base, stack_size, arguments, stack_pointer, stack_lease);
+    if (stack_status != GuestCallbackStatus::kReady) return stack_status;
+
+    std::array<uint32_t, kMaximumCallbackArguments + 1> frame{};
+    frame[0] = kHostCallbackReturn;
+    std::copy(arguments.begin(), arguments.end(), frame.begin() + 1);
+    if (mem::Write(stack_pointer, frame.data(), (arguments.size() + 1) * sizeof(uint32_t)) != mem::AccessStatus::kOk)
+        return GuestCallbackStatus::kStackWriteDenied;
+    struct RestoreContext {
+        X86Context& ctx;
+        X86Context saved;
+        ~RestoreContext() { ctx = saved; }
+    } restore{ctx, ctx};
+    ctx.esp = stack_pointer;
+    ctx.last_icall = current_target;
+    function(ctx, mem::Base());
+    result = ctx.eax;
+    return GuestCallbackStatus::kInvoked;
+}
+#endif
 
 }  // namespace kernel
 

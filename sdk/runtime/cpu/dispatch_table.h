@@ -36,6 +36,9 @@ public:
     CallLease(const CallLease&) = delete;
     CallLease& operator=(const CallLease&) = delete;
     ResolvedTarget Resolve(uint32_t guest) const;
+    uint64_t Generation() const;
+    uint32_t CodeBase() const;
+    uint32_t CodeEnd() const;
 
 private:
     std::shared_lock<std::shared_mutex> lock_;
@@ -52,6 +55,9 @@ struct Metadata {
 
 bool Init(const Metadata& metadata, std::string& error);
 bool IsContinuation(uint32_t guest);
+#ifdef MOSTWANTED_GUEST_CALLBACK_TESTS
+bool ResetWouldBlockForTest();
+#endif
 
 class Table {
 public:

@@ -83,6 +83,7 @@ target_include_directories(checked_recompiler_tests PRIVATE ${XBE_SDK}/runtime $
 target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_CHECKED_RECOMPILER_FIXTURE_CLI=1)
 target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_CHECKED_KERNEL_ABI_TESTS=1)
 target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_THREAD_PREPARATION_TESTS=1)
+target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_GUEST_CALLBACK_TESTS=1 MOSTWANTED_GUEST_PAGE_LEASE_TESTS=1)
 target_link_libraries(checked_recompiler_tests PRIVATE Threads::Threads)
 if(BUILD_TESTING)
     add_test(NAME checked_recompiler_tests COMMAND checked_recompiler_tests)

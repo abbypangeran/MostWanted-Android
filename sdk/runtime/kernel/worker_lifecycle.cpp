@@ -331,6 +331,9 @@ bool StopKernelWorkers() {
 
 bool RestartKernelWorkers() { return g_kernel_workers.StartAccepting(); }
 bool KernelWorkersAccepting() { return g_kernel_workers.Accepting(); }
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+void HoldKernelWorkerActivationForTest(bool hold) { g_kernel_workers.HoldActivationForTest(hold); }
+#endif
 
 GuestDispatchLease::GuestDispatchLease() {
     if (g_guest_dispatch_depth) {

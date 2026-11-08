@@ -8,7 +8,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -345,6 +347,17 @@ void CheckProductionWaitSuspensionAndApcShutdown() {
     Check(mem::Init(), "guest memory initializes for synthetic thread-wait tests");
     if (!mem::IsInitialized()) return;
 
+    const uint32_t code_base = X86CodeBase & ~(mem::kPage - 1);
+    const uint32_t code_end = (X86CodeEnd + mem::kPage - 1) & ~(mem::kPage - 1);
+    std::string dispatch_error;
+    const bool callback_map_ready = mem::Commit(code_base, code_end - code_base) &&
+                                    mem::Protect(code_base, code_end - code_base, mem::kRead | mem::kExecute) ==
+                                        mem::AccessStatus::kOk &&
+                                    dispatch::Init(dispatch_error);
+    Check(callback_map_ready, "generated fixture callback map initializes for cancellation tests");
+    if (!callback_map_ready) return;
+    const uint32_t callback_target = X86EntryPoint;
+
     ThreadWaitTest suspended;
     auto event = std::make_shared<kernel::Object>(kernel::ObjType::Event);
     g_thread_wait_test.store(&suspended);
@@ -385,7 +398,7 @@ void CheckProductionWaitSuspensionAndApcShutdown() {
     Check(held_suspended && suspended.result == kernel::kWait0,
           "dispatcher wait does not consume a signaled object until the thread resumes");
     Check(WaitFor([&] { return target->state.load() == kernel::ThreadState::kExited; }) &&
-              !kernel::QueueApc(*target, 0x1234, 0, 0, 0),
+              !kernel::QueueApc(*target, callback_target, 0, 0, 0),
           "APC registration rejects a thread after its completion transition");
     Check(kernel::StopKernelWorkers() && kernel::RestartKernelWorkers(),
           "suspended-wait test reaps its managed thread before runtime reuse");
@@ -406,7 +419,7 @@ void CheckProductionWaitSuspensionAndApcShutdown() {
               "alertable thread reaches the production dispatcher wait");
     }
     target = apc.thread;
-    Check(target && kernel::QueueApc(*target, 0x1234, 0, 0, 0), "synthetic APC queues before shutdown");
+    Check(target && kernel::QueueApc(*target, callback_target, 0, 0, 0), "synthetic APC queues before shutdown");
     {
         std::unique_lock lock(apc.lock);
         Check(WaitFor(apc.changed, lock, [&] { return apc.apc_observed; }),
@@ -435,6 +448,44 @@ void CheckProductionWaitSuspensionAndApcShutdown() {
     kernel::SetWaitApcHookForTest(nullptr);
     g_thread_wait_target.store(nullptr);
     g_thread_wait_test.store(nullptr);
+
+    constexpr uint32_t dpc_address = 0x7A000;
+    std::array<uint8_t, 0x1C> dpc_bytes{};
+    const uint16_t dpc_type = 19;
+    const uint32_t dpc_context = 0x7B000;
+    std::memcpy(dpc_bytes.data(), &dpc_type, sizeof(dpc_type));
+    std::memcpy(dpc_bytes.data() + 0x0C, &callback_target, sizeof(callback_target));
+    std::memcpy(dpc_bytes.data() + 0x10, &dpc_context, sizeof(dpc_context));
+    const bool dpc_ready = mem::Commit(dpc_address, mem::kPage) &&
+                           mem::Write(dpc_address, dpc_bytes.data(), dpc_bytes.size()) == mem::AccessStatus::kOk;
+    Check(dpc_ready, "synthetic KDPC memory initializes for queued-removal test");
+    if (dpc_ready) {
+        kernel::HoldKernelWorkerActivationForTest(true);
+        const bool queued = kernel::QueueDpc(dpc_address, 0x1111, 0x2222);
+        const bool removed = kernel::RemoveQueuedDpc(dpc_address);
+        kernel::HoldKernelWorkerActivationForTest(false);
+        const bool stopped = kernel::StopKernelWorkers();
+        uint8_t inserted = 1;
+        const bool read_inserted = mem::Read(dpc_address + 2, &inserted, sizeof(inserted)) == mem::AccessStatus::kOk;
+        Check(queued && removed && stopped && read_inserted && inserted == 0,
+              "queued DPC removal clears guest state before worker activation and shutdown");
+        Check(kernel::RestartKernelWorkers(), "DPC cancellation test reopens worker registration");
+
+        constexpr uint32_t shutdown_dpc = dpc_address + 0x100;
+        Check(mem::Write(shutdown_dpc, dpc_bytes.data(), dpc_bytes.size()) == mem::AccessStatus::kOk,
+              "synthetic KDPC memory initializes for shutdown cancellation test");
+        kernel::HoldKernelWorkerActivationForTest(true);
+        const bool shutdown_queued = kernel::QueueDpc(shutdown_dpc, 0x3333, 0x4444);
+        const bool shutdown_stopped = kernel::StopKernelWorkers();
+        kernel::HoldKernelWorkerActivationForTest(false);
+        inserted = 1;
+        const bool shutdown_read = mem::Read(shutdown_dpc + 2, &inserted, sizeof(inserted)) ==
+                                   mem::AccessStatus::kOk;
+        Check(shutdown_queued && shutdown_stopped && shutdown_read && inserted == 0,
+              "shutdown cancels a queued DPC and clears its guest Inserted state");
+        Check(kernel::RestartKernelWorkers(), "DPC shutdown test reopens worker registration");
+    }
+    dispatch::Reset();
 }
 #endif
 

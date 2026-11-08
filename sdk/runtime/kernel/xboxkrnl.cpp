@@ -809,20 +809,11 @@ KERNEL_EXPORT(107, KeInitializeDpc, 3) {
 }
 
 KERNEL_EXPORT(119, KeInsertQueueDpc, 3) {
-    uint32_t d = a[0];
-    if (G<uint8_t>(d + 2)) return 0;  // already Inserted
-    G<uint8_t>(d + 2) = 1;
-    if (!QueueDpc(d, a[1], a[2])) {
-        G<uint8_t>(d + 2) = 0;
-        return 0;
-    }
-    return 1;
+    return QueueDpc(a[0], a[1], a[2]) ? 1 : 0;
 }
 
 KERNEL_EXPORT(137, KeRemoveQueueDpc, 1) {
-    uint8_t was = G<uint8_t>(a[0] + 2);
-    G<uint8_t>(a[0] + 2) = 0;
-    return was;
+    return RemoveQueuedDpc(a[0]) ? 1 : 0;
 }
 
 KERNEL_EXPORT(109, KeInitializeInterrupt, 7) { return 0; }
@@ -832,7 +823,19 @@ KERNEL_EXPORT(44, HalGetInterruptVector, 2) {
     if (a[1]) G<uint8_t>(a[1]) = uint8_t(a[0]);
     return a[0] + 0x30;  // PRIMARY_VECTOR_BASE
 }
-KERNEL_EXPORT(153, KeSynchronizeExecution, 3) { return CallGuest(ctx, a[1], {a[2]}) & 0xFF; }
+KERNEL_EXPORT(153, KeSynchronizeExecution, 3) {
+    GuestCallbackTicket ticket;
+    if (PrepareGuestCallback(a[1], ticket) != GuestCallbackStatus::kReady) return 0;
+    const std::array<uint32_t, 1> arguments{a[2]};
+    Thread* thread = Current();
+    const uint32_t stack_base = thread ? thread->stack_top - thread->stack_size : 0;
+    const uint32_t stack_size = thread ? thread->stack_size : 0;
+    uint32_t result = 0;
+    return CallGuestCallback(ctx, ticket, a[1], arguments, stack_base, stack_size, result) ==
+                   GuestCallbackStatus::kInvoked
+               ? result & 0xFF
+               : 0;
+}
 
 // threads
 
