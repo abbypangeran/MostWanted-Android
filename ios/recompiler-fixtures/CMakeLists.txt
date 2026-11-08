@@ -90,10 +90,65 @@ target_compile_features(execution_probe_tests PRIVATE cxx_std_20)
 target_include_directories(execution_probe_tests PRIVATE ${XBE_SDK}/runtime ${PROBE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(execution_probe_tests PRIVATE
     MOSTWANTED_EXECUTION_PROBE_TESTS=1
+    EXECUTION_PROBE_MODE_SYNTHETIC=1
     EXECUTION_PROBE_FIXTURE_XBE="${PROBE_FIXTURE_XBE}"
     EXECUTION_PROBE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 target_link_libraries(execution_probe_tests PRIVATE Threads::Threads Zydis)
+
+# Phase 2C-16: a dedicated real-image mapping with the same 50 hooks.  The
+# target is excluded from the default build and fails if the real XBE is absent.
+set(EXECUTION_PROBE_REAL_XBE "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/default.xbe" CACHE FILEPATH
+    "Validated NFS Most Wanted Black Edition default.xbe")
+add_executable(execution_probe_real_config execution_probe_real_config.cpp)
+set_property(TARGET execution_probe_real_config PROPERTY CXX_STANDARD 20)
+target_include_directories(execution_probe_real_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set(REAL_PROBE_DIR ${CMAKE_CURRENT_BINARY_DIR}/probe_real)
+set(REAL_PROBE_CONFIG ${REAL_PROBE_DIR}/execution_probe_real.toml)
+set(REAL_PROBE_GENERATED_DIR ${REAL_PROBE_DIR}/generated)
+set(REAL_PROBE_GENERATED_SOURCE ${REAL_PROBE_GENERATED_DIR}/x86_recomp.0.cpp)
+set(REAL_PROBE_GENERATED_MAPPING ${REAL_PROBE_GENERATED_DIR}/x86_func_mapping.cpp)
+add_custom_command(
+    OUTPUT ${REAL_PROBE_CONFIG}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${REAL_PROBE_DIR}
+    COMMAND execution_probe_real_config ${REAL_PROBE_CONFIG} ${EXECUTION_PROBE_REAL_XBE}
+    DEPENDS execution_probe_real_config
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${REAL_PROBE_GENERATED_SOURCE} ${REAL_PROBE_GENERATED_DIR}/x86_recomp_shared.h ${REAL_PROBE_GENERATED_MAPPING}
+    COMMAND $<TARGET_FILE:xbe_recomp> ${REAL_PROBE_CONFIG} ${EXECUTION_PROBE_REAL_XBE} ${REAL_PROBE_GENERATED_DIR}
+    DEPENDS xbe_recomp ${REAL_PROBE_CONFIG}
+    VERBATIM
+)
+add_custom_target(generate_execution_probe_real DEPENDS ${REAL_PROBE_GENERATED_SOURCE})
+set_target_properties(generate_execution_probe_real PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_executable(execution_probe_real_preflight
+    execution_probe.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
+    ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/crypto.cpp
+    ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
+    ${XBE_SDK}/runtime/xbe/image_loader.cpp
+    ${REAL_PROBE_GENERATED_SOURCE}
+    ${REAL_PROBE_GENERATED_MAPPING}
+)
+add_dependencies(execution_probe_real_preflight generate_execution_probe_real)
+target_compile_features(execution_probe_real_preflight PRIVATE cxx_std_20)
+target_include_directories(execution_probe_real_preflight PRIVATE ${XBE_SDK}/runtime ${REAL_PROBE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(execution_probe_real_preflight PRIVATE
+    MOSTWANTED_EXECUTION_PROBE_TESTS=1
+    EXECUTION_PROBE_MODE_REAL=1
+    EXECUTION_PROBE_REAL_XBE="${EXECUTION_PROBE_REAL_XBE}"
+    EXECUTION_PROBE_REAL_GENERATED_DIR="${REAL_PROBE_GENERATED_DIR}"
+    EXECUTION_PROBE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+)
+target_link_libraries(execution_probe_real_preflight PRIVATE Threads::Threads Zydis)
+set_target_properties(execution_probe_real_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
 add_executable(checked_recompiler_tests
     fixture_runner.cpp

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <span>
@@ -37,6 +38,9 @@
 #include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
 #include "execution_probe_route.h"
+#if defined(EXECUTION_PROBE_MODE_REAL)
+#include "execution_probe_real_route.h"
+#endif
 #include "kernel/crypto.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
@@ -49,8 +53,17 @@ namespace kernel {
 uint8_t* g_base = nullptr;
 }
 
-#ifndef EXECUTION_PROBE_FIXTURE_XBE
+#if defined(EXECUTION_PROBE_MODE_SYNTHETIC) && !defined(EXECUTION_PROBE_FIXTURE_XBE)
 #error "EXECUTION_PROBE_FIXTURE_XBE must name the generated synthetic fixture"
+#endif
+#if defined(EXECUTION_PROBE_MODE_REAL) && !defined(EXECUTION_PROBE_REAL_XBE)
+#error "EXECUTION_PROBE_REAL_XBE must name the real image"
+#endif
+#if defined(EXECUTION_PROBE_MODE_REAL) && !defined(EXECUTION_PROBE_REAL_GENERATED_DIR)
+#error "EXECUTION_PROBE_REAL_GENERATED_DIR must name the generated real mapping"
+#endif
+#if !defined(EXECUTION_PROBE_MODE_SYNTHETIC) && !defined(EXECUTION_PROBE_MODE_REAL)
+#error "define EXECUTION_PROBE_MODE_SYNTHETIC or EXECUTION_PROBE_MODE_REAL"
 #endif
 #ifndef EXECUTION_PROBE_REPO_ROOT
 #define EXECUTION_PROBE_REPO_ROOT "."
@@ -98,6 +111,11 @@ struct StepRecord {
     bool branch_taken;
 };
 
+struct Span {
+    uint32_t begin, end;
+    bool write;
+};
+
 struct Options {
     uint32_t start_pc = kEntry;
     uint32_t instruction_budget = kMaximumInstructions;
@@ -114,6 +132,14 @@ struct Options {
     std::chrono::milliseconds delay{0};
     uint32_t delay_pc = 0;
     std::chrono::milliseconds deadline{0};
+    uint32_t initial_esp = kStackTop;
+    std::vector<Span> allowed_spans;
+    std::vector<uint32_t> snapshot_pages;
+    std::vector<uint32_t> owned_pages;
+    uint32_t image_base = 0, image_size = 0;
+    bool free_image = false;
+    uint32_t stack_top = 0;
+    bool free_stack = false;
 };
 
 struct ProbeState {
@@ -137,22 +163,6 @@ const RouteStep* FindStep(uint32_t pc) {
     for (const RouteStep& step : kRoute)
         if (step.pc == pc) return &step;
     return nullptr;
-}
-
-struct Span {
-    uint32_t begin, end;
-    bool write;
-};
-
-Span DataSpans(size_t index) {
-    switch (index) {
-        case 0: return {kDataPage, kDataPage + mem::kPage, true};
-        case 1: return {kPointerPage, kPointerPage + 2 * mem::kPage, true};
-        case 2: return {kGlobalPage, kGlobalPage + mem::kPage, true};
-        case 3: return {kCounterPage, kCounterPage + mem::kPage, true};
-        case 4: return {kStackPage, kStackTop, true};
-        default: return {0, 0, false};
-    }
 }
 
 bool InImportPage(uint32_t address, uint64_t end) {
@@ -301,9 +311,7 @@ void execution_probe_memory_access(uint32_t instruction, uint32_t address, std::
         Fail("ordinal-255 import slot access is forbidden", instruction, address, true);
 
     bool allowed = false;
-    for (size_t i = 0; i < 5; ++i) {
-        Span span = DataSpans(i);
-        if (i == 3 && !g_probe.options.allow_counter_page) continue;
+    for (const Span& span : g_probe.options.allowed_spans) {
         if (address >= span.begin && end <= span.end && (!write || span.write)) {
             allowed = true;
             break;
@@ -320,12 +328,9 @@ struct SnapshotPage {
     bool valid = false;
 };
 
-constexpr uint32_t kSnapshotPages[] = {kDataPage, kPointerPage, kAllocationPage,
-                                       kGlobalPage, kCounterPage, kStackPage};
-
 std::vector<SnapshotPage> Snapshot() {
     std::vector<SnapshotPage> pages;
-    for (uint32_t page : kSnapshotPages) {
+    for (uint32_t page : g_probe.options.snapshot_pages) {
         SnapshotPage snapshot;
         snapshot.page = page;
         snapshot.valid = mem::Read(page, snapshot.bytes.data(), snapshot.bytes.size()) == mem::AccessStatus::kOk;
@@ -413,6 +418,7 @@ bool ProtectRange(uint32_t base, uint32_t size, uint8_t permissions) {
     return mem::Protect(base, size, permissions) == mem::AccessStatus::kOk;
 }
 
+#if defined(EXECUTION_PROBE_MODE_SYNTHETIC)
 bool PrepareFixture(xbe::Image& image, std::string& error) {
     std::vector<uint8_t> bytes;
     if (!ReadFile(EXECUTION_PROBE_FIXTURE_XBE, bytes)) {
@@ -435,7 +441,7 @@ bool PrepareFixture(xbe::Image& image, std::string& error) {
     return true;
 }
 
-bool PrepareData(const Options& options) {
+bool PrepareData(Options& options) {
     const std::array<uint32_t, 7> pages = {kDataPage,  kPointerPage, kAllocationPage, kGlobalPage,
                                            kCounterPage, kImportPage,   kStackPage};
     for (uint32_t page : pages)
@@ -459,8 +465,30 @@ bool PrepareData(const Options& options) {
     Write32(kImportSlot, kImportEncoding);
     if (!ProtectRange(kImportPage, mem::kPage, mem::kNoAccess)) return false;
     if (options.decommit_global && !mem::Decommit(kGlobalPage, mem::kPage)) return false;
+
+    options.allowed_spans = {{kDataPage, kDataPage + mem::kPage, true},
+                             {kPointerPage, kPointerPage + 2 * mem::kPage, true},
+                             {kGlobalPage, kGlobalPage + mem::kPage, true},
+                             {kCounterPage, kCounterPage + mem::kPage, true},
+                             {kStackPage, kStackTop, true}};
+    if (!options.allow_counter_page)
+        options.allowed_spans.erase(std::remove_if(options.allowed_spans.begin(), options.allowed_spans.end(),
+                                                   [](const Span& span) {
+                                                       return span.begin == kCounterPage;
+                                                   }),
+                                    options.allowed_spans.end());
+    options.snapshot_pages = {kDataPage, kPointerPage, kAllocationPage, kGlobalPage, kCounterPage, kStackPage};
+    options.owned_pages = {kDataPage, kPointerPage, kAllocationPage, kGlobalPage, kCounterPage, kImportPage,
+                           kStackPage};
+    options.image_base = kImageBase;
+    options.image_size = kImageSize;
+    options.free_image = true;
+    options.initial_esp = kStackTop;
+    options.stack_top = 0;
+    options.free_stack = false;
     return true;
 }
+#endif  // EXECUTION_PROBE_MODE_SYNTHETIC
 
 struct Report {
     bool normal_stop = false;
@@ -501,10 +529,10 @@ Report RunProbe(const Options& options) {
             report.error.pc = options.start_pc;
         } else {
             X86Context ctx{};
-            ctx.esp = kStackTop;
+            ctx.esp = options.initial_esp;
             try {
                 if (options.use_resume)
-                    x86_resume(ctx, nullptr, {options.start_pc, kStackTop});
+                    x86_resume(ctx, nullptr, {options.start_pc, options.initial_esp});
                 else
                     target.function(ctx, nullptr);
                 report.failure = true;
@@ -538,13 +566,15 @@ void PrintFailure(const ProbeFailure& failure) {
                 ImportReads());
 }
 
-bool Teardown(uint32_t image_base, uint32_t image_size) {
+bool Teardown(const Options& options) {
     kernel::StopKernelWorkers();
     dispatch::Reset();
-    mem::FreeVirtual(image_base, image_size, mem::kMemRelease);
-    const std::array<uint32_t, 7> pages = {kDataPage,  kPointerPage, kAllocationPage, kGlobalPage,
-                                           kCounterPage, kImportPage,   kStackPage};
-    for (uint32_t page : pages) mem::Decommit(page, mem::kPage);
+    if (options.free_image) {
+        uint32_t base = options.image_base, size = options.image_size;
+        mem::FreeVirtual(base, size, mem::kMemRelease);
+    }
+    if (options.free_stack && options.stack_top) mem::FreeStack(options.stack_top);
+    for (uint32_t page : options.owned_pages) mem::Decommit(page, mem::kPage);
     const mem::Stats stats = mem::Query();
     const size_t workers = kernel::KernelWorkerCountForTest();
     mem::Shutdown();
@@ -555,6 +585,7 @@ bool Teardown(uint32_t image_base, uint32_t image_size) {
            !mem::IsInitialized();
 }
 
+#if defined(EXECUTION_PROBE_MODE_SYNTHETIC)
 int RunChild(const std::string& scenario) {
     Options options;
     bool import_probe = false;
@@ -606,7 +637,7 @@ int RunChild(const std::string& scenario) {
     if (guards) {
         const bool raw_guard = mem::Base() == nullptr;
         const size_t workers = kernel::KernelWorkerCountForTest();
-        teardown_ok = Teardown(0, 0);
+        teardown_ok = Teardown(Options{});
         std::printf("RESULT ok guards=1 raw_base=%s workers=%zu\n", raw_guard ? "null" : "non-null", workers);
         return teardown_ok ? 0 : 5;
     }
@@ -644,12 +675,12 @@ int RunChild(const std::string& scenario) {
             (void)x86_mem_read<uint32_t>(kStopBefore, kImportSlot);
             std::printf("RESULT fail reason=\"import read was not rejected\" pc=%08X\n", kStopBefore);
             g_probe.running = false;
-            Teardown(image.base, image.image_size);
+            Teardown(options);
             return 3;
         } catch (const ProbeFailure& failure) {
             g_probe.running = false;
             PrintFailure(failure);
-            teardown_ok = Teardown(image.base, image.image_size);
+            teardown_ok = Teardown(options);
             return teardown_ok ? 3 : 5;
         }
     }
@@ -657,16 +688,18 @@ int RunChild(const std::string& scenario) {
     const Report report = RunProbe(options);
     if (report.failure) {
         PrintFailure(report.error);
-        teardown_ok = Teardown(image.base, image.image_size);
+        teardown_ok = Teardown(options);
         return teardown_ok ? 3 : 5;
     }
     std::printf("RESULT ok instructions=%u direct_calls=%u import_reads=%u workers=%zu stop=%08X\n",
                 g_probe.executed, g_probe.direct_calls, ImportReads(), kernel::KernelWorkerCountForTest(),
                 kStopBefore);
-    teardown_ok = Teardown(image.base, image.image_size);
+    teardown_ok = Teardown(options);
     return teardown_ok ? 0 : 5;
 }
+#endif  // EXECUTION_PROBE_MODE_SYNTHETIC
 
+#if defined(EXECUTION_PROBE_MODE_SYNTHETIC)
 bool StaticValidateReal(const std::string& path, std::string& report) {
     std::vector<uint8_t> bytes;
     if (!ReadFile(path.c_str(), bytes)) {
@@ -744,6 +777,7 @@ bool StaticValidateReal(const std::string& path, std::string& report) {
     report += line;
     return true;
 }
+#endif  // EXECUTION_PROBE_MODE_SYNTHETIC
 
 std::string SelfPath() {
 #if defined(__APPLE__)
@@ -811,6 +845,7 @@ ChildResult SpawnChild(const std::string& self, const std::string& scenario, std
     return result;
 }
 
+#if defined(EXECUTION_PROBE_MODE_SYNTHETIC)
 struct Case {
     const char* scenario;
     bool expect_ok;
@@ -818,9 +853,11 @@ struct Case {
     int timeout_ms;
     bool expect_timeout;
 };
+#endif
 
 }  // namespace
 
+#if defined(EXECUTION_PROBE_MODE_SYNTHETIC)
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--child") == 0) return RunChild(argv[2]);
 
@@ -899,3 +936,8 @@ int main(int argc, char** argv) {
     std::printf("execution probe: %s\n", failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;
 }
+#endif  // EXECUTION_PROBE_MODE_SYNTHETIC
+
+#if defined(EXECUTION_PROBE_MODE_REAL)
+#include "execution_probe_real.inc"
+#endif

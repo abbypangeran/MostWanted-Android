@@ -500,18 +500,19 @@ void Analysis::Run() {
     // immediates that point at code are callbacks: make sure they are entries
     size_t imm = 0;
     std::vector<uint32_t> extra;
-    for (auto& [va, insn] : insns_) {
-        if (insn.flow != Flow::Normal) continue;
-        ZydisDecodedInstruction in;
-        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-        if (!Decode(va, in, ops)) continue;
-        if (in.mnemonic != ZYDIS_MNEMONIC_PUSH && in.mnemonic != ZYDIS_MNEMONIC_MOV) continue;
-        for (int i = 0; i < in.operand_count_visible; i++)
-            if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                uint32_t v = uint32_t(ops[i].imm.value.u);
-                if (IsCode(v) && !functions.count(v) && PlausibleEntry(v)) extra.push_back(v);
-            }
-    }
+    if (cfg.callback_seeds)
+        for (auto& [va, insn] : insns_) {
+            if (insn.flow != Flow::Normal) continue;
+            ZydisDecodedInstruction in;
+            ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+            if (!Decode(va, in, ops)) continue;
+            if (in.mnemonic != ZYDIS_MNEMONIC_PUSH && in.mnemonic != ZYDIS_MNEMONIC_MOV) continue;
+            for (int i = 0; i < in.operand_count_visible; i++)
+                if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    uint32_t v = uint32_t(ops[i].imm.value.u);
+                    if (IsCode(v) && !functions.count(v) && PlausibleEntry(v)) extra.push_back(v);
+                }
+        }
     std::sort(extra.begin(), extra.end());
     extra.erase(std::unique(extra.begin(), extra.end()), extra.end());
     for (uint32_t v : extra) {

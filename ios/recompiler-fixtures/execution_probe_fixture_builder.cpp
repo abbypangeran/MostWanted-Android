@@ -133,6 +133,7 @@ bool WriteConfig(const char* path) {
               "code_sections = [\".text\"]\n"
               "pointer_seeds = false\n"
               "gap_fill = false\n"
+              "callback_seeds = false\n"
               "checked_memory = true\n\n"
               "[[function]]\n"
               "at = 0x002B3916\n"
