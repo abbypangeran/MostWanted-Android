@@ -1110,20 +1110,20 @@ At `0x002B3916`, six pushed values feed the call to `0x002B396A`: `0, 0, 0x002B3
 
 The static routine VAs and zero context are established by the generated instructions; the effective stack size and TLS contents are runtime-derived. The thread object now retains the supplied `system_routine`, `start_routine`, and `start_context` directly. Activation waits for suspension to clear, then calls the system routine with `(start_routine, start_context)`, or the start routine with `(start_context)` when no system routine is supplied.
 
-The candidate start routine `0x002B38A2` begins with a direct call to `0x002B58B8`, an unsupported checked instruction boundary. The inspected path reads `0x003C9E34` and `0x003C9E3C`, then reaches dynamic calls through `[0x003C9D30]` and EDI loaded from `[0x003C9D28]`. These are static dependencies, not evidence that the routine is reached.
+The candidate start routine `0x002B38A2` begins with a checked direct call to `0x002B58B8`; that call form is supported. At this callee entry, generated output reads import-derived values from `0x003C9E34` and `0x003C9E3C` and guest memory at `0x8001003C`, then reaches the first unsupported instruction, `NOT AL` at `0x002B58CB`. Later in that helper, protection-service targets are loaded through `0x003C9D30` (`MmQueryAddressProtect`) and `0x003C9D28` (`MmSetAddressProtect`); the call through the first slot is at `0x002B5942`, followed by an indirect register call through EDI at `0x002B5955`. The start routine's later direct call to `0x002B5664` is statically present, but its helper first reaches `CALL [0x003C9E38]` (`HalRegisterShutdownNotification`) at `0x002B567B`; it also references `IoCreateSymbolicLink` through `0x003C9DDC`. These later sites are not established as reachable.
 
-The candidate system routine `0x002B5C0F` begins with `PUSH 0x18`, also outside the checked instruction set. It then pushes `0x003ED5B8`, calls `0x00319804`, accesses FS plus globals `0x003ED3F0`, `0x003ED3EC`, and `0x003ED3FC`, and calls the dynamic start routine from `[ebp+8]`. Later it calls import `[0x003C9E64]` and reaches `INT3`. None of these instructions ran.
+The candidate system routine `0x002B5C0F` has checked `PUSH 0x18` and a checked direct call to `0x00319804`; neither is its first blocker. The generated code reads `FS:[0x28]`, guest stack fields, and globals `0x003ED5B8`, `0x003ED3F0`, `0x003ED3EC`, and `0x003ED3FC`. Its first unsupported instruction is `REP MOVSD` at `0x002B5C4E`; later unsupported string operations are `REP MOVSB` at `0x002B5C55`, `REP STOSD` at `0x002B5C6B`, and `REP STOSB` at `0x002B5C72`. The routine later emits dynamic `CALL [EBP+8]` at `0x002B5C7E`, `CALL [0x003C9E64]` (`PsTerminateSystemThread`) at `0x002B5CA0`, and `INT3` at `0x002B5CA6`. No routine was executed.
 
 Each callback path ultimately uses legacy `CallGuest`/`x86_icall`. Its dispatch lease protects the selected dispatch entry only for the synchronous call; it does not keep queued callback targets or guest pages valid while they wait.
 
 | Callback path | Retained target and arguments | Dispatch, invalidation, and shutdown boundary |
 | --- | --- | --- |
-| Thread start | `Thread` retains start/system routine VAs and context from the export arguments. | `StartThread`'s detached host worker later calls legacy `CallGuest`; it does not pin guest code/data pages or classify the target under checked policy. No worker join or guest-code cancellation exists. |
-| File completion APC | `Complete` queues `(routine, context, IOSB, 0)` on the thread after IOSB publication; `RunApcs` later invokes it on that thread context. | Callback target/arguments remain VAs; pages are not pinned or revalidated as a complete callback span. The APC queue has no cancellation/removal API. `CallGuest` holds a dispatch lease only for the synchronous invocation. |
-| Timer APC | Timer entry retains APC routine/context and a weak thread reference; expiry queues `(context, timeLo, timeHi)`. | Cancelled timer sequences are ignored, but the timer worker is detached and has no stop/join path. Queued APC values and guest pages are not pinned. |
-| DPC | Queue retains DPC VA and copied system arguments; dispatch later reads `DeferredRoutine` and `DeferredContext` from guest DPC fields and calls `(dpc, context, arg1, arg2)`. | Guest field reads and callback target are not checked/pinned; removing a DPC clears the guest `Inserted` field but does not remove an already queued host record. The DPC worker is detached. |
+| Thread start | `Thread` retains start/system routine VAs and context from the export arguments. | Apple validates class-specific function tickets and code/stack spans before its disabled callback gate; no guest thread is activated. The context remains unresolved and unpinned. Android retains its legacy callback dispatch. |
+| File completion APC | `Complete` queues `(routine, context, IOSB, 0)` after IOSB publication using the `FileAPC` class. The APC record stores the bounded IOSB address without holding a page lease while queued. | Apple dispatch validates and leases the readable 8-byte IOSB only for callback validation/execution; a stale/decommitted span rejects without calling the guest target. Context remains unresolved and is not dereferenced by the host. |
+| Timer APC | Timer expiry queues `(context, timeLo, timeHi)` with the `TimerAPC` class. The two time values are scalars; context is optional and unresolved. | Timer sequence cancellation and worker quiescence are managed. The context's pointee is neither dereferenced nor pinned. Apple callback execution remains disabled. |
+| DPC and timer DPC | Queue records the KDPC address and callback ticket. Generic DPC system arguments are opaque dwords; timer low/high values are scalars. | Dispatch acquires a bounded read/write lease over the 0x1C-byte KDPC while host code reads/updates it and validates the callback. Context remains unresolved. DPC dispatch supplies no modeled guest stack, so the Apple boundary rejects with `kInvalidStack`; queued work is drained on shutdown. |
 
-Before any callback dispatch can be authorized, targets and arguments need checked access or lifetime pins covering the full call, callback code/data mappings must survive protection/decommit, cancellation must invalidate already queued work, dispatch-table reset must remain excluded until all callbacks quiesce, and every host worker must stop/join before guest memory or runtime state is torn down. The current `Shutdown` path stops the kernel clock and calls `_Exit`; it does not establish this callback quiescence. Later graphics, audio, filesystem, socket, object, wait, scatter/gather, and GPU-input paths retain additional raw or long-lived guest pointers.
+The class-specific boundary now protects callback code and bounded argument spans on Apple and in the synthetic fixture wrapper; file IOSBs and DPC records also retain leases while host work owns them. Optional or unresolved pointers are passed through as values and are not dereferenced or pinned. Checked scalar helpers can validate generated reads and writes at the point of use, but raw `X86_MEM*`, `X86_PTR`, `HostPtr()`, and other HLE accesses can bypass that boundary. The Apple production callback gate remains disabled, Android keeps legacy callback dispatch, and remaining raw graphics, audio, filesystem, socket, object, wait, scatter/gather, and GPU-input paths still block guest execution.
 
 ### Phase 2C-10 verification evidence
 
@@ -1244,7 +1244,7 @@ The synthetic callback fixtures cover generated-entry registration and rejection
 
 Both `src/d3d/d3d8.cpp` and `sdk/runtime/xdk/d3d8.cpp` now start the vertical-blank loop with `StartManagedHostThread`. Stop callbacks wake its condition-variable wait; stop is checked before device-state updates and callback dispatch. Managed-worker shutdown joins it before guest-memory teardown. CDevice fields used by the loop are accessed under a bounded page lease. The callback-info block remains allocated until guest-memory teardown, after the managed worker has joined.
 
-The worker's loop, pacing, focus pause, event behavior, and device-state transitions have no dedicated runtime test. Generic worker-lifecycle tests exercise managed creation failure, stop/wake/join, repeated lifecycle setup/teardown, and memory teardown ordering. The production iOS app and Android build compile the active `src/d3d/d3d8.cpp`; the alternate XDK implementation passes a syntax-only compile. Both VBlank callback paths pass no guest stack range because their host worker has no modeled guest thread stack, so the Apple callback boundary rejects them. DirectSound, input, XNet, threaded GPU, audio output, and other excluded workers remain outside this change.
+At the Phase 2C-12 checkpoint, the worker's loop, pacing, focus pause, event behavior, and device-state transitions had no dedicated runtime test. Phase 2C-13 below adds one for the shared compiled worker implementation. The production iOS app and Android build compile the active `src/d3d/d3d8.cpp`; the alternate XDK implementation remains a separate syntax-compile check. Both VBlank callback paths still pass no guest stack range because their host worker has no modeled guest thread stack, so the Apple callback boundary rejects them. DirectSound, input, XNet, threaded GPU, audio output, and other excluded workers remain outside this change.
 
 **`ADDITIONAL_WORKER_QUIESCENCE: PARTIAL`** — vertical-blank worker ownership is migrated and generic lifecycle behavior passes; the VBlank loop/device-state/callback path is not runtime-tested.
 
@@ -1262,7 +1262,7 @@ The static route remains `0x002B3916 → 0x002B396A → 0x002B5CA7 → 0x002B5CE
 | Graphics and audio | VBlank worker compiles and is managed, but has no dedicated loop test and its callback has no guest stack. Other graphics/audio paths retain raw or deferred guest pointers. | **Static/compile-only and unsafe/unverified** |
 | Filesystem | Contiguous IOSB lease/publication and worker ordering have focused tests. Scatter/gather buffers/status, other file metadata paths, and actual startup file flow remain raw or unverified; host I/O side effects are not transactional. | **Tested safe only for the covered contiguous IOSB cases; remainder unsafe/unverified** |
 
-The checked recompiler continues to trap unsupported 16-byte SIMD (`MOVUPS`), 10-byte x87 (`FLD`), implicit-memory exchange, `LOCKED XADD`, and `REP MOVSD` forms in synthetic tests. The statically inspected candidate start routine at `0x002B38A2` reaches an unsupported checked boundary at `0x002B58B8`; the system routine at `0x002B5C0F` begins with an instruction outside the checked set and later performs dynamic calls through `[0x003C9D30]` and EDI loaded from `[0x003C9D28]`, then reaches import `[0x003C9E64]` and `INT3`. The precise generated-code observations are not proof of runtime reachability.
+The checked recompiler still traps unsupported SIMD, x87, implicit-memory exchange, `LOCKED XADD`, and string-operation forms in synthetic tests. In the current generated XBE output, the start routine's direct call from `0x002B38A2` to `0x002B58B8` is supported; that callee's first unsupported instruction at this entry is `NOT AL` at `0x002B58CB`. The system routine's `PUSH 0x18` and direct call to `0x00319804` are also supported; its first unsupported instruction is `REP MOVSD` at `0x002B5C4E`. Its later dynamic callback/import calls and the start helper's protection imports are statically identified only. The generated output is not runtime reachability evidence.
 
 Raw guest access remains broad. Representative open paths include `G<T>()`/`R32()` object and synchronization fields in `sdk/runtime/kernel/objects.cpp` and `xboxkrnl.cpp`; `HostPtr()` critical-section atomics and DPC initialization in `xboxkrnl.cpp`; scatter/gather and file metadata buffers in `files.cpp`; D3D device/resource paths in both D3D implementations; generated `X86_MEM*`/`X86_PTR` outside the checked subset; and asynchronous audio, input, XNet, rendering, and GPU buffers. The current callback contract validates callback code and stack lifetime, not arbitrary guest addresses carried inside callback arguments.
 
@@ -1282,4 +1282,82 @@ Raw guest access remains broad. Representative open paths include `G<T>()`/`R32(
 - **Development:** callback ticket/lifetime boundary and VBlank managed-worker migration implemented; Stage A restored.
 - **Validation:** the platform and fixture evidence above passes within stated limits.
 - **Integration:** pushed to `origin/feature/ios-port` with a normal fast-forward; no merge to `main`.
+- **Deployment/customer release:** not performed.
+
+## Phase 2C-13 integrated startup and callback safety
+
+Baseline: `0515f9bc3313bf4714b53a36cf36e5a04493365f` on `feature/ios-port`. This phase joins the previously separate synthetic XBE preparation, kernel data, checked ordinal-255 ABI, inactive thread preparation, and callback ticket checks in one test. It also adds per-class callback argument validation and runtime coverage for the shared VBlank worker. The Apple `Boot()` guard remains. No real XBE instruction or guest callback ran, no guest thread was activated, and no physical device or IPA was used.
+
+### Track A: synthetic startup integration
+
+`synthetic_startup_integration_tests` runs two complete cycles through production memory initialization, synthetic XBE parsing and preparation, kernel structure initialization, dispatch setup, ordinal-255 import patching, the fixture-only checked ABI bridge, inactive `PrepareSystemThreadEx`, callback ticket registration, output/stack/TLS/KPCR/ETHREAD checks, cancellation, dispatch reset, allocation release, and guest-memory shutdown. It verifies there are no active threads or worker launches and that handle/pointer bindings and published outputs are cleared before teardown.
+
+Failure injection covers Apple memory initialization, XBE section publication, kernel-data publication rollback, dispatch initialization, import-slot patch rollback, and thread preparation after stack, KPCR, ETHREAD, and immediately before publication. It also checks rejection while the callback gate is closed and successful retry after reopening. The bridge accepts only the fixture's ordinal-255 `PsCreateSystemThreadEx`; it does not call the production export or activate the prepared thread. The fixture remains separate from production `Boot()`.
+
+### Track B: typed callback argument and lifetime contracts
+
+Each ticket now carries its callback class. Apple production dispatch and the checked test wrapper enforce these argument contracts before callback-frame writes:
+
+| Callback class | Contract |
+| --- | --- |
+| Thread start | One optional unresolved context value. |
+| System routine | One mapped generated guest-function address and one optional unresolved context. |
+| Generic APC | Three opaque dwords; no pointer assumptions. |
+| File APC | Optional context, readable 8-byte IOSB, reserved scalar. |
+| DPC | Read/write 0x1C-byte KDPC, optional unresolved context, two opaque dwords. |
+| Timer APC | Optional context, scalar low/high values. |
+| Timer DPC | Read/write 0x1C-byte KDPC, optional unresolved context, scalar low/high values. |
+| VBlank | Readable 12-byte info record. |
+| Synchronize execution | One optional unresolved context value. |
+| Fixture | Variadic scalar contract for tests only; production ticket preparation rejects this class. |
+
+Tests invoke each contract and cover invalid arity, unmapped function addresses, read/write permission changes, decommit, stale dispatch generations, queued cancellation, shutdown, and concurrent page mutation. A FileAPC queue stores its IOSB address without a lease; dispatch acquires the bounded read lease for validation and active use. A regression confirms decommit completes while the APC is queued and that dispatch rejects the now-invalid span without invoking the callback. DPC records retain a bounded KDPC lease while host code owns and updates that structure. VBlank's 12-byte temporary record stays leased through callback validation, and its allocation is freed when the worker exits.
+
+The FileAPC third slot is modeled as a reserved scalar, consistent with the Windows `PIO_APC_ROUTINE` signature's `ULONG Reserved`; this file path passes zero. The Xbox-specific callback ABI remains unverified. ([Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/icmpapi/nf-icmpapi-icmpsendecho2ex))
+
+Optional or unresolved pointer arguments remain values. The host does not dereference them, pin them, or retain arbitrary reachable object graphs. Checked generated reads and writes can enforce validity at each dereference only when the checked helpers are used; raw `X86_MEM*`, `X86_PTR`, `HostPtr()`, and other HLE accesses remain outside that boundary. Apple validates a valid callback, then returns `kExecutionDisabled`; callbacks without a supplied guest stack reject with `kInvalidStack`. Android callback execution keeps its existing legacy behavior.
+
+### Track C: VBlank runtime lifecycle
+
+Both `src/d3d/d3d8.cpp` and `sdk/runtime/xdk/d3d8.cpp` now use the shared compiled `sdk/runtime/kernel/vblank_worker.cpp` loop. `vblank_runtime_tests` uses synthetic device memory and a test-only callback substitute; it exercises worker creation failure/retry, focus pause/resume, count/swap/event consistency, page protection and decommit while device access is released, stop during a held callback, repeated start/stop, and memory shutdown joining the worker. The substitute calls the checked test gate with a zero stack and observes `kInvalidStack`; the mapped synthetic function is never called. The active D3D caller is included in Android's full native build. The alternate XDK caller receives a separate syntax compile; this does not claim XDK device runtime coverage.
+
+### Track D: source-grounded startup map
+
+Static inspection used the Black Edition XBE with SHA-1 `f636a16af04171089f879a4bed646e185c734233` and fresh ignored checked output. No candidate routine was executed.
+
+- **Startup import route:** generated references form `0x002B3916 → 0x002B396A → 0x002B5CA7 → CALL [0x003C9E68]`. The import slot initially contains ordinal 255 (`0x800000FF`); XBE preparation resolves it to `0xFE0003FC` (`PsCreateSystemThreadEx`). `TEST`, `SHR`, memory argument pushes, and the direct calls on this route are supported checked forms. The checked indirect-call helper rejects the patched kernel-thunk target before it mutates the guest return stack. The ordinal-255 acceptance exists only in the synthetic fixture bridge.
+- **Start routine `0x002B38A2`:** its direct `CALL 0x002B58B8` is a supported checked direct call. That callee reads import-derived values at `0x003C9E34` and `0x003C9E3C` and guest memory at `0x8001003C`; the first unsupported instruction from this callee entry is `NOT AL` at `0x002B58CB`. Later code references `MmQueryAddressProtect` through `0x003C9D30` and `MmSetAddressProtect` through `0x003C9D28` (`CALL [0x003C9D30]` at `0x002B5942`, then `CALL EDI` at `0x002B5955`). A later helper references `HalRegisterShutdownNotification` at `0x003C9E38` and `IoCreateSymbolicLink` at `0x003C9DDC`. These dynamic imports and pointer targets are not validated by runtime execution.
+- **System routine `0x002B5C0F`:** `PUSH 0x18` and direct `CALL 0x00319804` are supported checked forms. It uses `FS:[0x28]`, stack fields, and globals at `0x003ED5B8`, `0x003ED3F0`, `0x003ED3EC`, and `0x003ED3FC`. Its first unsupported instruction is `REP MOVSD` at `0x002B5C4E`; later string traps are `REP MOVSB` (`0x002B5C55`), `REP STOSD` (`0x002B5C6B`), and `REP STOSB` (`0x002B5C72`). The later callback `CALL [EBP+8]` at `0x002B5C7E` is dynamic; the import call to `PsTerminateSystemThread` at `0x002B5CA0` and `INT3` at `0x002B5CA6` are also static dependencies only.
+- **Host services and execution boundary:** current HLE `MmQueryAddressProtect` returns fixed `PAGE_READWRITE`, `MmSetAddressProtect` does not change protection, and `HalRegisterShutdownNotification` is a stub. `PsTerminateSystemThread` exits through the managed host-thread path; `IoCreateSymbolicLink` reaches host filesystem handling. These implementations do not establish Xbox protection, notification, filesystem, FS/TLS, or callback semantics for the real XBE.
+
+| Evidence class | Classification |
+| --- | --- |
+| Checked `TEST`, `SHR`, `PUSH`, direct `CALL`, and synthetic memory/flag behavior | **Supported and synthetic-tested only**; no real XBE instruction executed. |
+| XBE imports, candidate function targets, guest globals, FS accesses, and dynamic call sites | **Statically identified; runtime reachability unverified.** |
+| Ordinal-255 bridge, kernel initialization, inactive thread and callback tickets | **Synthetic fixture only.** Production indirect-call policy still rejects the kernel thunk. |
+| Thread/system routine activation, unresolved callback pointees, import semantics, raw HLE paths, and callbacks without a real guest stack | **Unsafe or unsupported.** |
+
+### Track E: platform regression
+
+| Platform/check | Result |
+| --- | --- |
+| macOS ARM64 memory/preparation | Debug and Release CTests passed 1/1 each. |
+| Generated recompiler, kernel ABI, callback, startup, and VBlank fixtures | Debug and Release CTests passed 4/4 each. |
+| iOS Simulator memory/preparation | **PASS** — iPhone 18 Pro simulator completed `mostwanted_memory_tests` with 857 `PASS:` lines and no `FAIL:` lines, including the synthetic checked callback/preparation fixture. |
+| Unsigned iPhoneOS ARM64 compile/link | **PASS** — `mostwanted_ios` and `mostwanted_memory_tests` are arm64 Mach-O executables; `codesign` confirms both are unsigned. Neither was installed on a physical iPhone. |
+| Android `:app:assembleDebug` | **PASS (build only)** with Java 21 and NDK 28.2.13676358, using freshly regenerated ignored output under `.local/ios-port/phase2c13-generated-game/`; runtime was not exercised. |
+| Alternate XDK D3D call site | **PASS (syntax only)** using Android's NDK 28.2.13676358 compile flags. The shared worker runtime test covers the loop; the alternate renderer was not linked or run. |
+| Vulkan GPU readback | Not rerun; this phase did not change Vulkan code. |
+
+### Phase 2C-13 gates and delivery state
+
+- `SYNTHETIC_STARTUP_INTEGRATION`: **PASS** — two lifecycle cycles and deterministic rollback checks pass in Debug and Release.
+- `CALLBACK_ARGUMENT_CONTRACT`: **PASS for the listed classes** — bounded spans, scalars, opaque dwords, function pointers, and unresolved values are distinguished; unknown pointees remain unvalidated/unpinned.
+- `VBLANK_RUNTIME_LIFECYCLE`: **PASS** — dedicated runtime test uses the compiled shared worker; no guest stack is fabricated.
+- `STARTUP_DEPENDENCY_MAP`: **PASS (static)** — source-grounded route and blockers; no runtime reachability claim.
+- `PLATFORM_REGRESSION`: **PASS** for the requested macOS, generated fixtures, Simulator, unsigned iPhoneOS build, and Android build checks. Android and physical-device runtime behavior were not exercised.
+- `REAL_GUEST_EXECUTION`: **NO-GO.** Keep the Apple `Boot()` guard and production callback execution disabled. Unsupported instructions, the expected kernel-thunk rejection, unresolved import/service semantics, raw memory paths, unspecified callback pointee graphs, and absent DPC/VBlank stack model remain blockers.
+- **Development:** implementation and documentation are complete on `feature/ios-port`.
+- **Validation:** all requested builds and synthetic/platform checks passed within the limits stated above.
+- **Integration:** implementation commit `3de3ea1df1ad2432ae6dae7e044b1a149c98c86c` pushed to `origin/feature/ios-port` with a normal fast-forward; `main` remains unchanged.
 - **Deployment/customer release:** not performed.
