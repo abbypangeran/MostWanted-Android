@@ -24,6 +24,7 @@ struct RealFacts {
     bool entry_taken = false;
     bool p_write_required = false;
     uint32_t idiv_dividend = 0, idiv_quotient = 0, idiv_remainder = 0;
+    uint32_t counter_after = 0;
     uint32_t q = 0, q_before = 0, q_after = 0;
     uint32_t stack_base = 0, stack_top = 0, esp = 0;
     std::vector<Span> spans;
@@ -480,6 +481,7 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
         return false;
     }
     facts.idiv_dividend = added;
+    facts.counter_after = added;
     facts.idiv_quotient = uint32_t(int32_t(quotient));
     facts.idiv_remainder = uint32_t(int32_t(remainder));
     facts.q_after = facts.idiv_quotient;
@@ -546,6 +548,8 @@ void PrintRealFacts(const RealFacts& facts) {
                 facts.idiv_dividend, facts.idiv_quotient, facts.idiv_remainder, facts.q, facts.q_before,
                 facts.q_after);
     std::printf("PREFLIGHT helper: arg=00000000 branch=not-taken fall-through-value=%08X\n", facts.g10130);
+    std::printf("PREFLIGHT expected: counter=%08X result=%08X entry_branch=%s helper_branch=not-taken\n",
+                facts.counter_after, facts.q_after, facts.entry_taken ? "taken" : "not-taken");
     std::printf("PREFLIGHT stack: base=%08X top=%08X esp=%08X requested=%X committed=%X\n", facts.stack_base,
                 facts.stack_top, facts.esp, kRealStackRequest, kRealStackCommitted);
     std::printf("PREFLIGHT pages: entry=RX helper=RX header=R rdata=R data=RW import=NOACCESS\n");
@@ -572,6 +576,93 @@ bool CopyAndPatch(const std::string& source, const std::string& destination, int
     return bool(out);
 }
 
+bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
+    const StepRecord* entry_branch = nullptr;
+    const StepRecord* helper_branch = nullptr;
+    const StepRecord* helper_value = nullptr;
+    const StepRecord* idiv_result = nullptr;
+    for (const StepRecord& step : g_probe.trace) {
+        if (step.pc == 0x002B392A) entry_branch = &step;
+        if (step.pc == 0x002B5CAF) helper_branch = &step;
+        if (step.pc == 0x002B5CD9) helper_value = &step;
+        if (step.pc == 0x002B3956) idiv_result = &step;
+    }
+    if (g_probe.executed != 49) {
+        error = "expected 49 instructions, got " + std::to_string(g_probe.executed);
+        return false;
+    }
+    if (g_probe.direct_calls != 1) {
+        error = "expected one direct call, got " + std::to_string(g_probe.direct_calls);
+        return false;
+    }
+    if (!facts.entry_taken || !entry_branch || !entry_branch->branch_valid || !entry_branch->branch_taken) {
+        error = "entry JNB was not taken";
+        return false;
+    }
+    if (!helper_branch || !helper_branch->branch_valid || helper_branch->branch_taken) {
+        error = "helper JNZ was not statically not-taken";
+        return false;
+    }
+    if (!helper_value || helper_value->eax != facts.g10130) {
+        error = "helper fall-through register mismatch";
+        return false;
+    }
+    if (!idiv_result || idiv_result->eax != facts.q_after) {
+        error = "IDIV register mismatch";
+        return false;
+    }
+    if (ImportReads() != 0) {
+        error = "the ordinal-255 import slot was read";
+        return false;
+    }
+    if (kernel::KernelWorkerCountForTest() != 0) {
+        error = "a worker was activated";
+        return false;
+    }
+    uint32_t counter = 0, result = 0;
+    if (mem::Read(kCounterAddress, &counter, sizeof(counter)) != mem::AccessStatus::kOk ||
+        counter != facts.counter_after) {
+        error = "counter postcondition failed at 004EDC74";
+        return false;
+    }
+    if (mem::Read(facts.q, &result, sizeof(result)) != mem::AccessStatus::kOk || result != facts.q_after) {
+        error = "result postcondition failed at the reviewed store";
+        return false;
+    }
+    if (g_probe.trace.empty() || g_probe.trace.back().pc != kLastInstruction) {
+        error = "mandatory stop was not at 002B5CDF";
+        return false;
+    }
+    return true;
+}
+
+void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) {
+    g_probe = ProbeState{};
+    g_probe.executed = 49;
+    g_probe.direct_calls = 1;
+    StepRecord entry{};
+    entry.pc = 0x002B392A;
+    entry.branch_valid = true;
+    entry.branch_taken = entry_taken;
+    g_probe.trace.push_back(entry);
+    StepRecord helper{};
+    helper.pc = 0x002B5CAF;
+    helper.branch_valid = true;
+    helper.branch_taken = helper_taken;
+    g_probe.trace.push_back(helper);
+    StepRecord idiv{};
+    idiv.pc = 0x002B3956;
+    idiv.eax = facts.q_after;
+    g_probe.trace.push_back(idiv);
+    StepRecord helper_value{};
+    helper_value.pc = 0x002B5CD9;
+    helper_value.eax = facts.g10130;
+    g_probe.trace.push_back(helper_value);
+    StepRecord last{};
+    last.pc = kLastInstruction;
+    g_probe.trace.push_back(last);
+}
+
 int RealChild(const std::string& scenario) {
     if (!mem::Init()) {
         std::printf("SETUP fail memory init\n");
@@ -583,23 +674,29 @@ int RealChild(const std::string& scenario) {
     RealFacts facts;
     bool ok = false;
     int exit_code = 5;
+    uint32_t execute_counter = 0, execute_result = 0;
 
     if (scenario == "execute") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
-        if (ok) {
+        if (!ok) {
+            std::printf("SETUP fail %s\n", error.c_str());
+            exit_code = 4;
+        } else {
             const Report report = RunProbe(options);
             if (report.failure) {
                 PrintFailure(report.error);
                 exit_code = 3;
             } else {
-                std::printf("REAL_EXEC ok instructions=%u direct_calls=%u import_reads=%u workers=%zu stop=%08X\n",
-                            g_probe.executed, g_probe.direct_calls, ImportReads(),
-                            kernel::KernelWorkerCountForTest(), kStopBefore);
-                exit_code = 0;
+                std::string post_error;
+                if (!VerifyRealPostconditions(facts, post_error)) {
+                    std::printf("RESULT fail reason=\"%s\"\n", post_error.c_str());
+                    exit_code = 3;
+                } else {
+                    mem::Read(kCounterAddress, &execute_counter, sizeof(execute_counter));
+                    mem::Read(facts.q, &execute_result, sizeof(execute_result));
+                    exit_code = 0;
+                }
             }
-        } else {
-            std::printf("SETUP fail %s\n", error.c_str());
-            exit_code = 4;
         }
     } else if (scenario == "preflight") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
@@ -671,6 +768,32 @@ int RealChild(const std::string& scenario) {
         ok = ValidateStack(0x0FF000, 0x100000, 0x100008, error);
         if (!ok) std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
         exit_code = ok ? 5 : 3;
+    } else if (scenario == "postcondition-count" || scenario == "postcondition-branch" ||
+               scenario == "postcondition-import" || scenario == "postcondition-counter" ||
+               scenario == "postcondition-result") {
+        const bool needs_image = scenario == "postcondition-counter" || scenario == "postcondition-result";
+        if (needs_image) ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        else {
+            facts = RealFacts{};
+            facts.entry_taken = true;
+            ok = true;
+        }
+        if (ok) {
+            facts.entry_taken = true;
+            FakeRealTrace(facts, true, false);
+            if (scenario == "postcondition-count") g_probe.executed = 48;
+            else if (scenario == "postcondition-branch") g_probe.trace[0].branch_taken = false;
+            else if (scenario == "postcondition-import")
+                g_probe.memory.push_back({kStopBefore, kRealImportSlot, 4, false});
+            else if (scenario == "postcondition-result") Write32(kCounterAddress, facts.counter_after);
+            std::string post_error;
+            ok = VerifyRealPostconditions(facts, post_error);
+            if (!ok) std::printf("RESULT fail reason=\"%s\"\n", post_error.c_str());
+            exit_code = ok ? 5 : 3;
+        } else {
+            std::printf("SETUP fail %s\n", error.c_str());
+            exit_code = 4;
+        }
     } else if (scenario == "execute-permission") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (ok) {
@@ -689,12 +812,106 @@ int RealChild(const std::string& scenario) {
         return 4;
     }
 
-    if (scenario == "preflight" || scenario == "execute-permission" || scenario == "execute") {
-        if (!Teardown(options)) exit_code = 5;
+    const bool execute_success = scenario == "execute" && exit_code == 0;
+    bool teardown_ok = false;
+    if (scenario == "preflight" || scenario == "execute-permission" || scenario == "execute" ||
+        scenario == "postcondition-counter" || scenario == "postcondition-result") {
+        teardown_ok = Teardown(options);
     } else {
-        if (!Teardown(Options{})) exit_code = 5;
+        teardown_ok = Teardown(Options{});
     }
+    if (!teardown_ok) {
+        if (scenario == "execute") std::printf("RESULT fail reason=\"teardown retained resources\"\n");
+        exit_code = 5;
+    } else if (execute_success) {
+        std::printf("REAL_EXEC ok instructions=%u direct_calls=%u import_reads=%u workers=%zu stop=%08X "
+                    "counter=%08X result=%08X\n",
+                    g_probe.executed, g_probe.direct_calls, ImportReads(), kernel::KernelWorkerCountForTest(),
+                    kStopBefore, execute_counter, execute_result);
+    }
+    alarm(0);
     return exit_code;
+}
+
+constexpr int kSupervisionFd = 3;
+
+bool SupervisionTokenValid() {
+    const char* expected = std::getenv("MOSTWANTED_PROBE_SUPERVISION");
+    if (!expected || !*expected) return false;
+    char token[64] = {};
+    const ssize_t count = read(kSupervisionFd, token, sizeof(token) - 1);
+    if (count <= 0) return false;
+    token[count] = '\0';
+    return std::strcmp(token, expected) == 0;
+}
+
+std::string SupervisionToken() {
+    const uint64_t nonce = uint64_t(Clock::now().time_since_epoch().count()) ^ (uint64_t(getpid()) << 32);
+    char token[32];
+    std::snprintf(token, sizeof(token), "%016llX", static_cast<unsigned long long>(nonce));
+    return token;
+}
+
+ChildResult SpawnSupervisedChild(const std::string& self, const std::string& scenario,
+                                 std::chrono::milliseconds timeout) {
+    int out[2], control[2];
+    if (pipe(out) != 0) return {};
+    if (pipe(control) != 0) {
+        close(out[0]);
+        close(out[1]);
+        return {};
+    }
+    const std::string token = SupervisionToken();
+    setenv("MOSTWANTED_PROBE_SUPERVISION", token.c_str(), 1);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(out[0]);
+        close(control[1]);
+        dup2(out[1], STDOUT_FILENO);
+        dup2(out[1], STDERR_FILENO);
+        if (control[0] != kSupervisionFd) {
+            dup2(control[0], kSupervisionFd);
+            close(control[0]);
+        }
+        close(out[1]);
+        execl(self.c_str(), self.c_str(), "--child", scenario.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    unsetenv("MOSTWANTED_PROBE_SUPERVISION");
+    close(out[1]);
+    close(control[0]);
+    ChildResult result;
+    if (pid < 0) {
+        close(out[0]);
+        close(control[1]);
+        return result;
+    }
+    (void)write(control[1], token.data(), token.size());
+    close(control[1]);
+    const auto start = Clock::now();
+    const auto deadline = start + timeout;
+    int status = 0;
+    for (;;) {
+        const pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) break;
+        if (Clock::now() >= deadline) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            result.timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    result.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
+    char buffer[4096];
+    for (;;) {
+        const ssize_t count = read(out[0], buffer, sizeof(buffer));
+        if (count <= 0) break;
+        if (result.output.size() < 65536) result.output.append(buffer, size_t(count));
+    }
+    close(out[0]);
+    result.status = status;
+    return result;
 }
 
 int RealParent(const std::string& mode, bool execute_real) {
@@ -717,7 +934,7 @@ int RealParent(const std::string& mode, bool execute_real) {
             std::printf("REFUSED: pass --execute-real only after explicit approval\n");
             return 2;
         }
-        const ChildResult result = SpawnChild(self, "execute", std::chrono::seconds(15));
+        const ChildResult result = SpawnSupervisedChild(self, "execute", std::chrono::seconds(15));
         std::printf("%s", result.output.c_str());
         if (result.timed_out) {
             std::printf("REAL EXECUTION FAIL: timeout\n");
@@ -744,6 +961,11 @@ int RealParent(const std::string& mode, bool execute_real) {
         {"invalid-stack", false, "stack"},
         {"execute-permission", false, "not executable"},
         {"pre-import-stop", false, "forbidden import slot"},
+        {"postcondition-count", false, "expected 49 instructions"},
+        {"postcondition-branch", false, "entry JNB"},
+        {"postcondition-import", false, "import slot"},
+        {"postcondition-counter", false, "counter postcondition"},
+        {"postcondition-result", false, "result postcondition"},
     };
     int failed = 0;
     for (const RealCase& test : cases) {
@@ -759,6 +981,26 @@ int RealParent(const std::string& mode, bool execute_real) {
             std::printf("%s: real child %s completes preflight\n", condition ? "PASS" : "FAIL", test.scenario);
         if (!condition) ++failed;
     }
+
+    const ChildResult unauthorised = SpawnChild(self, "execute", std::chrono::seconds(5));
+    const int unauthorised_exit = WIFEXITED(unauthorised.status) ? WEXITSTATUS(unauthorised.status) : -1;
+    const bool unauthorised_ok = !unauthorised.timed_out && unauthorised_exit == 2 &&
+                                 unauthorised.output.find("REFUSED") != std::string::npos;
+    std::printf("%s: direct --child execute is refused without the supervised parent\n",
+                unauthorised_ok ? "PASS" : "FAIL");
+    if (!unauthorised_ok) ++failed;
+
+    const ChildResult supervised = SpawnSupervisedChild(self, "supervised-check", std::chrono::seconds(5));
+    const int supervised_exit = WIFEXITED(supervised.status) ? WEXITSTATUS(supervised.status) : -1;
+    const bool supervised_ok = !supervised.timed_out && supervised_exit == 0 &&
+                               supervised.output.find("RESULT ok supervision=1") != std::string::npos;
+    std::printf("%s: supervised token/fd pathway is wired without execution\n", supervised_ok ? "PASS" : "FAIL");
+    if (!supervised_ok) ++failed;
+
+    const int missing_flag = RealParent("run-once", false);
+    std::printf("%s: --run-once without --execute-real is refused\n", missing_flag == 2 ? "PASS" : "FAIL");
+    if (missing_flag != 2) ++failed;
+
     std::printf("real probe preflight: %s\n", failed ? "FAILED" : "PASSED");
     return failed ? 1 : 0;
 }
@@ -766,7 +1008,22 @@ int RealParent(const std::string& mode, bool execute_real) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 3 && std::strcmp(argv[1], "--child") == 0) return RealChild(argv[2]);
+    if (argc == 3 && std::strcmp(argv[1], "--child") == 0) {
+        const std::string scenario = argv[2];
+        if (scenario == "execute" || scenario == "supervised-check") {
+            if (!SupervisionTokenValid()) {
+                std::printf("REFUSED: real execution requires the supervised parent\n");
+                return 2;
+            }
+            if (scenario == "execute") {
+                alarm(12);
+            } else {
+                std::printf("RESULT ok supervision=1\n");
+                return 0;
+            }
+        }
+        return RealChild(scenario);
+    }
     bool execute_real = false;
     const char* mode = "self-test";
     for (int i = 1; i < argc; ++i) {

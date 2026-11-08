@@ -1625,6 +1625,14 @@ The real probe uses the same isolated parent/child harness as Phase 2C-15. Each 
 
 Expected: 49 instructions, entry branch taken, one direct call to `002B5CA7`, stop at `002B5CE0`, `import_reads=0`, `workers=0`, memory changes at `004EDC74` and `004DF78C` plus the stack. Mandatory stop conditions: no execution of `002B5CE0`, no read of `003C9E68`, 64-instruction ceiling, one direct call total, and zero imports/indirect calls/callbacks/workers. Any other PC, target, page, fault or deadline aborts the child before the next instruction.
 
+### Execution-control correction
+
+Direct `--child execute` is rejected unless the parent handshake is present. The parent creates a random token, writes it to inherited fd 3, and exports the same token in `MOSTWANTED_PROBE_SUPERVISION`; the child validates both before running. A direct shell invocation has no token/fd and exits 2 with `REFUSED`. The supervised parent keeps the 15-second `SIGKILL` watchdog, and the execute child sets an independent 12-second `alarm` that is cancelled after normal teardown.
+
+A normal pre-import stop is reported only when all authentic postconditions hold: 49 instructions, one direct call, entry `JNB` taken, helper `JNZ` not taken, the helper fall-through register equals `[0x10130]=0x00010000`, the IDIV register equals `0xFFFFFFDB`, no import read, no worker, `[0x004EDC74]=0x00000094`, the reviewed store is `0xFFFFFFDB`, the last trace PC is `002B5CDF`, and teardown reports zero resources. The expected values come from the real preflight facts, not synthetic fixture data. Failures print `RESULT fail reason=...` and exit nonzero.
+
+Focused tests added: unsupervised `--child execute` refusal, supervised token/fd pathway (without execution), `--run-once` refusal without `--execute-real`, and five postcondition negatives (instruction count, entry branch, import read, counter result, store result). Debug and Release self-tests pass 20/20 each; the existing 12 preflight negatives and 5/5 synthetic CTests still pass.
+
 ### Decision
 
 - `REAL_MAPPING`: **PASS** — exactly two reviewed functions, 50 hooks, one stop hook, no continuation/alternate entry.
