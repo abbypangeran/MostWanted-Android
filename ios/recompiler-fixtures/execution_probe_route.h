@@ -4,20 +4,23 @@
 #include <cstdint>
 
 // Phase 2C-15 audited startup prefix, extended by Phase 2C-18 by one
-// instruction: the ordinal-255 import call at 0x002B5CE0.
+// instruction (the ordinal-255 import call at 0x002B5CE0) and by Phase 2C-20
+// through the helper's successful return path.
 //
 // The route mirrors the instruction shapes recorded in PORT_STATUS.md for
-// 0x002B3916 -> 0x002B396A -> 0x002B5CA7 -> 0x002B5CE0, stopping after the
-// import call and before 0x002B5CE6.  The synthetic fixture builder and the
-// execution probe both consume this table, so the allowed PCs, lengths,
-// transitions and the two call targets stay in one place.  The addresses are
-// real; the fixture bytes and their data values are synthetic and are not
-// evidence about the retail image.
+// 0x002B3916 -> 0x002B396A -> 0x002B5CA7 -> 0x002B5CE0 -> the success arm at
+// 0x002B5D0E..0x002B5D11, stopping before the helper's RET 0x18.  The synthetic
+// fixture builder and the execution probe both consume this table, so the
+// allowed PCs, lengths, transitions and the two call targets stay in one place.
+// The addresses are real; the fixture bytes and their data values are synthetic
+// and are not evidence about the retail image.
 namespace execution_probe {
 
 // kKernelCall is the reviewed indirect call through the import slot; it is
-// admissible only through the test-only ordinal-255 bridge.
-enum class StepKind : uint8_t { kSequential, kConditional, kCall, kKernelCall };
+// admissible only through the test-only ordinal-255 bridge.  kForbidden marks a
+// PC that must have a hook but must never be reached: the debug arm of the
+// post-import branch is outside this experiment.
+enum class StepKind : uint8_t { kSequential, kConditional, kCall, kKernelCall, kForbidden };
 
 struct RouteStep {
     uint32_t pc;
@@ -79,7 +82,13 @@ struct RouteStep {
     X(0x002B5CDA, 2, kSequential, 0x002B5CDC, 0)                                             \
     X(0x002B5CDC, 3, kSequential, 0x002B5CDF, 0)                                             \
     X(0x002B5CDF, 1, kSequential, 0x002B5CE0, 0)                                             \
-    X(0x002B5CE0, 6, kKernelCall, 0x002B5CE6, 0)
+    X(0x002B5CE0, 6, kKernelCall, 0x002B5CE6, 0)                                             \
+    X(0x002B5CE6, 2, kSequential, 0x002B5CE8, 0)                                             \
+    X(0x002B5CE8, 2, kSequential, 0x002B5CEA, 0)                                             \
+    X(0x002B5CEA, 2, kConditional, 0x002B5CEC, 0x002B5D0E)                                   \
+    X(0x002B5CEC, 8, kForbidden, 0, 0)                                                       \
+    X(0x002B5D0E, 3, kSequential, 0x002B5D11, 0)                                             \
+    X(0x002B5D11, 1, kSequential, 0x002B5D12, 0)
 
 inline constexpr RouteStep kRoute[] = {
 #define EXECUTION_PROBE_ROUTE_STEP(pc, len, kind, next, alt) {pc, len, StepKind::kind, next, alt},
@@ -92,9 +101,12 @@ inline constexpr uint32_t kEntry = 0x002B3916;
 inline constexpr uint32_t kCallSite = 0x002B396A;
 inline constexpr uint32_t kCallTarget = 0x002B5CA7;
 inline constexpr uint32_t kImportCall = 0x002B5CE0;
-inline constexpr uint32_t kImportReturn = 0x002B5CE6;  // first PC the probe never executes
-inline constexpr uint32_t kLastInstruction = kImportCall;
-inline constexpr uint32_t kStopBefore = kImportReturn;
+inline constexpr uint32_t kImportReturn = 0x002B5CE6;
+inline constexpr uint32_t kPostImportBranch = 0x002B5CEA;  // jnl successor of the kernel status
+inline constexpr uint32_t kDebugPath = 0x002B5CEC;         // forbidden arm, a trap-only boundary function
+inline constexpr uint32_t kHandleRead = 0x002B5D0E;        // mov eax, [ebp+0x0C]
+inline constexpr uint32_t kLastInstruction = 0x002B5D11;   // pop ebp
+inline constexpr uint32_t kStopBefore = 0x002B5D12;        // ret 0x18, never executed
 inline constexpr uint32_t kImportSlot = 0x003C9E68;
 inline constexpr uint32_t kImportOrdinal = 255;
 inline constexpr uint32_t kImportEncoding = 0x800000FF;
@@ -107,6 +119,12 @@ inline constexpr uint32_t kSystemRoutine = 0x002B5C0F;
 // stack the reviewed route consumes between the initial ESP and 0x002B5CE0.
 inline constexpr uint32_t kImportStackBytes = 0x50;
 inline constexpr uint32_t kImportArg0Offset = 0x34;  // lea eax, [ebp+0x0C] with ebp = esp + 0x28
+
+// the helper's RET 0x18 contract, reviewed but never executed: it returns to
+// the direct call's continuation and pops the caller's six arguments.
+inline constexpr uint32_t kRetInstruction = 0x002B5D12;
+inline constexpr uint32_t kRetTarget = 0x002B396F;
+inline constexpr uint32_t kRetPopBytes = 0x18;
 
 inline constexpr uint32_t kMaximumInstructions = 64;
 inline constexpr uint32_t kMaximumDirectCalls = 1;

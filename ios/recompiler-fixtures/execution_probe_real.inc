@@ -180,6 +180,59 @@ bool ValidateRealRouteText(const xbe::Image& image, std::string& error) {
         return false;
     }
 
+    const RouteStep* post = FindStep(kPostImportBranch);
+    if (!post || post->kind != StepKind::kConditional || post->next != kDebugPath ||
+        post->alternate != kHandleRead) {
+        error = "post-import branch coverage mismatch";
+        return false;
+    }
+    const int64_t debug_offset = image.Offset(kDebugPath);
+    const size_t debug_span = image.FileSpan(kDebugPath);
+    ZydisDecodedInstruction debug_instruction;
+    ZydisDecodedOperand debug_operands[ZYDIS_MAX_OPERAND_COUNT];
+    char debug_text[256] = {};
+    if (debug_offset < 0 ||
+        !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, image.file.data() + debug_offset, debug_span,
+                                             &debug_instruction, debug_operands)) ||
+        debug_instruction.length != kDebugPathLength) {
+        error = "debug arm does not decode as reviewed";
+        return false;
+    }
+    ZydisFormatterFormatInstruction(&formatter, &debug_instruction, debug_operands,
+                                    debug_instruction.operand_count_visible, debug_text, sizeof(debug_text),
+                                    kDebugPath, nullptr);
+    if (std::strcmp(debug_text, kDebugPathText) != 0) {
+        error = "debug arm text mismatch";
+        return false;
+    }
+
+    // the helper's RET contract: never executed, but its immediate and return
+    // target are reviewed so the stop boundary is meaningful.
+    const int64_t ret_offset = image.Offset(kRetInstruction);
+    const size_t ret_span = image.FileSpan(kRetInstruction);
+    ZydisDecodedInstruction ret_instruction;
+    ZydisDecodedOperand ret_operands[ZYDIS_MAX_OPERAND_COUNT];
+    if (ret_offset < 0 ||
+        !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, image.file.data() + ret_offset, ret_span, &ret_instruction,
+                                             ret_operands)) ||
+        ret_instruction.mnemonic != ZYDIS_MNEMONIC_RET || ret_instruction.operand_count_visible != 1 ||
+        ret_operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE || ret_operands[0].imm.value.u != kRetPopBytes) {
+        error = "helper RET contract mismatch";
+        return false;
+    }
+    // the six caller pushes at 0x002B395E..0x002B3967 are the 0x18 cleanup
+    for (uint32_t pc : {0x002B395EU, 0x002B395FU, 0x002B3960U, 0x002B3961U, 0x002B3966U, 0x002B3967U}) {
+        if (!FindStep(pc)) {
+            error = "a reviewed caller argument push is missing";
+            return false;
+        }
+    }
+    const RouteStep* call = FindStep(kCallSite);
+    if (!call || kCallSite + call->length != kRetTarget) {
+        error = "the reviewed RET target is not the direct call's continuation";
+        return false;
+    }
+
     if (FindStep(kStopBefore)) {
         error = "stop PC is part of the reviewed route";
         return false;
@@ -211,12 +264,8 @@ bool ValidateHookCoverageText(const std::string& header, const std::string& sour
         error = "generated hook counts are not exactly the reviewed set";
         return false;
     }
-    const size_t step_call = source.find("ProbeStep_0x002B5CE0(ctx");
-    const size_t stop_call = source.find("ProbeStop_0x002B5CE0(ctx");
-    if (step_call == std::string::npos || stop_call == std::string::npos || step_call > stop_call) {
-        error = "stop hook is not after the reviewed import call";
-        return false;
-    }
+    const size_t step_call = source.find("ProbeStep_0x002B5D11(ctx");
+    const size_t stop_call = source.find("ProbeStop_0x002B5D11(ctx");
     const std::string import_call =
         "x86_checked_indirect_call(ctx, base, 0x3C9E68u, 0x2B5CE6u, 0x2B5CE0u)";
     const size_t import_at = source.find(import_call);
@@ -229,9 +278,10 @@ bool ValidateHookCoverageText(const std::string& header, const std::string& sour
         error = "stop hook is not after the checked import call";
         return false;
     }
-    // the function must end at the call: no instruction or label beyond 0x2B5CE0
-    if (source.find("// 002B5CE6") != std::string::npos || source.find("loc_002B5CE6") != std::string::npos) {
-        error = "generated source contains code after the import call";
+    // the function must end at pop ebp: no instruction, label or RET beyond it
+    if (source.find("// 002B5D12") != std::string::npos || source.find("loc_002B5D12") != std::string::npos ||
+        source.find("ret 0x18") != std::string::npos) {
+        error = "generated source contains the unreviewed RET";
         return false;
     }
     for (const char* forbidden : {"x86_icall", "x86_kernel", "x86_resume"}) {
@@ -240,15 +290,29 @@ bool ValidateHookCoverageText(const std::string& header, const std::string& sour
             return false;
         }
     }
+    if (step_call == std::string::npos || stop_call == std::string::npos || step_call > stop_call) {
+        error = "stop hook is not after the last reviewed instruction";
+        return false;
+    }
+    if (source.find("X86_FUNC(__imp__sub_002B5CEC)") == std::string::npos ||
+        source.find("ProbeStep_0x002B5CEC(ctx") == std::string::npos) {
+        error = "debug boundary function is missing";
+        return false;
+    }
+    if (source.find("X86_FUNC(__imp__sub_002B3826)") != std::string::npos ||
+        source.find("x86_checked_call(ctx, base, 0x2B3826") != std::string::npos) {
+        error = "the debug arm's callee was compiled";
+        return false;
+    }
     const size_t direct_calls = CountOccurrences(source, "x86_checked_call(ctx, base, 0x2B5CA7");
     const size_t functions = CountOccurrences(source, "X86_FUNC(__imp__sub_");
-    if (direct_calls != 1 || functions != 2) {
+    if (direct_calls != 1 || functions != 3) {
         error = "generated source has an unexpected call or function set";
         return false;
     }
     if (source.find("X86_FUNC(__imp__sub_002B3916)") == std::string::npos ||
         source.find("X86_FUNC(__imp__sub_002B5CA7)") == std::string::npos) {
-        error = "generated source does not contain exactly the two reviewed functions";
+        error = "generated source does not contain exactly the reviewed functions";
         return false;
     }
     return true;
@@ -485,21 +549,22 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
         error = "dispatch init failed: " + error;
         return false;
     }
-    if (X86FuncMappingCount != 2 || X86ContinuationCount != 0) {
-        error = "generated real mapping does not contain exactly two functions and no continuations";
+    if (X86FuncMappingCount != 3 || X86ContinuationCount != 0) {
+        error = "generated real mapping does not contain the reviewed functions and the debug boundary";
         return false;
     }
-    bool entry = false, helper = false;
+    bool entry = false, helper = false, debug_boundary = false;
     for (size_t i = 0; i < X86FuncMappingCount; ++i) {
         if (X86FuncMappings[i].guest == kEntry) entry = true;
         else if (X86FuncMappings[i].guest == kCallTarget) helper = true;
+        else if (X86FuncMappings[i].guest == kDebugPath) debug_boundary = true;
         else {
             error = "generated real mapping contains an unexpected function";
             return false;
         }
     }
-    if (!entry || !helper) {
-        error = "generated real mapping is missing a reviewed function";
+    if (!entry || !helper || !debug_boundary) {
+        error = "generated real mapping is missing a reviewed function or the debug boundary";
         return false;
     }
     if (!ValidateHookCoverage(std::string(EXECUTION_PROBE_REAL_GENERATED_DIR) + "/x86_recomp_shared.h",
@@ -680,9 +745,10 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
 void PrintRealFacts(const RealFacts& facts) {
     std::printf("PREFLIGHT identity: base=%08X image=%X header=%X sections=%u\n", facts.base, facts.image_size,
                 facts.header_size, facts.sections);
-    std::printf("PREFLIGHT route: 51/51 instructions matched, stop=%08X, import=%08X:%08X\n", kStopBefore,
+    std::printf("PREFLIGHT route: 57/57 instructions matched, stop=%08X, import=%08X:%08X\n", kStopBefore,
                 kImportSlot, kImportEncoding);
-    std::printf("PREFLIGHT mapping: functions=2 continuations=0 hooks=51 stop_hooks=1\n");
+    std::printf("PREFLIGHT mapping: functions=3 (2 reviewed + debug boundary) continuations=0 hooks=57 "
+                "stop_hooks=1\n");
     std::printf("PREFLIGHT globals: 10108=%08X 10118=%08X 10130=%08X 3ED3EC=%08X 3ED3F0=%08X 3ED3F4=%08X "
                 "3ED3FC=%08X 4EDC74=%08X\n",
                 facts.g10108, facts.g10118, facts.g10130, facts.g3ec, facts.g3f0, facts.g3f4, facts.g3fc,
@@ -707,6 +773,8 @@ void PrintRealFacts(const RealFacts& facts) {
                 facts.import_args[4], facts.import_args[5], facts.import_args[6], facts.import_args[7],
                 facts.import_args[8], facts.import_args[9]);
     std::printf("PREFLIGHT pages: entry=RX helper=RX header=R rdata=R data=RW import=R\n");
+    std::printf("PREFLIGHT continuation: status=0 jnl=%08X taken debug=%08X forbidden ret=%08X target=%08X pop=%X\n",
+                kPostImportBranch, kDebugPath, kRetInstruction, kRetTarget, kRetPopBytes);
     std::printf("PREFLIGHT limits: instructions=64 direct_calls=1 kernel_calls=1 memory=256 imports=1 callbacks=0 "
                 "workers=0\n");
     std::printf("PREFLIGHT spans:");
@@ -736,14 +804,18 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
     const StepRecord* helper_branch = nullptr;
     const StepRecord* helper_value = nullptr;
     const StepRecord* idiv_result = nullptr;
+    const StepRecord* kernel_status = nullptr;
+    const StepRecord* post_branch = nullptr;
     for (const StepRecord& step : g_probe.trace) {
         if (step.pc == 0x002B392A) entry_branch = &step;
         if (step.pc == 0x002B5CAF) helper_branch = &step;
         if (step.pc == 0x002B5CD9) helper_value = &step;
         if (step.pc == 0x002B3956) idiv_result = &step;
+        if (step.pc == kImportReturn) kernel_status = &step;
+        if (step.pc == kPostImportBranch) post_branch = &step;
     }
-    if (g_probe.executed != 50) {
-        error = "expected 50 instructions, got " + std::to_string(g_probe.executed);
+    if (g_probe.executed != 55) {
+        error = "expected 55 instructions, got " + std::to_string(g_probe.executed);
         return false;
     }
     if (g_probe.direct_calls != 1) {
@@ -768,6 +840,14 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
     }
     if (!idiv_result || idiv_result->eax != facts.q_after) {
         error = "IDIV register mismatch";
+        return false;
+    }
+    if (!kernel_status || kernel_status->eax != kernel::kSuccess) {
+        error = "kernel status was not success at the post-import branch";
+        return false;
+    }
+    if (!post_branch || !post_branch->branch_valid || !post_branch->branch_taken) {
+        error = "post-import JNL was not taken";
         return false;
     }
     const MemoryRecord* import = nullptr;
@@ -800,16 +880,36 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
         error = "result postcondition failed at the reviewed store";
         return false;
     }
-    if (!g_probe.have_stop || g_probe.stop.pc != kImportCall) {
-        error = "mandatory stop was not after 002B5CE0";
+    if (!g_probe.have_stop || g_probe.stop.pc != kLastInstruction) {
+        error = "mandatory stop was not after 002B5D11";
         return false;
     }
-    if (g_probe.stop.esp != facts.import_esp + 0x28) {
-        error = "post-call ESP does not match the reviewed stdcall cleanup";
+    if (g_probe.stop.esp != facts.import_esp + 0x2C) {
+        error = "post-import ESP does not match pop ebp";
         return false;
     }
-    if (g_probe.stop.eax != kernel::kSuccess) {
-        error = "ordinal-255 service did not report success";
+    if (g_probe.stop.ecx != 0 || g_probe.stop.ebp != 0) {
+        error = "post-import register state mismatch";
+        return false;
+    }
+    uint32_t handle = 0;
+    if (mem::Read(facts.import_args[0], &handle, sizeof(handle)) != mem::AccessStatus::kOk || !handle ||
+        g_probe.stop.eax != handle) {
+        error = "the helper did not return the published thread handle";
+        return false;
+    }
+    unsigned handle_reads = 0;
+    for (const MemoryRecord& record : g_probe.memory)
+        if (!record.write && record.pc == kHandleRead && record.address == facts.import_args[0] && record.size == 4)
+            ++handle_reads;
+    if (handle_reads != 1) {
+        error = "the handle output was not read exactly once";
+        return false;
+    }
+    uint32_t ret_target = 0;
+    if (mem::Read(g_probe.stop.esp, &ret_target, sizeof(ret_target)) != mem::AccessStatus::kOk ||
+        ret_target != kRetTarget) {
+        error = "the reviewed RET target is not on the stack at the stop";
         return false;
     }
     if (g_kernel255_calls != 1 || g_kernel255_esp != facts.import_esp - 4 ||
@@ -831,10 +931,8 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
         error = "the prepared thread does not carry the authentic routines";
         return false;
     }
-    uint32_t handle = 0;
-    if (mem::Read(facts.import_args[0], &handle, sizeof(handle)) != mem::AccessStatus::kOk || !handle ||
-        kernel::FromHandle(handle).get() != g_prepared_thread.get()) {
-        error = "the prepared thread handle was not published";
+    if (kernel::FromHandle(handle).get() != g_prepared_thread.get()) {
+        error = "the returned handle does not name the prepared thread";
         return false;
     }
     if (!kernel::Threads().empty()) {
@@ -846,7 +944,7 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
 
 void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) {
     g_probe = ProbeState{};
-    g_probe.executed = 50;
+    g_probe.executed = 55;
     g_probe.direct_calls = 1;
     g_probe.kernel_calls = 1;
     g_probe.import_reads = 1;
@@ -870,12 +968,23 @@ void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) 
     helper_value.pc = 0x002B5CD9;
     helper_value.eax = facts.g10130;
     g_probe.trace.push_back(helper_value);
+    StepRecord status{};
+    status.pc = kImportReturn;
+    status.eax = kernel::kSuccess;
+    g_probe.trace.push_back(status);
+    StepRecord post_branch{};
+    post_branch.pc = kPostImportBranch;
+    post_branch.branch_valid = true;
+    post_branch.branch_taken = true;
+    g_probe.trace.push_back(post_branch);
     StepRecord last{};
     last.pc = kLastInstruction;
     g_probe.trace.push_back(last);
     g_probe.stop = last;
     g_probe.stop.eax = kernel::kSuccess;
-    g_probe.stop.esp = facts.import_esp + 0x28;
+    g_probe.stop.ecx = 0;
+    g_probe.stop.ebp = 0;
+    g_probe.stop.esp = facts.import_esp + 0x2C;
     g_probe.have_stop = true;
 }
 
@@ -960,6 +1069,7 @@ int RealChild(const std::string& scenario) {
     } else if (scenario == "preflight") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (ok) PrintRealFacts(facts);
+        else std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
         exit_code = ok ? 0 : 3;
     } else if (scenario == "identity-missing") {
         ok = ValidateRealIdentity("/tmp/mostwanted-probe-does-not-exist.xbe", image, error);
@@ -1005,7 +1115,7 @@ int RealChild(const std::string& scenario) {
             } else if (scenario == "extra-hook") {
                 source += "\nProbeStep_0x002B3916(ctx, base);\n";
             } else {
-                source += "\nloc_002B5CE6:;\n";
+                source += "\nloc_002B5D12:;\n";
             }
             ok = ValidateHookCoverageText(header, source, error);
         } else {
@@ -1027,8 +1137,8 @@ int RealChild(const std::string& scenario) {
         if (!ok) std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
         exit_code = ok ? 5 : 3;
     } else if (scenario == "postcondition-count" || scenario == "postcondition-branch" ||
-               scenario == "postcondition-import" || scenario == "postcondition-counter" ||
-               scenario == "postcondition-result") {
+               scenario == "postcondition-post-branch" || scenario == "postcondition-import" ||
+               scenario == "postcondition-counter" || scenario == "postcondition-result") {
         const bool needs_image = scenario == "postcondition-counter" || scenario == "postcondition-result";
         if (needs_image) ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         else {
@@ -1039,8 +1149,12 @@ int RealChild(const std::string& scenario) {
         if (ok) {
             facts.entry_taken = true;
             FakeRealTrace(facts, true, false);
-            if (scenario == "postcondition-count") g_probe.executed = 48;
+            if (scenario == "postcondition-count") g_probe.executed = 54;
             else if (scenario == "postcondition-branch") g_probe.trace[0].branch_taken = false;
+            else if (scenario == "postcondition-post-branch") {
+                for (StepRecord& step : g_probe.trace)
+                    if (step.pc == kPostImportBranch) step.branch_taken = false;
+            }
             else if (scenario == "postcondition-import")
                 g_probe.memory.push_back({kImportCall, kImportSlot, 4, false});
             else if (scenario == "postcondition-result") Write32(kCounterAddress, facts.counter_after);
@@ -1261,7 +1375,7 @@ int RealParent(const std::string& mode, bool execute_real) {
         {"incomplete-hooks", false, "hook coverage"},
         {"unexpected-target", false, "call"},
         {"extra-hook", false, "hook coverage"},
-        {"post-import-instruction", false, "code after the import call"},
+        {"post-import-instruction", false, "unreviewed RET"},
         {"overlapping-spans", false, "overlap"},
         {"pointer-uncommitted", false, "not committed"},
         {"invalid-stack", false, "stack"},
@@ -1269,8 +1383,9 @@ int RealParent(const std::string& mode, bool execute_real) {
         {"import-slot-mismatch", false, "import slot is not the ordinal-255 encoding"},
         {"import-page-writable", false, "import page is writable"},
         {"argument-span", false, "outside the reviewed guest stack"},
-        {"postcondition-count", false, "expected 50 instructions"},
+        {"postcondition-count", false, "expected 55 instructions"},
         {"postcondition-branch", false, "entry JNB"},
+        {"postcondition-post-branch", false, "post-import JNL"},
         {"postcondition-import", false, "import slot"},
         {"postcondition-counter", false, "counter postcondition"},
         {"postcondition-result", false, "result postcondition"},

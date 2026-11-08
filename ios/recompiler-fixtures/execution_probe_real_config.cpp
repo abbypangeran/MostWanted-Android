@@ -33,7 +33,10 @@ int main(int argc, char** argv) {
               "end = 0x002B396F\n\n"
               "[[function]]\n"
               "at = 0x002B5CA7\n"
-              "end = 0x002B5CE6\n";
+              "end = 0x002B5D12\n\n"
+              "[[function]]\n"
+              "at = 0x002B5CEC\n"
+              "end = 0x002B5CF4\n";
     for (const auto& step : execution_probe::kRoute) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')

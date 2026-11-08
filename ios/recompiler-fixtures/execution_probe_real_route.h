@@ -59,15 +59,26 @@ inline constexpr const char* kExpectedRouteText[] = {
     "lea eax, [ebp+0x0C]",         // 002B5CDC
     "push eax",                    // 002B5CDF
     "call [0x003C9E68]",           // 002B5CE0
+    "mov ecx, eax",                // 002B5CE6
+    "test ecx, ecx",               // 002B5CE8
+    "jnl 0x002B5D0E",              // 002B5CEA
+    "movzx eax, byte ptr fs:[0x00000024]",  // 002B5CEC, forbidden debug arm
+    "mov eax, [ebp+0x0C]",         // 002B5D0E
+    "pop ebp",                     // 002B5D11
 };
 
 inline constexpr size_t kExpectedRouteTextCount =
     sizeof(kExpectedRouteText) / sizeof(kExpectedRouteText[0]);
 
-// FNV-1a over the 152 reviewed instruction bytes in route order.  A hash keeps
+// FNV-1a over the 170 reviewed instruction bytes in route order.  A hash keeps
 // the proprietary bytes out of tracked source while still pinning the exact
 // encoding that the text table decodes.
-inline constexpr uint32_t kExpectedRouteBytes = 152;
-inline constexpr uint64_t kExpectedRouteHash = 0x08207c9bb6b0e42cULL;
+inline constexpr uint32_t kExpectedRouteBytes = 170;
+inline constexpr uint64_t kExpectedRouteHash = 0x51d66cd99d8cc7adULL;
+
+// the debug arm's first instruction, reviewed as a forbidden boundary; it is a
+// one-instruction function so the recompiler does not follow its call at all.
+inline constexpr const char* kDebugPathText = "movzx eax, byte ptr fs:[0x00000024]";
+inline constexpr uint32_t kDebugPathLength = 8;
 
 }  // namespace execution_probe

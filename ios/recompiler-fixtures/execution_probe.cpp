@@ -245,6 +245,12 @@ void ProbeStep(uint32_t pc, X86Context& ctx) {
         }
     }
 
+    if (step->kind == StepKind::kForbidden) Fail("unreviewed control flow", pc);
+
+    // a failed kernel status would divert into the unreviewed debug arm
+    if (pc == kImportReturn && g_probe.options.require_kernel_success && ctx.eax != kernel::kSuccess)
+        Fail("ordinal-255 thread preparation failed", pc);
+
     if (step->kind == StepKind::kCall) {
         if (!g_probe.options.allow_call_target) Fail("direct call target is not permitted", pc);
         if (g_probe.direct_calls >= g_probe.options.direct_call_budget)
@@ -406,7 +412,7 @@ void ProbeStopHook(X86Context& ctx) {
 EXECUTION_PROBE_ROUTE(DEFINE_PROBE_STEP)
 #undef DEFINE_PROBE_STEP
 
-void ProbeStop_0x002B5CE0(X86Context& ctx, uint8_t*) { ProbeStopHook(ctx); }
+void ProbeStop_0x002B5D11(X86Context& ctx, uint8_t*) { ProbeStopHook(ctx); }
 
 // Test-only replacements for the production handlers.  The probe target does
 // not link sdk/runtime/cpu/memory_fault.cpp; these turn a fault into a structured
@@ -773,7 +779,7 @@ bool CancelPreparedThreadForProbe() {
 
 bool VerifySyntheticPostconditions(std::string& error) {
     if (!g_probe.have_stop || g_probe.stop.pc != kLastInstruction) {
-        error = "mandatory stop did not follow the import call";
+        error = "mandatory stop did not follow the last reviewed instruction";
         return false;
     }
     if (g_probe.direct_calls != 1) {
@@ -788,12 +794,37 @@ bool VerifySyntheticPostconditions(std::string& error) {
         error = "expected exactly one import operand read";
         return false;
     }
-    if (g_probe.stop.eax != kernel::kSuccess) {
-        error = "ordinal-255 preparation did not report success";
+    const StepRecord* status = nullptr;
+    const StepRecord* branch = nullptr;
+    for (const StepRecord& step : g_probe.trace) {
+        if (step.pc == kImportReturn) status = &step;
+        if (step.pc == kPostImportBranch) branch = &step;
+    }
+    if (!status || status->eax != kernel::kSuccess) {
+        error = "kernel status was not success at the post-import branch";
+        return false;
+    }
+    if (!branch || !branch->branch_valid || !branch->branch_taken) {
+        error = "post-import JNL was not taken";
         return false;
     }
     if (!g_prepared_thread || g_prepared_thread->state.load() != kernel::ThreadState::kPrepared) {
         error = "no thread was prepared";
+        return false;
+    }
+    uint32_t handle = 0;
+    if (mem::Read(g_kernel255_args[0], &handle, sizeof(handle)) != mem::AccessStatus::kOk || !handle ||
+        g_probe.stop.eax != handle) {
+        error = "the helper did not return the published thread handle";
+        return false;
+    }
+    unsigned handle_reads = 0;
+    for (const MemoryRecord& record : g_probe.memory)
+        if (!record.write && record.pc == kHandleRead && record.address == g_kernel255_args[0] &&
+            record.size == 4)
+            ++handle_reads;
+    if (handle_reads != 1) {
+        error = "the handle output was not read exactly once";
         return false;
     }
     if (!kernel::Threads().empty() || kernel::ThreadWorkerLaunchCountForTest() != g_probe.worker_launch_baseline) {
@@ -841,6 +872,10 @@ int RunChild(const std::string& scenario) {
         options.allow_kernel_call = true;
         options.require_kernel_success = true;
         g_kernel_bridge_mode = KernelBridgeMode::kStartAttempt;
+    } else if (scenario == "import-failure-path") {
+        // a failed kernel status must diverge to the unreviewed debug arm and stop there
+        options.allow_kernel_call = true;
+        g_kernel_bridge_mode = KernelBridgeMode::kFail;
     } else if (scenario == "import-read") {
         mode = Mode::kImportProbe;
     } else if (scenario == "import-second-read") {
@@ -1191,8 +1226,8 @@ int main(int argc, char** argv) {
 
     const Case cases[] = {
         {"guards", true, "RESULT ok guards=1", 5000, false},
-        {"taken", true, "RESULT ok instructions=50", 5000, false},
-        {"not-taken", true, "RESULT ok instructions=51", 5000, false},
+        {"taken", true, "RESULT ok instructions=55", 5000, false},
+        {"not-taken", true, "RESULT ok instructions=56", 5000, false},
         {"entry-not-executable", false, "entry page is not executable", 5000, false},
         {"helper-not-executable", false, "direct call target page is not executable", 5000, false},
         {"call-target-not-permitted", false, "direct call target is not permitted", 5000, false},
@@ -1214,6 +1249,7 @@ int main(int argc, char** argv) {
         {"import-arg-span", false, "guest memory fault", 5000, false},
         {"import-prepare-failure", false, "ordinal-255 thread preparation failed", 5000, false},
         {"import-start-attempt", false, "ordinal-255 thread preparation failed", 5000, false},
+        {"import-failure-path", false, "unreviewed control flow", 5000, false},
         {"post-import-entry", false, "start PC is not in the reviewed route", 5000, false},
         {"re-entry", false, "re-entry during a step", 5000, false},
         {"parent-timeout", false, "", 800, true},
@@ -1260,9 +1296,9 @@ int main(int argc, char** argv) {
     // the success path prepares and cancels an inactive thread and stops after the import call
     const ChildResult success = SpawnChild(self, "taken", std::chrono::milliseconds(5000));
     Check(success.output.find("CANCEL prepared=1 cancelled=1 output_cleared=1 stack_freed=1") != std::string::npos &&
-              success.output.find("STOP 002B5CE0") != std::string::npos &&
+              success.output.find("STOP 002B5D11") != std::string::npos &&
               success.output.find("kernel_calls=1 import_reads=1") != std::string::npos,
-          "successful probe stops after the import call, prepares a thread, and cancels it");
+          "successful probe stops before ret 0x18, prepares a thread, and cancels it");
 
     std::printf("execution probe: %s\n", failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;

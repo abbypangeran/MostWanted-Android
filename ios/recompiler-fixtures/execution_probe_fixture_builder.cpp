@@ -22,7 +22,7 @@ using execution_probe::kSectionVa;
 
 struct Instruction {
     uint32_t va;
-    std::array<uint8_t, 7> bytes;
+    std::array<uint8_t, 8> bytes;
     uint8_t length;
 };
 
@@ -80,6 +80,12 @@ constexpr Instruction kInstructions[] = {
     {0x002B5CDC, {0x8D, 0x45, 0x0C}, 3},                                // lea eax, [ebp+0xC]
     {0x002B5CDF, {0x50}, 1},                                            // push eax
     {0x002B5CE0, {0xFF, 0x15, 0x68, 0x9E, 0x3C, 0x00}, 6},              // call [0x3C9E68] - ordinal 255
+    {0x002B5CE6, {0x8B, 0xC8}, 2},                                      // mov ecx, eax
+    {0x002B5CE8, {0x85, 0xC9}, 2},                                      // test ecx, ecx
+    {0x002B5CEA, {0x7D, 0x22}, 2},                                      // jnl 0x2B5D0E
+    {0x002B5CEC, {0x64, 0x0F, 0xB6, 0x05, 0x24, 0x00, 0x00, 0x00}, 8},  // movzx eax, fs:[0x24] - forbidden
+    {0x002B5D0E, {0x8B, 0x45, 0x0C}, 3},                                // mov eax, [ebp+0xC]
+    {0x002B5D11, {0x5D}, 1},                                            // pop ebp
 };
 
 void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
@@ -140,7 +146,10 @@ bool WriteConfig(const char* path) {
               "end = 0x002B396F\n\n"
               "[[function]]\n"
               "at = 0x002B5CA7\n"
-              "end = 0x002B5CE6\n";
+              "end = 0x002B5D12\n\n"
+              "[[function]]\n"
+              "at = 0x002B5CEC\n"
+              "end = 0x002B5CF4\n";
     for (const auto& step : execution_probe::kRoute) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
