@@ -1361,3 +1361,102 @@ Static inspection used the Black Edition XBE with SHA-1 `f636a16af04171089f879a4
 - **Validation:** all requested builds and synthetic/platform checks passed within the limits stated above.
 - **Integration:** implementation commit `3de3ea1df1ad2432ae6dae7e044b1a149c98c86c` pushed to `origin/feature/ios-port` with a normal fast-forward; `main` remains unchanged.
 - **Deployment/customer release:** not performed.
+
+## Phase 2C-14 minimum execution path and readiness hardening
+
+Baseline: `20f1e749a4edf197033252c2d28474702b2b2191` on `feature/ios-port`. This section supersedes Phase 2C-13's memory-protection HLE description: protection calls now fail closed instead of returning fixed success-like values. The Apple `Boot()` guard, production callback gate, and production kernel-thunk dispatch restriction remain enabled. No real XBE code, guest thread, production callback, physical iPhone, IPA, or release was used.
+
+### Track A: regenerated census and bounded route
+
+Static inspection used the locally validated Black Edition XBE (SHA-1 `f636a16af04171089f879a4bed646e185c734233`, title ID `4541007B`) and freshly regenerated ignored output at `.local/ios-port/phase2c14-generated-game-reviewfix/`, using the current checked `MOVZX`/`MOVSX` gate. The census matches the prior generation: 28,848 functions, 13 callback entries, 230 distinct unimplemented mnemonics, and 186,866 static unimplemented opcode instances. This is an emitted-code census only; it does not measure runtime reachability. For example, the table still reports `call 9019`, `not 231`, `movsb 6`, `movsd 538`, `movsw 76`, `stosb 106`, `stosd 655`, and `stosw 133`; those counts include encodings and operand forms outside the narrow checked whitelist. The exact `NOT AL` and `REP MOVSD/MOVSB/STOSD/STOSB` forms below now emit checked helpers and pass synthetic generated-code tests.
+
+The first bounded route has 30 entry instructions and at most 20 helper instructions. `0x2B392A` is data-dependent; `0x2B5CAF` is statically not-taken because ESI is zeroed at `0x2B395C` and passed as the tested second argument. The largest statically enumerated prefix is 50 guest instructions and one direct guest call. This table lists every instruction through the stop point; a semicolon-delimited PC/instruction pair is one decoded instruction. PCs are hexadecimal; shorthand omits the common `0x002B` prefix.
+
+| Region | PC → instruction | Dependency and runtime uncertainty |
+| --- | --- | --- |
+| Entry `0x002B3916` | `3916 MOV ECX,[0x10118]`; `391C MOV EAX,[0x10108]`; `3921 SUB EAX,ECX`; `3923 ADD EAX,0x10000`; `3928 CMP EAX,[ECX]` | Checked scalar reads and arithmetic; all guest values and the indirect `[ECX]` span are runtime data. |
+| Entry | `392A JNB 392E`; `392C MOV [ECX],EAX` (conditional); `392E MOV EAX,[0x3ED3FC]`; `3933 SUB EAX,[0x3ED3EC]`; `3939 MOV ECX,[0x3ED3F0]` | Checked branch/store and global reads; branch outcome and pointer validity are unresolved until runtime. |
+| Entry | `393F PUSH ESI`; `3940 LEA EAX,[EAX+ECX+0x0F]`; `3944 PUSH EDI`; `3945 AND EAX,0xFFFFFFF0`; `3948 PUSH -4` | Checked stack writes; guest stack commitment/permissions and the computed values require preflight. |
+| Entry | `394A POP ECX`; `394B ADD EAX,4`; `394E MOV [0x4EDC74],EAX`; `3953 CDQ`; `3954 IDIV ECX` | Checked stack/global access; ECX is the previously pushed `-4`, so this reviewed path has no zero divisor and sign-extended EAX quotient fits. |
+| Entry | `3956 MOV ECX,[0x3ED3F4]`; `395C XOR ESI,ESI`; `395E PUSH ESI`; `395F PUSH ESI`; `3960 PUSH ESI` | Checked global read and stack writes. |
+| Entry | `3961 PUSH 0x2B38A2`; `3966 PUSH ESI`; `3967 PUSH ESI`; `3968 MOV [ECX],EAX`; `396A CALL 0x2B5CA7` | Checked stack/global writes and the one generated direct call. Its target is a generated function; the current dispatcher does not enforce software execute permission on the target page. |
+| Helper `0x002B5CA7` | `5CA7 PUSH EBP`; `5CA8 MOV EBP,ESP`; `5CAA MOV EAX,[EBP+0x0C]`; `5CAD TEST EAX,EAX`; `5CAF JNZ 5CB6` | Checked stack reads/writes; the tested argument is the zero ESI value pushed at `0x2B3966`, so this branch is statically not taken on the reviewed path. |
+| Helper | `5CB1 MOV EAX,[0x10130]`; `5CB6 MOV ECX,[EBP+0x18]`; `5CB9 PUSH 0x2B5C0F`; `5CBE PUSH 0`; `5CC0 SHR ECX,2` | The global read is reached on the reviewed path; guest contents remain runtime data. The system-routine address is pushed as data only. |
+| Helper | `5CC3 AND ECX,0xFFFFFF01`; `5CC9 PUSH ECX`; `5CCA PUSH [EBP+0x14]`; `5CCD PUSH [EBP+0x10]`; `5CD0 PUSH [EBP+0x1C]` | Checked arithmetic, stack reads, and writes; argument values remain runtime-dependent. |
+| Helper | `5CD3 PUSH [0x4EDC74]`; `5CD9 PUSH EAX`; `5CDA PUSH 0`; `5CDC LEA EAX,[EBP+0x0C]`; `5CDF PUSH EAX` | Checked global/stack access. Stop before executing `0x2B5CE0`. |
+| Stop | `0x2B5CE0 CALL [0x3C9E68]` | Import slot initially contains ordinal 255 (`0x800000FF`) and XBE preparation maps it to `0xFE0003FC` (`PsCreateSystemThreadEx`). The proposed experiment must stop before reading or dispatching this slot; allowed imports: none. |
+
+The candidate future experiment would start at `0x002B3916`, stop before `0x002B5CE0`, enforce a hard limit of 64 guest instructions and one direct call (`0x002B396A → 0x002B5CA7`), and permit zero imports, indirect calls, worker activation, callbacks, `PsCreateSystemThreadEx`, `PsTerminateSystemThread`, or `CallGuest`. The branch at `0x2B392A` remains data-dependent and untested at that production PC; the helper branch at `0x2B5CAF` has a statically determined outcome but the function itself is not run. The 64-instruction ceiling is above the 50-instruction static maximum only to provide a simple hard abort threshold; it does not authorize extending the stop PC.
+
+| Dependency class | Classification |
+| --- | --- |
+| Entry/helper instruction forms listed above | **Checked and synthetic-tested** through the generated fixture pipeline; the Black Edition functions themselves were not executed. |
+| Checked reads/writes, stack accesses, and REP element accesses | **Software permission checked** at 4 KB guest-page granularity; REP holds the memory lock for one source/destination element and advances ESI/EDI/ECX only after that element succeeds. |
+| `CALL 0x2B5CA7` | **Generated direct call supported** with checked return-stack handling and dispatch metadata; target execute permission is not consulted by `CheckedCall`. |
+| Import slot `0x3C9E68` / ordinal 255 | **Static target known, production dispatch denied.** Only the synthetic fixture bridge accepts ordinal 255, and it prepares an inactive thread; it is not permission to execute the import. |
+| Entry branch `0x2B392A`, guest globals and pointer values | **Dynamic and unresolved.** No runtime observations were made. |
+| Helper branch `0x2B5CAF` | **Statically not-taken on this route** because the tested second argument is the ESI value zeroed at `0x2B395C`; the helper itself was not executed. |
+| System routine `0x002B5C0F` | **Static but not currently reachable through the checked call contract.** It calls `0x00319804` at `0x2B5C16`; that helper pushes return PC `0x00319858`, while `x86_checked_ret` requires call-return PC `0x002B5C1B`, so it traps on the mismatch at `0x0031983E`. Later direct calls at `0x2B5C76` and `0x2B5C86` enter `0x2B597D`, which calls `RtlEnterCriticalSection` (`0x3C9E44`) and `RtlLeaveCriticalSection` (`0x3C9E40`), with a dynamic `[EAX+8]` call at `0x2B59A1` and unsupported `POP EBX` at `0x2B59B1`. The four REP forms at `0x2B5C4E`, `0x2B5C55`, `0x2B5C6B`, and `0x2B5C72` are supported and synthetic-tested, but not proven reachable. Other blockers are the dynamic callback call at `0x2B5C7E`, `OR [EBP-4],-1` at `0x2B5C99`, `PsTerminateSystemThread` at `0x2B5CA0`, and `INT3` at `0x2B5CA6`. |
+| Start routine `0x002B38A2` | **Static and dynamically dependent.** Its direct calls are `0x2B38A2→0x2B58B8`, `0x2B38A7→0x2B5664`, `0x2B38EE→0x2B582B`, `0x2B38F3→0x2B57D3`, `0x2B38FE→0x1C8C20`, and `0x2B390C→0x2B55EE`. The first helper calls `0x2B8DC4`; `NOT AL` at `0x2B58CB` is supported, but conditional paths reach unsupported `NEG AL`/`SBB` sites (`0x2B58F8`, `0x2B5908`, `0x2B5918`, `0x2B5923`) and `TEST ESI,ESI` at `0x2B5933`. It references `MmQueryAddressProtect` (`0x3C9D30`) at `0x2B5942`, `MmSetAddressProtect` (`0x3C9D28`), and dynamic `CALL EDI` at `0x2B5955`. Other immediate callees have dynamic `CALL EAX` sites at `0x2B5848`, `0x2B57DC`, `0x2B57FB`, and `0x2B581F`; `0x2B5664` reaches `HalRegisterShutdownNotification` (`0x3C9E38`), `IoCreateSymbolicLink` (`0x3C9DDC`), and `MmFreeContiguousMemory` (`0x3C9D2C`), then `0x2B5E12` calls `KeInitializeDpc` (`0x3C9E30`) and `KeInitializeTimerEx` (`0x3C9E1C`). `0x2B55EE` calls `HalReturnToFirmware` (`0x3C9DC4`). The `0x1C8C20` helper has further direct-call fan-out. All these are outside the proposed stop policy and remain statically inventoried only. |
+| Raw HLE/host-memory access | **None identified inside the 50-instruction proposed prefix:** emitted guest memory operations use checked helpers and the direct call only pushes a checked return address. Extending into unreviewed imports or host routines is unsafe: `G<T>()`, `X86_MEM*`, `X86_PTR`, `HostPtr()`, and legacy `R32/W32` paths remain elsewhere in the runtime. |
+
+### Track B: checked `NOT AL` and REP strings
+
+Checked code generation now admits only unprefixed `NOT AL` and exactly the 32-bit-address, F3-only `REP MOVSB`, `REP MOVSD`, `REP STOSB`, and `REP STOSD` forms. Other NOT registers/memory and REPNE, unprefixed string, 16-bit address/operand-size, or segment-override forms remain traps.
+
+`NOT AL` complements only EAX's low byte and leaves the other 24 bits and all flags unchanged. Generated fixtures check independent expected results and reject `NOT EAX`, `NOT BL`, `NOT AH`, and `NOT [ESI]`.
+
+Checked `MOVZX`/`MOVSX` memory sources now use the same checked 32-bit address/segment gate as other scalar loads. FS-relative `MOVZX` remains supported and is tested; GS and 16-bit-address forms for both extensions trap in generated fixtures.
+
+REP helpers perform one checked element at a time. MOVS reads then writes under one memory lock; STOS captures the source value from EAX; DF selects increment/decrement; zero ECX performs no access; the helper preserves flags. ESI/EDI/ECX advance after a successful element only, so a later source/destination fault preserves earlier completed iterations and points at the first failing byte. Generated Debug/Release fixtures cover forward/backward MOVS and STOS, both forward and backward overlap, zero count, cross-page dwords, permission faults, a decommitted source page after one completed byte, partial STOSD writes, 32-bit wrapping, exact fault PC/address/direction, and flag preservation. Apple hosts' 16 KB host-page size does not replace the memory manager's 4 KB guest-page checks.
+
+### Track C: Xbox memory-protection export audit
+
+The prior fixed `MmQueryAddressProtect` result and no-op `MmSetAddressProtect`/`NtProtectVirtualMemory` success behavior were unsafe. Exports 179, 182, and 204 now trap before interpreting arguments, writing an old-protection output, or changing page state. The diagnostic return-address read is checked. The generated fixture verifies all three exports are registered, trap, preserve ESP/target bytes/output sentinels, and that an invalid export stack produces a checked read fault.
+
+These common handlers also compile into Android. If an Android guest path reaches one of these exports, the checked trap aborts that process. `assembleDebug` verifies Android build compatibility only; no Android guest runtime was used to measure the impact. This is a known compatibility risk while preserving fail-closed behavior until the retail contract is established.
+
+Retail original-Xbox protection constants, range rounding/alignment, old-protection behavior, and the exact `NtProtectVirtualMemory` contract remain unverified. The available [OpenXDK Xbox memory header](https://github.com/XboxDev/OpenXDK/blob/master/include/xboxkrnl/mm.h) declares `MmSetAddressProtect` as `VOID` but exposes `MmQueryAddressProtect` only as an opaque function pointer; the [xboxrecomp export table](https://github.com/sp00nznet/xboxrecomp/blob/main/docs/formats/kernel-exports.md) lists a query signature, but neither is an authoritative retail ABI specification. No values or return behavior were inferred from Windows or Xbox 360. Existing `mem::Protect` tests establish the internal manager's 4 KB software permissions and lease behavior only; they do not establish the Xbox export contract, execute permission on guest PCs, or Xbox alias semantics.
+
+**`MEMORY_PROTECTION_HLE: PARTIAL`** — fail-closed behavior is tested; guest protection semantics are not implemented because the contract is not established.
+
+### Track D: FS/TLS and inactive thread context
+
+The production thread initializer places TLS at `stack_top - aligned_tls_size`, builds the current KPCR/ETHREAD fields through checked guest writes on Apple, and sets `X86Context.fs_base` to the KPCR. The fixture prepares a thread through the test-only ordinal-255 bridge but does not activate it; it verifies `fs_base == kpcr`, initial ESP is 16-byte aligned and within the prepared stack/TLS span, the KPCR self/current-thread fields (`+0x18`, `+0x28`), and ETHREAD stack/TLS fields (`+0x1C`, `+0x28`). Recompiler-generated `FS:[0x28]` and `FS:[EAX+ECX+0x28]` fixture reads return the expected ETHREAD/TLS values; a denied KPCR read reports `kpcr+0x28` and read direction. Worker count and thread registry stay unchanged.
+
+**`GUEST_FS_TLS: PARTIAL`** — internal context/layout and generated effective-address consistency pass in synthetic tests; original-Xbox KPCR field semantics and runtime behavior are not independently established. No real guest thread ran.
+
+### Track E: restricted experiment proposal and permission assessment
+
+This is a proposal for a separately authorized future test; it was not implemented or performed.
+
+1. Use an isolated disposable process and freshly prepared image. Start at `0x002B3916`; instrument every instruction and direct call; stop before `0x002B5CE0`. Hard cap: 64 instructions, one direct call to `0x002B5CA7`, and zero imports or indirect calls.
+2. Allow only checked memory helpers and the statically mapped direct target. Before starting, verify every stack/data page in the reviewed spans is committed and readable/writable as needed, and every guest-code page in the route is committed and executable. Reject any runtime pointer outside those reviewed spans. Keep workers, production/test callbacks, guest-thread activation, `CallGuest`, and all kernel imports disabled.
+3. Record each PC, branch outcome, call target, instruction count, memory-fault status/address/direction, and memory diff. On first unsupported instruction, fault, unexpected PC/target, import/callback/worker attempt, permission mismatch, or budget exhaustion, record the first PC and abort the disposable process; never skip or continue past a failure.
+4. Stop deterministically before the import operand at `0x002B5CE0`. On normal stop, verify no guest/host workers or callback tickets were created, compare the reviewed memory diff, stop/join harness resources, and release image, stack, and guest-memory allocations. On an abort or teardown mismatch, keep the process isolated and preserve the diagnostic snapshot for review.
+
+The linear guest mapping can represent this route's 4 KB software data permissions even on 16 KB Apple hosts; checked data accesses are sufficient only while every access remains in checked helpers and no concurrent host mutator can invalidate the reviewed pages. The mapping is **not sufficient as currently wired for execution authorization**: `CheckedCall` checks dispatch metadata but not `mem::kExecute`, and the entry point has no execute-page gate. The future probe must enforce execute permission at its entry and every direct target and prevent permission mutation during the run. A full page-table redesign is not required to test this narrow static prefix, but current software-mapped permissions alone do not make it GO-ready.
+
+**`RESTRICTED_EXECUTION_READINESS: NO-GO`** — missing execute checks and per-PC instrumentation, data-dependent branches and pointers, and the checked return-contract blocker in `0x00319804` remain. Preserve all execution gates.
+
+### Track F: platform regression and acceptance
+
+| Platform/check | Result |
+| --- | --- |
+| macOS ARM64 memory/preparation | **PASS** — Debug and Release CTests passed 1/1 each. |
+| Generated recompiler, ABI, callback, startup, REP/NOT, FS/TLS, and protection-trap fixtures | **PASS** — Debug and Release CTests passed 4/4 each. |
+| iOS Simulator memory/preparation | **PASS** — iPhone 18 Pro simulator run with the regenerated fixture completed with 934 `PASS:` lines and zero `FAIL:` lines. |
+| Unsigned iPhoneOS ARM64 compile/link | **PASS** — app and memory-test executables are arm64 Mach-O; code signing is disabled and absent. No physical iPhone install. |
+| Android `:app:assembleDebug` | **PASS (build only)** — Java 21.0.13 and NDK 28.2.13676358 with fresh ignored `.local/ios-port/phase2c14-generated-game-reviewfix/`; runtime was not exercised. If a guest reaches one of the three unsupported protection exports, it will abort. |
+| Vulkan readback | Not rerun; Vulkan dependencies and code were unchanged. |
+
+Targeted branch coverage is synthetic only: REP fixtures exercise zero/nonzero counts, both DF directions, overlapping copies, source versus destination faults, permission/decommit failures, and completed-iteration partial progress. The production instruction at `0x2B392A`, imported call targets, runtime globals, `sub_00319804` handoff, start-routine import branches, and raw HLE callers were not executed; `0x2B5CAF` is statically fixed to its fall-through branch but was not run from the XBE. No global line/branch coverage percentage is claimed.
+
+- `MINIMUM_EXECUTION_ROUTE`: **PASS (static map)** — every instruction through the proposed stop PC and unresolved runtime branch/pointer dependency is recorded above.
+- `CHECKED_NOT_REP`: **PASS** — only the exact requested forms are enabled and generated Debug/Release fixtures cover the specified memory and flag semantics.
+- `MEMORY_PROTECTION_HLE`: **PARTIAL** — exports fail closed; retail semantics remain unknown and unimplemented.
+- `GUEST_FS_TLS`: **PARTIAL** — synthetic context/effective-address agreement passes; original-Xbox layout semantics remain unverified.
+- `PLATFORM_REGRESSION`: **PASS for requested compile/test checks**, with Android build-only and simulator-only limits above.
+- `RESTRICTED_EXECUTION_READINESS`: **NO-GO** — proposal only; instrumentation/execute enforcement and static-call blocker remain.
+- `REAL_GUEST_EXECUTION`: **NO-GO throughout Phase 2C-14.**
+- Integration and customer release: this phase remains on `feature/ios-port`; no merge to `main`, physical-device install, IPA, deployment, or release occurred.
