@@ -1281,5 +1281,5 @@ Raw guest access remains broad. Representative open paths include `G<T>()`/`R32(
 
 - **Development:** callback ticket/lifetime boundary and VBlank managed-worker migration implemented; Stage A restored.
 - **Validation:** the platform and fixture evidence above passes within stated limits.
-- **Integration:** remains on `feature/ios-port`; no merge to `main`. A normal fast-forward push is authorized after final review.
+- **Integration:** pushed to `origin/feature/ios-port` with a normal fast-forward; no merge to `main`.
 - **Deployment/customer release:** not performed.
