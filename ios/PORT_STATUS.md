@@ -1543,3 +1543,92 @@ Expected trace on the real path: entry `002B3916`, the reviewed globals and bran
 - `PHASE_2C_16_RECOMMENDATION`: **GO, restricted** — authorize only the real probe mapping, the reviewed-span/stack preparation, and one bounded micro-execution. **NO-GO** for any run past `0x002B5CE0`, any import/callback/worker, or boot.
 - `REAL_GUEST_EXECUTION`: **NO-GO throughout Phase 2C-15.** No real XBE instruction ran.
 - Integration and release: work remains on `feature/ios-port`; no merge to `main`, physical-device install, IPA, deployment, or release occurred.
+
+## Phase 2C-16 real-XBE micro-execution integration
+
+Baseline: `f5855db75902f4708d6488008283c1eee438a9d6` on `feature/ios-port`, 2026-11-08. This phase integrates the probe with the authentic Black Edition image. The real probe binary is built and preflighted; **no real XBE instruction has run**. The Apple `Boot()` guard, callback gate, and kernel-thunk policy are unchanged.
+
+### Real mapping and identity
+
+A dedicated ignored mapping is generated from `assets/default.xbe` into `.local/ios-port/phase2c16-fixtures/probe_real/generated/` by `execution_probe_real_config` plus `xbe_recomp`. The config sets `callback_seeds = false`, a new default-preserving recompiler switch, so only the two declared functions are compiled. The mapping contains exactly **2 functions** (`0x002B3916`, `0x002B5CA7`), **0 continuations**, and **17,189 bytes** of generated C++; the full game recompiler census is not used.
+
+| Check | Result |
+| --- | --- |
+| SHA-1 | `f636a16af04171089f879a4bed646e185c734233` |
+| Title / entry / base | `4541007B` / `002B3916` / `00010000` |
+| Image / header / sections | `4F8040` / `1000` / 15 |
+| Route instructions | **50/50 matched** by Zydis text, 146-byte FNV-1a hash, length, branch targets and direct-call target |
+| Stop instruction | `002B5CE0` decodes to `CALL dword ptr [003C9E68]` |
+| Import slot | file-backed `003C9E68 = 800000FF` (ordinal 255) |
+| Hooks | 50 `ProbeStep` declarations/calls, one `ProbeStop_0x002B5CDF` after the last instruction |
+| Forbidden text | no `3C9E68`, no indirect call, no `x86_icall`/`x86_kernel`/`x86_resume` |
+
+Missing, truncated or mismatched images fail closed. The real target is excluded from the default build and fails at build time if `assets/default.xbe` is absent; missing validation is never reported as PASS.
+
+### Authentic globals and pointer spans
+
+The real preflight prepares the image through checked XBE preparation, then reads the authentic values. No synthetic global is written.
+
+| Address | Value | Use |
+| --- | --- | --- |
+| `00010108` | `00001000` | entry arithmetic |
+| `00010118` | `00010184` | entry pointer |
+| `00010184` | `000001EC` | certificate dword compared at `002B3928` |
+| `00010130` | `00010000` | helper fall-through value |
+| `003ED3EC` | `00000000` | subtraction |
+| `003ED3F0` | `00000000` | LEA |
+| `003ED3F4` | `004DF78C` | helper store pointer |
+| `003ED3FC` | `00000090` | starting value |
+| `004EDC74` | `00000000` | counter, written before use |
+
+The entry computes `0x00000E7C`, compares it with `0x000001EC`, and takes `JNB`; the `002B392C` write is therefore not on the real path and the certificate page stays read-only. The helper argument is zero, so `002B5CAF JNZ` falls through and reads `[0x10130]=0x10000`. The reviewed IDIV computes `0x94 / -4 = FFFFFFDB` with remainder 0 and stores `FFFFFFDB` at `004DF78C`. The pointer targets are inside the prepared image: `00010184` in the header page and `004DF78C` in the `.data` virtual tail.
+
+All pointer spans are validated before use: overflow, import-page overlap, committed state, read/write permission, and image-section containment. The preflight rejects an outside-image pointer rather than dereferencing it.
+
+### Stack and page permissions
+
+| Object | Preparation |
+| --- | --- |
+| Stack | `mem::AllocStack(0x4000)` → committed `D0010000`–`D0020000`; ESP `D001FFF0`, 16-byte aligned, 0x100 bytes of reviewed headroom |
+| Header `00010000` | read-only |
+| `.text` `00011000`–`03714D4` pages | read + execute |
+| `.rdata` | read-only; reviewed globals `003ED3EC`–`003ED3FC` readable |
+| `.data` | read/write; `004EDC74` and `004DF78C` writable |
+| Import page `003C9000` | no access; observer also rejects `003C9E68` before any read |
+| Stack | read/write |
+
+Reviewed spans: `003ED000-003EE000:R`, `004ED000-004EE000:RW`, `00010000-00011000:R`, `004DF000-004E0000:RW`, `D0010000-D0020000:RW`. Overlaps, uncommitted spans, import-page spans and permission mismatches fail closed.
+
+### Isolation and budgets
+
+The real probe uses the same isolated parent/child harness as Phase 2C-15. Each child is disposable, has a 15-second external deadline (`SIGKILL`), and tears down to `system_used=0 contiguous_used=0 virtual_committed=0 workers=0 initialized=0`. The execution path is `--run-once --execute-real`; it spawns `--child execute`. Without `--execute-real`, the binary refuses. The first execution path retains: 64 instructions, one direct call to `002B5CA7`, 256 checked memory operations, zero imports, zero indirect calls, zero callbacks/workers, and a mandatory stop after `002B5CDF` before `002B5CE0`. A memory diff snapshots the header, `.rdata`, `.data`, pointer pages and the full stack before the run.
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| Synthetic probe + existing fixtures, macOS Debug | **PASS** — 5/5 CTests |
+| Synthetic probe + existing fixtures, macOS Release | **PASS** — 5/5 CTests |
+| Real preflight, Debug | **PASS** — identity, route, mapping, globals, spans, stack, permissions, teardown |
+| Real preflight, Release | **PASS** — same report |
+| Real negative tests | **12/12 PASS** — missing/mismatched identity, route mismatch, incomplete/extra hooks, unexpected target, overlapping spans, uncommitted pointer, invalid stack, execute-permission loss, pre-import stop |
+| iOS Simulator memory/preparation | **PASS** — 935 `PASS:` lines, 0 `FAIL:` lines |
+| Unsigned iPhoneOS ARM64 | **PASS** — app and memory-test executables are arm64 Mach-O |
+| Android | Not rebuilt; this phase changed only the host recompiler/config and `ios/` test sources, not shared runtime code |
+
+### Exact first-execution command (not run)
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_real_preflight \
+  --run-once --execute-real
+```
+
+Expected: 49 instructions, entry branch taken, one direct call to `002B5CA7`, stop at `002B5CE0`, `import_reads=0`, `workers=0`, memory changes at `004EDC74` and `004DF78C` plus the stack. Mandatory stop conditions: no execution of `002B5CE0`, no read of `003C9E68`, 64-instruction ceiling, one direct call total, and zero imports/indirect calls/callbacks/workers. Any other PC, target, page, fault or deadline aborts the child before the next instruction.
+
+### Decision
+
+- `REAL_MAPPING`: **PASS** — exactly two reviewed functions, 50 hooks, one stop hook, no continuation/alternate entry.
+- `REAL_PREFLIGHT`: **PASS** — authentic identity, route, globals, pointer spans, stack and permissions; no execution.
+- `REAL_EXECUTION_READINESS`: **GO for one bounded micro-execution** after explicit approval. **NO-GO** past `002B5CE0`, for any import/callback/worker, or for boot.
+- `REAL_GUEST_EXECUTION`: **NO-GO throughout Phase 2C-16.** No real XBE instruction ran.
+- Integration and release: work remains on `feature/ios-port`; no merge to `main`, physical-device install, IPA, deployment, or release occurred.
