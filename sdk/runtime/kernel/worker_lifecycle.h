@@ -102,6 +102,7 @@ bool RestartKernelWorkers();
 bool KernelWorkersAccepting();
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
 void HoldKernelWorkerActivationForTest(bool hold);
+void FailNextKernelWorkerStartForTest();
 #endif
 
 class GuestDispatchLease {

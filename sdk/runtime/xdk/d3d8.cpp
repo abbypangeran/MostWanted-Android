@@ -19,6 +19,7 @@
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
+#include "kernel/vblank_worker.h"
 
 using namespace kernel;
 
@@ -85,7 +86,6 @@ uint32_t g_buffer_count = 2;
 uint32_t g_depth = 0;
 uint32_t g_scratch_push = 0, g_scratch_size = 0;
 uint32_t g_walk = 0;  // first scratch command not read yet
-std::atomic<bool> g_vertical_blank_started{false};
 
 uint32_t Dev(uint32_t off) { return R32(kDevice + off); }
 void SetDev(uint32_t off, uint32_t v) { W32(kDevice + off, v); }
@@ -216,75 +216,6 @@ void ApplyDefaultStates(X86Context& ctx) {
 constexpr bool kVBlank = XDK_CDevice_VBlankCount != xdk::kUnknown && XDK_CDevice_VBlankEvent != xdk::kUnknown &&
                          XDK_CDevice_VBlankCallback != xdk::kUnknown;
 
-// what the library's vertical blank interrupt leaves for the title: count, event, callback
-void VerticalBlank(X86Context& ctx, WorkerStopToken stop) {
-    using clock = std::chrono::steady_clock;
-    struct ResetStarted {
-        ~ResetStarted() { g_vertical_blank_started.store(false); }
-    } reset_started;
-    std::mutex wait_lock;
-    std::condition_variable wait_changed;
-    WorkerStopCallback wake(stop, [&] { wait_changed.notify_all(); });
-    if (!wake.Ready()) return;
-    uint32_t info = mem::AllocSystem(12), shown = 0;
-    if (!info) return;
-    auto wait_until = [&](clock::time_point deadline) {
-        std::unique_lock lock(wait_lock);
-        return wait_changed.wait_until(lock, deadline, [&] { return stop.StopRequested(); });
-    };
-    auto reset_event = [&](const ObjectRef& event) {
-        std::lock_guard<std::recursive_mutex> lock(g_lock);
-        mem::ScopedPageLease device_lease;
-        if (device_lease.Acquire(kDevice, XDK_CDevice_Size, mem::kReadWrite) == mem::AccessStatus::kOk)
-            ResetEvent(*event);
-    };
-    auto next = clock::now();
-    for (;;) {
-        next = std::max(next + std::chrono::microseconds(16667), clock::now());
-        if (wait_until(next)) return;
-        uint32_t count = 0, swaps = 0, callback = 0;
-        ObjectRef event;
-        {
-            std::lock_guard<std::recursive_mutex> lock(g_lock);
-            mem::ScopedPageLease device_lease;
-            if (device_lease.Acquire(kDevice, XDK_CDevice_Size, mem::kReadWrite) != mem::AccessStatus::kOk ||
-                mem::Read(kDevice + XDK_CDevice_VBlankCount, &count, sizeof(count)) != mem::AccessStatus::kOk ||
-                mem::Read(kDevice + kDevSwapCount, &swaps, sizeof(swaps)) != mem::AccessStatus::kOk ||
-                mem::Read(kDevice + XDK_CDevice_VBlankCallback, &callback, sizeof(callback)) !=
-                    mem::AccessStatus::kOk)
-                continue;
-            ++count;
-            if (mem::Write(kDevice + XDK_CDevice_VBlankCount, &count, sizeof(count)) != mem::AccessStatus::kOk)
-                continue;
-            event = FromPointer(kDevice + XDK_CDevice_VBlankEvent);
-            if (!event) continue;
-            SetEvent(*event);
-        }
-        if (callback && !stop.StopRequested()) {
-            GuestCallbackTicket ticket;
-            if (PrepareGuestCallback(callback, ticket) == GuestCallbackStatus::kReady) {
-            // blank count, swaps shown, 1 when this blank showed one
-                const std::array<uint32_t, 3> values{count, swaps, uint32_t(swaps != shown)};
-                mem::ScopedPageLease info_lease;
-                if (info_lease.Acquire(info, sizeof(values), mem::kWrite) == mem::AccessStatus::kOk &&
-                    mem::Write(info, values.data(), sizeof(values)) == mem::AccessStatus::kOk) {
-                    info_lease.Release();
-                    const std::array<uint32_t, 1> arguments{info};
-                    uint32_t result = 0;
-                    CallGuestCallback(ctx, ticket, callback, arguments, 0, 0, result);
-                }
-            }
-        }
-        shown = swaps;
-        // the title clears the event in its own memory before a wait, which the host object does not see
-        if (wait_until(clock::now() + std::chrono::milliseconds(1))) {
-            reset_event(event);
-            return;
-        }
-        reset_event(event);
-    }
-}
-
 }  // namespace
 
 gpu::State& State() { return g_state; }
@@ -357,10 +288,9 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
         // notification event, signalled
         SetDev(XDK_CDevice_VBlankEvent, 0x00040000);
         SetDev(XDK_CDevice_VBlankEvent + 4, 1);
-        bool expected = false;
-        if (g_vertical_blank_started.compare_exchange_strong(expected, true) &&
-            !StartManagedHostThread("vertical blank", VerticalBlank))
-            g_vertical_blank_started.store(false);
+        StartVBlankWorker("vertical blank",
+                          {kDevice, XDK_CDevice_Size, XDK_CDevice_VBlankCount, kDevSwapCount,
+                           XDK_CDevice_VBlankEvent, XDK_CDevice_VBlankCallback, &g_lock});
     }
     g_state.rt = SurfaceOf(g_buffers[1]);
     g_state.zs = SurfaceOf(g_depth);

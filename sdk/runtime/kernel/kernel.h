@@ -215,7 +215,7 @@ int32_t ReleaseMutant(Object& o, uint32_t& status);
 int64_t Now100ns();                           // system time, 100 ns since 1601
 int64_t ToDeadline(int64_t due_100ns);        // relative or absolute to a steady clock deadline in ns
 bool QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2, const GuestCallbackTicket* expected = nullptr,
-              uint32_t expected_context = 0);
+              uint32_t expected_context = 0, GuestCallbackClass callback_class = GuestCallbackClass::kDpc);
 bool RemoveQueuedDpc(uint32_t dpc);
 struct Thread;
 // apc_routine runs on apc_thread with (apc_context, due low, due high) each time the timer fires
@@ -275,7 +275,8 @@ void Resume(Thread& t);
 uint32_t Suspend(Thread& t);  // previous count; another thread stops at its next kernel wait, delay or yield
 void SuspendPoint();           // blocks the current thread while it is suspended
 bool RunApcs(Thread& t);
-bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3);
+bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3,
+              GuestCallbackClass callback_class = GuestCallbackClass::kApc);
 bool QueueApcWithTicket(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3,
                         const GuestCallbackTicket& expected);
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS

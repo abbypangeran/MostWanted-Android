@@ -470,7 +470,6 @@ void RunDpcs(X86Context& ctx, WorkerStopToken stop) {
         if (mem::Write(d.dpc + 2, &inserted, sizeof(inserted)) != mem::AccessStatus::kOk) continue;
         if (current[0] != d.routine || current[1] != d.context || current[2] != d.arg1 || current[3] != d.arg2)
             continue;
-        dpc_lease.Release();
 #else
         G<uint8_t>(d.dpc + 2) = 0;  // Inserted
         routine = R32(d.dpc + 0x0C);
@@ -480,7 +479,7 @@ void RunDpcs(X86Context& ctx, WorkerStopToken stop) {
             const std::array<uint32_t, 4> arguments{d.dpc, context, d.arg1, d.arg2};
             GuestCallbackTicket ticket = d.ticket;
 #if !defined(__APPLE__)
-            ticket = {routine, 0};
+            ticket = {routine, 0, d.ticket.callback_class};
 #endif
             uint32_t result = 0;
             CallGuestCallback(ctx, ticket, routine, arguments, 0, 0, result);
@@ -489,7 +488,7 @@ void RunDpcs(X86Context& ctx, WorkerStopToken stop) {
 }
 
 bool QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2, const GuestCallbackTicket* expected,
-              uint32_t expected_context) {
+              uint32_t expected_context, GuestCallbackClass callback_class) {
     if (!KernelWorkersAccepting()) return false;
     std::lock_guard<std::mutex> lock(g_dpc_lock);
     if (!KernelWorkersAccepting()) return false;
@@ -502,10 +501,12 @@ bool QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2, const GuestCallbackTic
         mem::Read(dpc + 0x0C, &record.routine, sizeof(record.routine)) != mem::AccessStatus::kOk ||
         mem::Read(dpc + 0x10, &record.context, sizeof(record.context)) != mem::AccessStatus::kOk)
         return false;
-    if (record.routine && PrepareGuestCallback(record.routine, record.ticket) != GuestCallbackStatus::kReady) return false;
+    if (record.routine && PrepareGuestCallback(record.routine, callback_class, record.ticket) !=
+                              GuestCallbackStatus::kReady)
+        return false;
     if (expected && (expected->target != record.routine ||
                      expected->dispatch_generation != record.ticket.dispatch_generation ||
-                     expected_context != record.context))
+                     expected_context != record.context || expected->callback_class != record.ticket.callback_class))
         return false;
     if (expected) record.ticket = *expected;
     if (mem::Write(dpc + 0x14, &arg1, sizeof(arg1)) != mem::AccessStatus::kOk ||
@@ -520,7 +521,7 @@ bool QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2, const GuestCallbackTic
     W32(dpc + 0x14, arg1);  // KDPC.SystemArgument1 and 2
     W32(dpc + 0x18, arg2);
     W8(dpc + 2, 1);
-    record.ticket = {record.routine, 0};
+    record.ticket = {record.routine, 0, callback_class};
 #endif
     try {
         g_dpcs.push_back(record);
@@ -625,7 +626,7 @@ static void TimerLoop(WorkerStopToken stop) {
         if (!stop.StopRequested()) {
             const int64_t now = Now100ns();
             const uint32_t low = uint32_t(now), high = uint32_t(uint64_t(now) >> 32);
-            if (e.dpc) QueueDpc(e.dpc, low, high, &e.dpc_ticket, e.dpc_context);
+            if (e.dpc) QueueDpc(e.dpc, low, high, &e.dpc_ticket, e.dpc_context, GuestCallbackClass::kTimerDpc);
             if (auto t = e.apc_thread.lock(); t && e.apc_routine)
                 QueueApcWithTicket(*t, e.apc_routine, e.apc_context, low, high, e.apc_ticket);
         }
@@ -643,11 +644,14 @@ bool SetTimer(ObjectRef timer, int64_t due, int32_t period_ms, uint32_t dpc, std
         if (dpc_lease.Acquire(dpc, 0x1C, mem::kReadWrite) != mem::AccessStatus::kOk ||
             mem::Read(dpc + 0x0C, &dpc_routine, sizeof(dpc_routine)) != mem::AccessStatus::kOk ||
             mem::Read(dpc + 0x10, &dpc_context, sizeof(dpc_context)) != mem::AccessStatus::kOk ||
-            (dpc_routine && PrepareGuestCallback(dpc_routine, dpc_ticket) != GuestCallbackStatus::kReady))
+            (dpc_routine && PrepareGuestCallback(dpc_routine, GuestCallbackClass::kTimerDpc, dpc_ticket) !=
+                                GuestCallbackStatus::kReady))
             return false;
     }
 #endif
-    if (apc_routine && PrepareGuestCallback(apc_routine, apc_ticket) != GuestCallbackStatus::kReady) return false;
+    if (apc_routine && PrepareGuestCallback(apc_routine, GuestCallbackClass::kTimerApc, apc_ticket) !=
+                            GuestCallbackStatus::kReady)
+        return false;
     std::lock_guard<std::mutex> lock(g_timer_lock);
     if (!KernelWorkersAccepting()) return false;
     if (!g_timer_thread) {

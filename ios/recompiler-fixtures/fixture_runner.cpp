@@ -142,11 +142,14 @@ void CheckGuestCallbackContract() {
     Check(kernel::RestartKernelWorkers(), "callback test opens worker dispatch gate");
 
     kernel::GuestCallbackTicket ticket;
-    Check(kernel::PrepareGuestCallback(target, ticket) == kernel::GuestCallbackStatus::kReady,
+    Check(kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kFixture, ticket) ==
+              kernel::GuestCallbackStatus::kReady,
           "mapped executable generated callback registers");
     kernel::GuestCallbackTicket rejected;
-    Check(kernel::PrepareGuestCallback(target + 4, rejected) == kernel::GuestCallbackStatus::kRejectedTarget &&
-              kernel::PrepareGuestCallback(target + 8, rejected) == kernel::GuestCallbackStatus::kRejectedTarget,
+    Check(kernel::PrepareGuestCallback(target + 4, kernel::GuestCallbackClass::kFixture, rejected) ==
+                  kernel::GuestCallbackStatus::kRejectedTarget &&
+              kernel::PrepareGuestCallback(target + 8, kernel::GuestCallbackClass::kFixture, rejected) ==
+                  kernel::GuestCallbackStatus::kRejectedTarget,
           "unmapped entry and continuation targets reject");
 
     X86Context ctx{};
@@ -163,6 +166,148 @@ void CheckGuestCallbackContract() {
               g_callback_fake_stack[0] == 0xFFFFFFF0 && g_callback_fake_stack[1] == arguments[0] &&
               g_callback_fake_stack[2] == arguments[1],
           "synthetic callback writes checked sentinel and arguments then invokes host substitute");
+    auto invalid_class_ticket = ticket;
+    invalid_class_ticket.callback_class = static_cast<kernel::GuestCallbackClass>(0xFF);
+    const uint32_t calls_before_invalid_class = g_callback_fake_calls.load();
+    Check(kernel::CallGuestCallbackForTest(ctx, invalid_class_ticket, target, arguments, stack_base, stack_size,
+                                           result) == kernel::GuestCallbackStatus::kArgumentRejected &&
+              g_callback_fake_calls.load() == calls_before_invalid_class,
+          "forged callback class rejects without indexing outside the contract table");
+
+    constexpr uint32_t info_page = 0x05000000;
+    constexpr uint32_t info = info_page + 0x800;
+    const std::array<uint32_t, 3> info_words{7, 2, 1};
+    kernel::GuestCallbackTicket vblank_ticket;
+    Check(mem::Commit(info_page, mem::kPage) &&
+              mem::Write(info, info_words.data(), sizeof(info_words)) == mem::AccessStatus::kOk &&
+              kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kVBlank, vblank_ticket) ==
+                  kernel::GuestCallbackStatus::kReady,
+          "VBlank contract registers a mapped callback and bounded info record");
+    const std::array<uint32_t, 1> info_argument{info};
+    g_callback_fake_stack_words = 2;
+    Check(kernel::CallGuestCallbackForTest(ctx, vblank_ticket, target, info_argument, stack_base, stack_size, result) ==
+                  kernel::GuestCallbackStatus::kInvoked &&
+              g_callback_fake_stack[1] == info,
+          "VBlank callback accepts only its readable 12-byte info span");
+    const uint32_t calls_before_bad_info = g_callback_fake_calls.load();
+    Check(mem::Protect(info_page, mem::kPage, mem::kWrite) == mem::AccessStatus::kOk &&
+              kernel::CallGuestCallbackForTest(ctx, vblank_ticket, target, info_argument, stack_base, stack_size,
+                                               result) == kernel::GuestCallbackStatus::kArgumentRejected &&
+              mem::Protect(info_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              mem::Decommit(info_page, mem::kPage) &&
+              kernel::CallGuestCallbackForTest(ctx, vblank_ticket, target, info_argument, stack_base, stack_size,
+                                               result) == kernel::GuestCallbackStatus::kArgumentRejected &&
+              mem::Commit(info_page, mem::kPage) &&
+              mem::Write(info, info_words.data(), sizeof(info_words)) == mem::AccessStatus::kOk &&
+              g_callback_fake_calls.load() == calls_before_bad_info,
+          "VBlank callback rejects unreadable or decommitted bounded info without dispatch");
+
+    kernel::GuestCallbackTicket system_ticket, apc_ticket, timer_apc_ticket;
+    const std::array<uint32_t, 2> system_arguments{target, 0};
+    const std::array<uint32_t, 1> wrong_system_function{target + 8};
+    const std::array<uint32_t, 3> opaque_apc_arguments{0xDEADCAFE, 0xFFFFFFFF, 0x80000000};
+    const std::array<uint32_t, 3> timer_apc_arguments{0, 0xF1234567, 0xFFFFFFFF};
+    Check(kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kSystemRoutine, system_ticket) ==
+                  kernel::GuestCallbackStatus::kReady &&
+              kernel::CallGuestCallbackForTest(ctx, system_ticket, target, system_arguments, stack_base, stack_size,
+                                               result) == kernel::GuestCallbackStatus::kInvoked &&
+              kernel::CallGuestCallbackForTest(ctx, system_ticket, target, wrong_system_function, stack_base,
+                                               stack_size, result) == kernel::GuestCallbackStatus::kArgumentRejected &&
+              kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kApc, apc_ticket) ==
+                  kernel::GuestCallbackStatus::kReady &&
+              kernel::CallGuestCallbackForTest(ctx, apc_ticket, target, opaque_apc_arguments, stack_base, stack_size,
+                                               result) == kernel::GuestCallbackStatus::kInvoked &&
+              kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kTimerApc, timer_apc_ticket) ==
+                  kernel::GuestCallbackStatus::kReady &&
+              kernel::CallGuestCallbackForTest(ctx, timer_apc_ticket, target, timer_apc_arguments, stack_base,
+                                               stack_size, result) == kernel::GuestCallbackStatus::kInvoked,
+          "callback contracts validate guest functions and leave opaque APC values and timer scalars uninterpreted");
+    Check(kernel::CallGuestCallbackForTest(ctx, apc_ticket, target, info_argument, stack_base, stack_size, result) ==
+              kernel::GuestCallbackStatus::kArgumentRejected,
+          "APC contract rejects an argument frame with the wrong arity");
+
+    kernel::GuestCallbackTicket file_apc_ticket, dpc_ticket, timer_dpc_ticket, synchronize_ticket;
+    const std::array<uint32_t, 3> file_apc_arguments{0xDEADCAFE, info, 0xFFFFFFFF};
+    g_callback_fake_stack_words = 4;
+    Check(kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kFileApc, file_apc_ticket) ==
+                  kernel::GuestCallbackStatus::kReady &&
+              kernel::CallGuestCallbackForTest(ctx, file_apc_ticket, target, file_apc_arguments, stack_base,
+                                               stack_size, result) == kernel::GuestCallbackStatus::kInvoked,
+          "file APC contract accepts its optional context, bounded IOSB, and reserved scalar");
+    const uint32_t calls_before_bad_iosb = g_callback_fake_calls.load();
+    Check(mem::Protect(info_page, mem::kPage, mem::kWrite) == mem::AccessStatus::kOk &&
+              kernel::CallGuestCallbackForTest(ctx, file_apc_ticket, target, file_apc_arguments, stack_base,
+                                               stack_size, result) == kernel::GuestCallbackStatus::kArgumentRejected &&
+              mem::Protect(info_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              mem::Decommit(info_page, mem::kPage) &&
+              kernel::CallGuestCallbackForTest(ctx, file_apc_ticket, target, file_apc_arguments, stack_base,
+                                               stack_size, result) == kernel::GuestCallbackStatus::kArgumentRejected &&
+              mem::Commit(info_page, mem::kPage) &&
+              mem::Write(info, info_words.data(), sizeof(info_words)) == mem::AccessStatus::kOk &&
+              g_callback_fake_calls.load() == calls_before_bad_iosb,
+          "file APC contract rejects IOSB protection changes and decommit before dispatch");
+
+    constexpr uint32_t dpc_page = 0x05020000;
+    constexpr uint32_t dpc = dpc_page + 0x80;
+    const std::array<uint8_t, 0x1C> dpc_bytes{};
+    const std::array<uint32_t, 4> dpc_arguments{dpc, 0xDEADCAFE, 0xFFFFFFFF, 0x80000000};
+    const std::array<uint32_t, 4> timer_dpc_arguments{dpc, 0xF1234567, 0xFFFFFFFF, 0x80000000};
+    g_callback_fake_stack_words = 5;
+    Check(mem::Commit(dpc_page, mem::kPage) &&
+              mem::Write(dpc, dpc_bytes.data(), dpc_bytes.size()) == mem::AccessStatus::kOk &&
+              kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kDpc, dpc_ticket) ==
+                  kernel::GuestCallbackStatus::kReady &&
+              kernel::CallGuestCallbackForTest(ctx, dpc_ticket, target, dpc_arguments, stack_base, stack_size,
+                                               result) == kernel::GuestCallbackStatus::kInvoked &&
+              kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kTimerDpc, timer_dpc_ticket) ==
+                  kernel::GuestCallbackStatus::kReady &&
+              kernel::CallGuestCallbackForTest(ctx, timer_dpc_ticket, target, timer_dpc_arguments, stack_base,
+                                               stack_size, result) == kernel::GuestCallbackStatus::kInvoked,
+          "DPC contracts accept bounded KDPC spans, unresolved contexts, and class-specific dword values");
+    const uint32_t calls_before_bad_dpc = g_callback_fake_calls.load();
+    Check(mem::Protect(dpc_page, mem::kPage, mem::kRead) == mem::AccessStatus::kOk &&
+              kernel::CallGuestCallbackForTest(ctx, dpc_ticket, target, dpc_arguments, stack_base, stack_size,
+                                               result) == kernel::GuestCallbackStatus::kArgumentRejected &&
+              mem::Protect(dpc_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              mem::Decommit(dpc_page, mem::kPage) &&
+              kernel::CallGuestCallbackForTest(ctx, timer_dpc_ticket, target, timer_dpc_arguments, stack_base,
+                                               stack_size, result) == kernel::GuestCallbackStatus::kArgumentRejected &&
+              mem::Commit(dpc_page, mem::kPage) && g_callback_fake_calls.load() == calls_before_bad_dpc,
+          "DPC contracts reject protection changes and decommitted KDPC records");
+
+    const std::array<uint32_t, 1> synchronize_arguments{0xFFFFFFFF};
+    g_callback_fake_stack_words = 2;
+    Check(kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kSynchronizeExecution,
+                                       synchronize_ticket) == kernel::GuestCallbackStatus::kReady &&
+              kernel::CallGuestCallbackForTest(ctx, synchronize_ticket, target, synchronize_arguments, stack_base,
+                                               stack_size, result) == kernel::GuestCallbackStatus::kInvoked,
+          "synchronize-execution contract preserves its unresolved context value");
+
+    constexpr uint32_t queued_iosb_page = 0x05010000;
+    constexpr uint32_t queued_iosb = queued_iosb_page + 0x80;
+    Check(mem::Commit(queued_iosb_page, mem::kPage) &&
+              mem::Write(queued_iosb, info_words.data(), 8) == mem::AccessStatus::kOk,
+          "file APC IOSB is committed before queueing");
+    kernel::Thread file_apc_thread;
+    file_apc_thread.ctx = &ctx;
+    file_apc_thread.stack_top = stack_top;
+    file_apc_thread.stack_size = stack_size;
+    Check(kernel::QueueApc(file_apc_thread, target, 0, queued_iosb, 0, kernel::GuestCallbackClass::kFileApc) &&
+              file_apc_thread.apcs.size() == 1,
+          "file APC queue stores a bounded IOSB address without retaining a page lease");
+    std::atomic<bool> iosb_decommitted{false};
+    std::thread iosb_mutation([&] { iosb_decommitted = mem::Decommit(queued_iosb_page, mem::kPage); });
+    const auto iosb_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!iosb_decommitted.load() && std::chrono::steady_clock::now() < iosb_deadline)
+        std::this_thread::yield();
+    const bool iosb_mutation_completed_while_queued = iosb_decommitted.load();
+    if (!iosb_mutation_completed_while_queued) (void)kernel::RunApcs(file_apc_thread);
+    iosb_mutation.join();
+    const uint32_t calls_before_stale_file_apc = g_callback_fake_calls.load();
+    const bool stale_file_apc_rejected = !kernel::RunApcs(file_apc_thread) &&
+                                         g_callback_fake_calls.load() == calls_before_stale_file_apc;
+    Check(iosb_mutation_completed_while_queued && stale_file_apc_rejected,
+          "queued file APC does not block IOSB decommit and rejects the stale span at dispatch");
 
     Check(mem::Protect(code_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
               kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result) ==
@@ -197,7 +342,8 @@ void CheckGuestCallbackContract() {
                   kernel::GuestCallbackStatus::kStaleDispatch &&
               ticket.dispatch_generation == old_generation,
           "queued callback ticket rejects a reset dispatch generation");
-    Check(kernel::PrepareGuestCallback(target, ticket) == kernel::GuestCallbackStatus::kReady,
+    Check(kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kDpc, ticket) ==
+              kernel::GuestCallbackStatus::kReady,
           "callback ticket refreshes against replacement dispatch map");
 
     constexpr uint32_t timer_dpc = 0xA0000;
@@ -218,7 +364,8 @@ void CheckGuestCallbackContract() {
         mem::Read(timer_dpc + 2, &timer_dpc_inserted, sizeof(timer_dpc_inserted)) == mem::AccessStatus::kOk;
     Check(!stale_timer_queued && timer_dpc_state_read && timer_dpc_inserted == 0,
           "timer DPC rejects a stale dispatch ticket before queueing");
-    Check(kernel::PrepareGuestCallback(target, ticket) == kernel::GuestCallbackStatus::kReady,
+    Check(kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kFixture, ticket) ==
+              kernel::GuestCallbackStatus::kReady,
           "callback ticket refreshes after stale timer DPC rejection");
 
     {
@@ -230,8 +377,17 @@ void CheckGuestCallbackContract() {
     }
     mem::SetPageMutationWaitHookForTest(CallbackPageMutationWaiting);
     std::atomic<kernel::GuestCallbackStatus> active_status{kernel::GuestCallbackStatus::kCancelled};
+    const uint64_t active_generation = vblank_ticket.dispatch_generation;
+    Check(dispatch::Init(metadata, error) &&
+              kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kVBlank, vblank_ticket) ==
+                  kernel::GuestCallbackStatus::kReady &&
+              vblank_ticket.dispatch_generation != active_generation,
+          "bounded callback ticket refreshes for lease-concurrency test");
+    g_callback_fake_stack_words = 2;
     std::thread active([&] {
-        active_status = kernel::CallGuestCallbackForTest(ctx, ticket, target, arguments, stack_base, stack_size, result);
+        uint32_t active_result = 0;
+        active_status = kernel::CallGuestCallbackForTest(ctx, vblank_ticket, target, info_argument, stack_base,
+                                                         stack_size, active_result);
     });
     bool entered = false;
     {
@@ -247,6 +403,9 @@ void CheckGuestCallbackContract() {
     std::thread stack_mutator([&] {
         mem::Protect(stack_base, mem::kPage, mem::kRead);
     });
+    std::thread info_mutator([&] {
+        mem::Protect(info_page, mem::kPage, mem::kNoAccess);
+    });
     std::thread code_mutator([&] {
         mem::Decommit(code_page, mem::kPage);
     });
@@ -255,11 +414,11 @@ void CheckGuestCallbackContract() {
     {
         std::unique_lock lock(g_callback_fake_lock);
         mutations_waited = g_callback_fake_changed.wait_for(lock, std::chrono::seconds(3), [] {
-            return g_callback_page_mutation_waits >= 2;
+            return g_callback_page_mutation_waits >= 3;
         });
     }
     Check(entered && mutations_waited && dispatch::ResetWouldBlockForTest() && !reset_done.load(),
-          "active callback leases block code and stack mutation and dispatch reset");
+          "active callback leases block code, stack, and bounded data mutation plus dispatch reset");
     {
         std::lock_guard lock(g_callback_fake_lock);
         g_callback_fake_release = true;
@@ -269,14 +428,18 @@ void CheckGuestCallbackContract() {
     active.join();
     resetter.join();
     stack_mutator.join();
+    info_mutator.join();
     code_mutator.join();
     mem::SetPageMutationWaitHookForTest(nullptr);
     Check(reset_done.load() && active_status.load() == kernel::GuestCallbackStatus::kInvoked &&
               mem::Commit(code_page, mem::kPage) &&
               mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
               mem::Protect(stack_base, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
-          "callback return releases code-range and full-stack leases before page mutations finish");
-    Check(dispatch::Init(metadata, error) && kernel::PrepareGuestCallback(target, ticket) ==
+          "callback return releases code, stack, and bounded data leases before page mutations finish");
+    Check(mem::Protect(info_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              mem::Decommit(info_page, mem::kPage),
+          "bounded callback fixture restores and releases its owned info page");
+    Check(dispatch::Init(metadata, error) && kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kFixture, ticket) ==
                                                    kernel::GuestCallbackStatus::kReady,
           "dispatch map restores and fresh callback ticket registers");
 
@@ -285,7 +448,8 @@ void CheckGuestCallbackContract() {
     std::thread registrar([&] {
         start.arrive_and_wait();
         kernel::GuestCallbackTicket concurrent_ticket;
-        registration_status = kernel::PrepareGuestCallback(target, concurrent_ticket);
+        registration_status = kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kFixture,
+                                                           concurrent_ticket);
     });
     start.arrive_and_wait();
     Check(kernel::StopKernelWorkers(), "shutdown closes callback admission gate");

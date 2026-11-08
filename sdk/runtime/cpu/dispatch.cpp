@@ -378,6 +378,74 @@ namespace {
 
 constexpr size_t kMaximumCallbackArguments = 16;
 constexpr uint32_t kHostCallbackReturn = 0xFFFFFFF0;
+constexpr GuestCallbackArgumentContract kThreadStartArguments[] = {{GuestCallbackArgumentKind::kNullableUnresolvedPointer}};
+constexpr GuestCallbackArgumentContract kSystemRoutineArguments[] = {
+    {GuestCallbackArgumentKind::kGuestFunction}, {GuestCallbackArgumentKind::kNullableUnresolvedPointer}};
+constexpr GuestCallbackArgumentContract kApcArguments[] = {
+    {GuestCallbackArgumentKind::kOpaqueDword}, {GuestCallbackArgumentKind::kOpaqueDword},
+    {GuestCallbackArgumentKind::kOpaqueDword}};
+constexpr GuestCallbackArgumentContract kFileApcArguments[] = {
+    {GuestCallbackArgumentKind::kNullableUnresolvedPointer}, {GuestCallbackArgumentKind::kBoundedRead, 8},
+    {GuestCallbackArgumentKind::kScalar}};
+constexpr GuestCallbackArgumentContract kDpcArguments[] = {
+    {GuestCallbackArgumentKind::kBoundedReadWrite, 0x1C},
+    {GuestCallbackArgumentKind::kNullableUnresolvedPointer}, {GuestCallbackArgumentKind::kOpaqueDword},
+    {GuestCallbackArgumentKind::kOpaqueDword}};
+constexpr GuestCallbackArgumentContract kTimerApcArguments[] = {
+    {GuestCallbackArgumentKind::kNullableUnresolvedPointer}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}};
+constexpr GuestCallbackArgumentContract kTimerDpcArguments[] = {
+    {GuestCallbackArgumentKind::kBoundedReadWrite, 0x1C},
+    {GuestCallbackArgumentKind::kNullableUnresolvedPointer}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}};
+constexpr GuestCallbackArgumentContract kVBlankArguments[] = {{GuestCallbackArgumentKind::kBoundedRead, 12}};
+constexpr GuestCallbackArgumentContract kSynchronizeArguments[] = {
+    {GuestCallbackArgumentKind::kNullableUnresolvedPointer}};
+constexpr GuestCallbackArgumentContract kFixtureArguments[] = {
+    {GuestCallbackArgumentKind::kScalar}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}, {GuestCallbackArgumentKind::kScalar},
+    {GuestCallbackArgumentKind::kScalar}, {GuestCallbackArgumentKind::kScalar}};
+
+GuestCallbackStatus ValidateCallbackArguments(const GuestCallbackTicket& ticket, std::span<const uint32_t> arguments,
+                                              dispatch::CallLease& dispatch_lease,
+                                              std::array<mem::ScopedPageLease, kMaximumCallbackArguments>& leases) {
+#if !defined(MOSTWANTED_GUEST_CALLBACK_TESTS)
+    if (ticket.callback_class == GuestCallbackClass::kFixture) return GuestCallbackStatus::kArgumentRejected;
+#endif
+    const GuestCallbackContract& contract = CallbackContract(ticket.callback_class);
+    if (contract.callback_class != ticket.callback_class) return GuestCallbackStatus::kArgumentRejected;
+    if ((!contract.variadic && arguments.size() != contract.arguments.size()) ||
+        arguments.size() > contract.arguments.size())
+        return GuestCallbackStatus::kArgumentRejected;
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        const uint32_t value = arguments[i];
+        const GuestCallbackArgumentContract& argument = contract.arguments[i];
+        switch (argument.kind) {
+            case GuestCallbackArgumentKind::kScalar:
+            case GuestCallbackArgumentKind::kOpaqueDword:
+            case GuestCallbackArgumentKind::kNullableUnresolvedPointer:
+                break;
+            case GuestCallbackArgumentKind::kGuestFunction:
+                if (dispatch_lease.Resolve(value).kind != dispatch::TargetKind::kGeneratedFunction)
+                    return GuestCallbackStatus::kArgumentRejected;
+                break;
+            case GuestCallbackArgumentKind::kBoundedRead:
+                if (!value || leases[i].Acquire(value, argument.size, mem::kRead) != mem::AccessStatus::kOk)
+                    return GuestCallbackStatus::kArgumentRejected;
+                break;
+            case GuestCallbackArgumentKind::kBoundedReadWrite:
+                if (!value || leases[i].Acquire(value, argument.size, mem::kReadWrite) != mem::AccessStatus::kOk)
+                    return GuestCallbackStatus::kArgumentRejected;
+                break;
+        }
+    }
+    return GuestCallbackStatus::kReady;
+}
 
 GuestCallbackStatus ValidateMappedCallback(uint32_t target, dispatch::CallLease& lease, X86Func*& function) {
     const dispatch::ResolvedTarget resolved = lease.Resolve(target);
@@ -421,9 +489,34 @@ GuestCallbackStatus ValidateCallbackStack(X86Context& ctx, uint32_t stack_base, 
 
 }  // namespace
 
-GuestCallbackStatus PrepareGuestCallback(uint32_t target, GuestCallbackTicket& ticket) {
+const GuestCallbackContract& CallbackContract(GuestCallbackClass callback_class) {
+    static const GuestCallbackContract contracts[] = {
+        {GuestCallbackClass::kThreadStart, kThreadStartArguments},
+        {GuestCallbackClass::kSystemRoutine, kSystemRoutineArguments},
+        {GuestCallbackClass::kApc, kApcArguments},
+        {GuestCallbackClass::kFileApc, kFileApcArguments},
+        {GuestCallbackClass::kDpc, kDpcArguments},
+        {GuestCallbackClass::kTimerApc, kTimerApcArguments},
+        {GuestCallbackClass::kTimerDpc, kTimerDpcArguments},
+        {GuestCallbackClass::kVBlank, kVBlankArguments},
+        {GuestCallbackClass::kSynchronizeExecution, kSynchronizeArguments},
+        {GuestCallbackClass::kFixture, kFixtureArguments, true},
+    };
+    const size_t index = static_cast<size_t>(callback_class);
+    if (index < sizeof(contracts) / sizeof(contracts[0])) return contracts[index];
+    static const GuestCallbackContract invalid{static_cast<GuestCallbackClass>(0xFF), {}};
+    return invalid;
+}
+
+GuestCallbackStatus PrepareGuestCallback(uint32_t target, GuestCallbackClass callback_class,
+                                         GuestCallbackTicket& ticket) {
     ticket = {};
     if (!target) return GuestCallbackStatus::kNullTarget;
+#if !defined(MOSTWANTED_GUEST_CALLBACK_TESTS)
+    if (callback_class == GuestCallbackClass::kFixture) return GuestCallbackStatus::kArgumentRejected;
+#endif
+    if (CallbackContract(callback_class).callback_class != callback_class)
+        return GuestCallbackStatus::kArgumentRejected;
 #if defined(__APPLE__) || defined(MOSTWANTED_GUEST_CALLBACK_TESTS)
     if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
     dispatch::CallLease lease;
@@ -434,10 +527,10 @@ GuestCallbackStatus PrepareGuestCallback(uint32_t target, GuestCallbackTicket& t
     if (code_lease.Acquire(target, 1, mem::kExecute) != mem::AccessStatus::kOk)
         return GuestCallbackStatus::kCodePageDenied;
     if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
-    ticket = {target, lease.Generation()};
+    ticket = {target, lease.Generation(), callback_class};
     return GuestCallbackStatus::kReady;
 #else
-    ticket = {target, 0};
+    ticket = {target, 0, callback_class};
     return GuestCallbackStatus::kReady;
 #endif
 }
@@ -459,6 +552,10 @@ GuestCallbackStatus CallGuestCallback(X86Context& ctx, const GuestCallbackTicket
     const GuestCallbackStatus target_status =
         ValidateCallbackTicket(ticket, current_target, dispatch_lease, function, code_lease);
     if (target_status != GuestCallbackStatus::kReady) return target_status;
+    std::array<mem::ScopedPageLease, kMaximumCallbackArguments> argument_leases;
+    const GuestCallbackStatus argument_status =
+        ValidateCallbackArguments(ticket, arguments, dispatch_lease, argument_leases);
+    if (argument_status != GuestCallbackStatus::kReady) return argument_status;
     (void)function;
     uint32_t stack_pointer = 0;
     mem::ScopedPageLease stack_lease;
@@ -491,6 +588,10 @@ GuestCallbackStatus CallGuestCallbackForTest(X86Context& ctx, const GuestCallbac
     const GuestCallbackStatus target_status =
         ValidateCallbackTicket(ticket, current_target, dispatch_lease, function, code_lease);
     if (target_status != GuestCallbackStatus::kReady) return target_status;
+    std::array<mem::ScopedPageLease, kMaximumCallbackArguments> argument_leases;
+    const GuestCallbackStatus argument_status =
+        ValidateCallbackArguments(ticket, arguments, dispatch_lease, argument_leases);
+    if (argument_status != GuestCallbackStatus::kReady) return argument_status;
     uint32_t stack_pointer = 0;
     mem::ScopedPageLease stack_lease;
     const GuestCallbackStatus stack_status =

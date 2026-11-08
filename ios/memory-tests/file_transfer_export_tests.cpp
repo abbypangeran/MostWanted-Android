@@ -38,6 +38,7 @@ std::atomic<uint32_t> g_expected_status{0};
 std::atomic<uint32_t> g_expected_information{0};
 std::atomic<bool> g_event_after_publication{false};
 std::atomic<bool> g_apc_after_publication{false};
+std::atomic<bool> g_file_apc_class_ok{false};
 
 void Check(bool condition, const char* name) {
     std::printf("%s: %s\n", condition ? "PASS" : "FAIL", name);
@@ -214,7 +215,8 @@ int32_t ResetEvent(Object& object) {
 
 Thread* Current() { return g_current_for_test; }
 
-bool QueueApc(Thread&, uint32_t, uint32_t, uint32_t iosb, uint32_t) {
+bool QueueApc(Thread&, uint32_t, uint32_t, uint32_t iosb, uint32_t, GuestCallbackClass callback_class) {
+    g_file_apc_class_ok = callback_class == GuestCallbackClass::kFileApc;
     if (iosb == g_expected_iosb.load() && PublishedExpectedIosb()) g_apc_after_publication = true;
     return true;
 }
@@ -275,7 +277,8 @@ extern "C" int RunFileTransferExportTests() {
     Check(g_event_after_publication,
           "file completion signal follows the fully published IOSB");
 #ifdef MOSTWANTED_FILE_TRANSFER_TEST_STUBS
-    Check(g_apc_after_publication, "queued APC observes the fully published IOSB");
+    Check(g_apc_after_publication && g_file_apc_class_ok,
+          "file APC is classed and queued only after the fully published IOSB");
 #endif
 #ifdef MOSTWANTED_FILE_TRANSFER_TEST_STUBS
     g_current_for_test = nullptr;

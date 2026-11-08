@@ -352,8 +352,10 @@ bool CancelPreparedThread(const ThreadRef& t) {
 bool StartThread(ThreadRef t) {
     if (!t) return false;
     GuestCallbackTicket start_ticket, system_ticket;
-    if (PrepareGuestCallback(t->start_routine, start_ticket) != GuestCallbackStatus::kReady ||
-        (t->system_routine && PrepareGuestCallback(t->system_routine, system_ticket) != GuestCallbackStatus::kReady))
+    if (PrepareGuestCallback(t->start_routine, GuestCallbackClass::kThreadStart, start_ticket) !=
+            GuestCallbackStatus::kReady ||
+        (t->system_routine && PrepareGuestCallback(t->system_routine, GuestCallbackClass::kSystemRoutine,
+                                                   system_ticket) != GuestCallbackStatus::kReady))
         return false;
     t->start_routine_ticket = start_ticket;
     t->system_routine_ticket = system_ticket;
@@ -562,9 +564,10 @@ void SuspendPoint() {
     t->resume_cv.wait(lock, [&] { return t->suspend.load() <= 0 || t->stop_requested.load(); });
 }
 
-bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3) {
+bool QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3,
+              GuestCallbackClass callback_class) {
     GuestCallbackTicket ticket;
-    if (PrepareGuestCallback(routine, ticket) != GuestCallbackStatus::kReady) return false;
+    if (PrepareGuestCallback(routine, callback_class, ticket) != GuestCallbackStatus::kReady) return false;
     return QueueApcWithTicket(t, routine, a1, a2, a3, ticket);
 }
 
@@ -572,8 +575,9 @@ bool QueueApcWithTicket(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, u
                         const GuestCallbackTicket& expected) {
     if (!KernelWorkersAccepting()) return false;
     GuestCallbackTicket ticket;
-    if (PrepareGuestCallback(routine, ticket) != GuestCallbackStatus::kReady ||
-        expected.target != ticket.target || expected.dispatch_generation != ticket.dispatch_generation)
+    if (PrepareGuestCallback(routine, expected.callback_class, ticket) != GuestCallbackStatus::kReady ||
+        expected.target != ticket.target || expected.dispatch_generation != ticket.dispatch_generation ||
+        expected.callback_class != ticket.callback_class)
         return false;
     ticket = expected;
     {
@@ -601,7 +605,7 @@ bool RunApcs(Thread& t) {
                 t.apcs.clear();
                 break;
             }
-            apc = t.apcs.front();
+            apc = std::move(t.apcs.front());
             t.apcs.pop_front();
         }
         uint32_t result = 0;

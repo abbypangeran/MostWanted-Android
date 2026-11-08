@@ -138,7 +138,7 @@ std::string ObjectName(uint32_t attrs, uint32_t* root = nullptr) {
 void Complete(uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
     if (event)
         if (ObjectRef e = FromHandle(event)) SetEvent(*e);
-    if (apc && Current()) QueueApc(*Current(), apc, apc_ctx, iosb, 0);
+    if (apc && Current()) QueueApc(*Current(), apc, apc_ctx, iosb, 0, GuestCallbackClass::kFileApc);
 }
 
 }  // namespace

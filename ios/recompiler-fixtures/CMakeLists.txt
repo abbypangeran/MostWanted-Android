@@ -74,9 +74,50 @@ add_executable(checked_fault_handler_tests
     ${GENERATED_SOURCE}
     ${GENERATED_MAPPING}
 )
+add_executable(synthetic_startup_integration_tests
+    startup_integration_tests.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
+    ${XBE_SDK}/runtime/cpu/memory_fault.cpp
+    ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/crypto.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_data_init.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_thunks.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
+    ${XBE_SDK}/runtime/xbe/image_loader.cpp
+    ${GENERATED_SOURCE}
+    ${GENERATED_MAPPING}
+)
+add_executable(vblank_runtime_tests
+    vblank_runtime_tests.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
+    ${XBE_SDK}/runtime/cpu/memory_fault.cpp
+    ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
+    ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
+    ${XBE_SDK}/runtime/kernel/vblank_worker.cpp
+    ${GENERATED_SOURCE}
+    ${GENERATED_MAPPING}
+)
 add_dependencies(checked_fault_handler_tests generate_checked_fixture)
+add_dependencies(synthetic_startup_integration_tests generate_checked_fixture)
+add_dependencies(vblank_runtime_tests generate_checked_fixture)
 target_compile_features(checked_fault_handler_tests PRIVATE cxx_std_20)
+target_compile_features(synthetic_startup_integration_tests PRIVATE cxx_std_20)
+target_compile_features(vblank_runtime_tests PRIVATE cxx_std_20)
 target_include_directories(checked_fault_handler_tests PRIVATE ${XBE_SDK}/runtime ${GENERATED_DIR})
+target_include_directories(synthetic_startup_integration_tests PRIVATE ${XBE_SDK}/runtime ${GENERATED_DIR})
+target_include_directories(vblank_runtime_tests PRIVATE ${XBE_SDK}/runtime ${GENERATED_DIR})
 add_dependencies(checked_recompiler_tests generate_checked_fixture)
 target_compile_features(checked_recompiler_tests PRIVATE cxx_std_20)
 target_include_directories(checked_recompiler_tests PRIVATE ${XBE_SDK}/runtime ${GENERATED_DIR})
@@ -85,7 +126,23 @@ target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_CHECKED_K
 target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_THREAD_PREPARATION_TESTS=1)
 target_compile_definitions(checked_recompiler_tests PRIVATE MOSTWANTED_GUEST_CALLBACK_TESTS=1 MOSTWANTED_GUEST_PAGE_LEASE_TESTS=1)
 target_link_libraries(checked_recompiler_tests PRIVATE Threads::Threads)
+target_compile_definitions(synthetic_startup_integration_tests PRIVATE
+    MOSTWANTED_CHECKED_KERNEL_ABI_TESTS=1
+    MOSTWANTED_THREAD_PREPARATION_TESTS=1
+    MOSTWANTED_GUEST_CALLBACK_TESTS=1
+    MOSTWANTED_GUEST_PAGE_LEASE_TESTS=1
+)
+target_link_libraries(synthetic_startup_integration_tests PRIVATE Threads::Threads)
+target_compile_definitions(vblank_runtime_tests PRIVATE
+    MOSTWANTED_GUEST_CALLBACK_TESTS=1
+    MOSTWANTED_GUEST_PAGE_LEASE_TESTS=1
+    MOSTWANTED_KERNEL_WORKER_TESTS=1
+    MOSTWANTED_VBLANK_RUNTIME_TESTS=1
+)
+target_link_libraries(vblank_runtime_tests PRIVATE Threads::Threads)
 if(BUILD_TESTING)
     add_test(NAME checked_recompiler_tests COMMAND checked_recompiler_tests)
     add_test(NAME checked_fault_handler_tests COMMAND checked_fault_handler_tests)
+    add_test(NAME synthetic_startup_integration_tests COMMAND synthetic_startup_integration_tests ${FIXTURE_XBE})
+    add_test(NAME vblank_runtime_tests COMMAND vblank_runtime_tests)
 endif()

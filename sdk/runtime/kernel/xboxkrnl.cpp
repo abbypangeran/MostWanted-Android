@@ -825,7 +825,9 @@ KERNEL_EXPORT(44, HalGetInterruptVector, 2) {
 }
 KERNEL_EXPORT(153, KeSynchronizeExecution, 3) {
     GuestCallbackTicket ticket;
-    if (PrepareGuestCallback(a[1], ticket) != GuestCallbackStatus::kReady) return 0;
+    if (PrepareGuestCallback(a[1], GuestCallbackClass::kSynchronizeExecution, ticket) !=
+        GuestCallbackStatus::kReady)
+        return 0;
     const std::array<uint32_t, 1> arguments{a[2]};
     Thread* thread = Current();
     const uint32_t stack_base = thread ? thread->stack_top - thread->stack_size : 0;
