@@ -24,7 +24,7 @@ void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
 }
 
 bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& config_path) {
-    const std::vector<uint8_t> code = {
+    std::vector<uint8_t> code = {
         0x8B, 0x03,                   // mov eax, [ebx]
         0x89, 0x07,                   // mov [edi], eax
         0x88, 0x47, 0x04,             // mov [edi+4], al
@@ -98,7 +98,7 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xE8, 0xF3, 0xFF, 0xFF, 0xFF, 0xC3, // call corrupting callee; ret
         0xB9, 0x78, 0x56, 0x34, 0x12, 0xC3, // continuation target for dispatch tests
         0xFF, 0xD0, 0xC3,                   // indirect CALL remains unsupported
-        0xE8, 0xBC, 0x00, 0x00, 0x00, 0xC3, // direct CALL to unmapped target remains blocked
+        0xE8, 0xBC, 0x1E, 0x00, 0x00, 0xC3, // direct CALL to unmapped target remains blocked
         0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3, // CALL $+5 remains blocked in checked mode
         0x89, 0xDC, 0xC3,                   // RET read-fault callee: mov esp, ebx; ret
         0xE8, 0xF8, 0xFF, 0xFF, 0xFF, 0xC3, // RET read-fault caller
@@ -139,6 +139,34 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3,       // checked short JMP target returns 42
         0x5F, 0x5E, 0xC3                            // checked POP EDI, POP ESI; ret
     };
+    if (code.size() != 0x1ED) return false;
+    code.insert(code.end(), 0x23, 0);
+    code.insert(code.end(), {
+        0xF6, 0xD0, 0xC3,                         // NOT AL; ret
+        0xF7, 0xD0, 0xC3,                         // NOT EAX must trap
+        0xF6, 0xD3, 0xC3,                         // NOT BL must trap
+        0xF6, 0xD4, 0xC3,                         // NOT AH must trap
+        0xF6, 0x16, 0xC3,                         // NOT [ESI] must trap
+        0xF3, 0xA4, 0xC3,                         // REP MOVSB
+        0xF3, 0xA5, 0xC3,                         // REP MOVSD
+        0xF3, 0xAA, 0xC3,                         // REP STOSB
+        0xF3, 0xAB, 0xC3,                         // REP STOSD
+        0xA4, 0xC3,                               // MOVSB without REP must trap
+        0xF2, 0xA4, 0xC3,                         // REPNE MOVSB must trap
+        0x66, 0xF3, 0xA5, 0xC3,                   // REP MOVSW must trap
+        0x67, 0xF3, 0xA4, 0xC3,                   // 16-bit address REP MOVSB must trap
+        0x64, 0xF3, 0xA4, 0xC3,                   // FS override REP MOVSB must trap
+        0xF2, 0xAA, 0xC3,                         // REPNE STOSB must trap
+        0x64, 0xA1, 0x28, 0x00, 0x00, 0x00, 0xC3, // MOV EAX, FS:[0x28]
+        0x64, 0x8B, 0x44, 0x08, 0x28, 0xC3,       // MOV EAX, FS:[EAX+ECX+0x28]
+        0x65, 0xA1, 0x28, 0x00, 0x00, 0x00, 0xC3, // GS memory must trap
+        0x67, 0x64, 0xA1, 0x28, 0x00, 0xC3,       // 16-bit FS memory must trap
+        0x64, 0x0F, 0xB7, 0x05, 0x28, 0, 0, 0, 0xC3, // MOVZX EAX, word FS:[0x28]
+        0x65, 0x0F, 0xB6, 0x05, 0x28, 0, 0, 0, 0xC3, // MOVZX GS memory must trap
+        0x67, 0x0F, 0xB6, 0x00, 0xC3,                 // 16-bit MOVZX memory must trap
+        0x65, 0x0F, 0xBE, 0x05, 0x28, 0, 0, 0, 0xC3, // MOVSX GS memory must trap
+        0x67, 0x0F, 0xBE, 0x00, 0xC3                  // 16-bit MOVSX memory must trap
+    });
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
     std::copy_n("XBEH", 4, image.begin());
@@ -447,7 +475,69 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "end = 0x111EA\n\n"
               "[[function]]\n"
               "at = 0x111EA\n"
-              "end = 0x111ED\n";
+              "end = 0x111ED\n\n"
+              "[[function]]\n"
+              "at = 0x11210\n"
+              "end = 0x11213\n\n"
+              "[[function]]\n"
+              "at = 0x11213\n"
+              "end = 0x11216\n\n"
+              "[[function]]\n"
+              "at = 0x11216\n"
+              "end = 0x11219\n\n"
+              "[[function]]\n"
+              "at = 0x11219\n"
+              "end = 0x1121C\n\n"
+              "[[function]]\n"
+              "at = 0x1121C\n"
+              "end = 0x1121F\n\n"
+              "[[function]]\n"
+              "at = 0x1121F\n"
+              "end = 0x11222\n\n"
+              "[[function]]\n"
+              "at = 0x11222\n"
+              "end = 0x11225\n\n"
+              "[[function]]\n"
+              "at = 0x11225\n"
+              "end = 0x11228\n\n"
+              "[[function]]\n"
+              "at = 0x11228\n"
+              "end = 0x1122B\n\n"
+              "[[function]]\n"
+              "at = 0x1122B\n"
+              "end = 0x1122D\n\n"
+              "[[function]]\n"
+              "at = 0x1122D\n"
+              "end = 0x11230\n\n"
+              "[[function]]\n"
+              "at = 0x11230\n"
+              "end = 0x11234\n\n"
+              "[[function]]\n"
+              "at = 0x11234\n"
+              "end = 0x11238\n\n"
+              "[[function]]\n"
+              "at = 0x11238\n"
+              "end = 0x1123C\n\n"
+              "[[function]]\n"
+              "at = 0x1123C\n"
+              "end = 0x1123F\n\n"
+              "[[function]]\n"
+              "at = 0x1123F\n"
+              "end = 0x11246\n\n"
+              "[[function]]\n"
+              "at = 0x11246\n"
+              "end = 0x1124C\n\n"
+              "[[function]]\n"
+              "at = 0x1124C\n"
+              "end = 0x11253\n\n"
+              "[[function]]\n"
+              "at = 0x11253\n"
+              "end = 0x11259\n";
+    config << "\n[[function]]\nat = 0x11259\nend = 0x11262\n"
+              "\n[[function]]\nat = 0x11262\nend = 0x1126B\n"
+              "\n[[function]]\nat = 0x1126B\nend = 0x11270\n"
+              "\n[[function]]\nat = 0x11270\nend = 0x11279\n"
+              "\n[[function]]\nat = 0x11279\nend = 0x1127E\n";
     return bool(config);
 }
 

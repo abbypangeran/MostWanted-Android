@@ -1,4 +1,5 @@
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -16,6 +17,7 @@
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
+#include "kernel/thread_memory.h"
 #include "x86_recomp_shared.h"
 
 namespace kernel {
@@ -809,8 +811,8 @@ void CheckCmpTests(uint32_t destination) {
     };
     check_fault_unchanged(0, 0x24000, 0x24000, 0x11068, mem::AccessStatus::kUncommitted,
                           "CMP uncommitted read preserves all registers and arithmetic flags", sub_00011068);
-    check_fault_unchanged(0, 0x21FFF, 0x21FFF, 0x11068, mem::AccessStatus::kUncommitted,
-                          "CMP cross-page read reports starting guest address and fault PC", sub_00011068);
+    check_fault_unchanged(0, 0x21FFF, 0x22000, 0x11068, mem::AccessStatus::kUncommitted,
+                          "CMP cross-page read reports first uncommitted byte and fault PC", sub_00011068);
     Check(mem::Commit(0x40000, mem::kPage) && mem::Protect(0x40000, mem::kPage, mem::kWrite) == mem::AccessStatus::kOk,
           "CMP denied-read fixture page becomes write-only");
     check_fault_unchanged(0, 0x40000, 0x40000, 0x11068, mem::AccessStatus::kPermissionDenied,
@@ -1081,7 +1083,7 @@ void CheckIndirectCallTests() {
 
     reject_target(0, "null", "checked indirect CALL rejects null target before stack mutation");
     reject_target(0x11001, "unmapped", "checked indirect CALL rejects generated-code gap before stack mutation");
-    reject_target(0x11200, "unknown", "checked indirect CALL rejects unknown target before stack mutation");
+    reject_target(0x13000, "unknown", "checked indirect CALL rejects unknown target before stack mutation");
     reject_target(dispatch::KernelThunkAddress(255), "kernel", "checked indirect CALL rejects kernel export thunk");
     reject_target(dispatch::HostThunk(sub_000111B2), "host", "checked indirect CALL rejects registered host thunk");
 
@@ -1175,7 +1177,7 @@ void CheckIndirectCallTests() {
     ctx = X86Context{};
     ctx.esp = 0x86002;
     Check(ThrowsMemoryFault(sub_0001119E, ctx) && last_fault.instruction == 0x1119E &&
-              last_fault.address == stack_prefix && last_fault.status == mem::AccessStatus::kUncommitted &&
+              last_fault.address == 0x86000 && last_fault.status == mem::AccessStatus::kUncommitted &&
               last_fault.write && ctx.esp == 0x86002 &&
               mem::Read(stack_prefix, &sentinel, sizeof(prefix)) == mem::AccessStatus::kOk && sentinel == prefix,
           "indirect CALL cross-page stack fault writes no partial return address");
@@ -1207,7 +1209,7 @@ void CheckIndirectCallTests() {
     ctx.esp = top;
     const X86Context before_cross_page_fault = ctx;
     Check(ThrowsMemoryFault(sub_000111C7, ctx) && last_fault.instruction == 0x111C7 &&
-              last_fault.address == cross_page_slot && last_fault.status == mem::AccessStatus::kUncommitted &&
+              last_fault.address == 0x16000 && last_fault.status == mem::AccessStatus::kUncommitted &&
               !last_fault.write && SameCoreState(ctx, before_cross_page_fault),
           "indirect CALL cross-page source fault reports full read span and preserves state");
     Check(mem::Commit(0x16000, mem::kPage), "indirect CALL cross-page source tail recommits");
@@ -1426,6 +1428,27 @@ void CheckKernel255AbiAndPreparationTests() {
               kernel::IsPointerBoundForTest(prepared_thread->ethread, prepared_thread.get()) &&
               kernel::Threads().empty() && kernel::ThreadWorkerLaunchCountForTest() == workers_before,
           "ordinal-255 test service prepares and publishes a thread without activating a host worker or guest callback");
+    X86Context prepared_context{};
+    const uint32_t prepared_stack_low = prepared_thread ? prepared_thread->stack_top - prepared_thread->stack_size : 0;
+    const bool prepared_context_ready =
+        prepared_thread && kernel::InitializePreparedThreadContextForTest(prepared_thread, prepared_context);
+    Check(prepared_context_ready &&
+              prepared_thread->state.load() == kernel::ThreadState::kPrepared &&
+              prepared_context.fs_base == prepared_thread->kpcr &&
+              prepared_context.esp == ((prepared_thread->tls & ~15u) - 16) &&
+              prepared_context.esp >= prepared_stack_low && prepared_context.esp < prepared_thread->stack_top &&
+              prepared_context.fcw == 0x27F && prepared_context.mxcsr == 0x1F80 &&
+              kernel::Threads().empty() && kernel::ThreadWorkerLaunchCountForTest() == workers_before,
+          "production context initialization binds KPCR FS base and bounded TLS stack without starting a thread");
+    Check(prepared_context_ready && Runs(sub_0001123F, prepared_context) &&
+              prepared_context.eax == prepared_thread->ethread,
+          "production-prepared FS base reads KPCR current ETHREAD through generated code");
+    if (prepared_context_ready) prepared_context.eax = prepared_thread->ethread - prepared_thread->kpcr;
+    prepared_context.ecx = 0;
+    Check(prepared_context_ready && Runs(sub_00011246, prepared_context) &&
+              prepared_context.eax == prepared_thread->tls,
+          "production-prepared context reaches ETHREAD TLS through generated FS base/index addressing");
+    if (prepared_thread) prepared_thread->ctx = nullptr;
     auto duplicate_output = prepared_thread;
     const uint32_t duplicate_status = kernel::PrepareSystemThreadEx(
         output, 0x10000, 0x20, output + 4, args[5], args[6], false, args[9], duplicate_output);
@@ -1594,6 +1617,382 @@ void CheckPostCallInstructionTests() {
           "checked POP EDI read fault preserves EDI, ESI, ESP, and flags");
 }
 
+void CheckNotRepAndFsTests() {
+    X86Context ctx{};
+    ctx.eax = 0xA1B2C3A5;
+    SeedFlags(ctx);
+    const SubFlags flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(Runs(sub_00011210, ctx) && ctx.eax == 0xA1B2C35A && MatchesFlags(ctx, flags),
+          "checked generated NOT AL flips only AL and preserves every flag");
+
+    const struct {
+        X86Func* function;
+        uint32_t pc;
+        const char* name;
+    } not_traps[] = {{sub_00011213, 0x11213, "NOT EAX"}, {sub_00011216, 0x11216, "NOT BL"},
+                     {sub_00011219, 0x11219, "NOT AH"}, {sub_0001121C, 0x1121C, "NOT memory"}};
+    for (const auto& test : not_traps) {
+        ctx = X86Context{};
+        ctx.eax = 0x12345678;
+        ctx.ebx = 0x87654321;
+        SeedFlags(ctx);
+        const X86Context before = ctx;
+        Check(ThrowsTrap(test.function, ctx) && last_trap_pc == test.pc && SameCoreState(ctx, before), test.name);
+    }
+
+    const struct {
+        X86Func* function;
+        uint32_t pc;
+        const char* name;
+    } extend_traps[] = {{sub_00011262, 0x11262, "MOVZX GS memory"},
+                        {sub_0001126B, 0x1126B, "16-bit-address MOVZX memory"},
+                        {sub_00011270, 0x11270, "MOVSX GS memory"},
+                        {sub_00011279, 0x11279, "16-bit-address MOVSX memory"}};
+    for (const auto& test : extend_traps) {
+        ctx = X86Context{};
+        ctx.fs_base = 0xA3000;
+        ctx.eax = 0x12345678;
+        SeedFlags(ctx);
+        const X86Context before = ctx;
+        Check(ThrowsTrap(test.function, ctx) && last_trap_pc == test.pc && SameCoreState(ctx, before), test.name);
+    }
+
+    constexpr uint32_t source = 0x90000, destination = 0x91000;
+    Check(mem::Commit(source, 5 * mem::kPage) && mem::Commit(destination, 2 * mem::kPage),
+          "REP semantic fixture pages commit at 4 KB granularity");
+    const uint8_t input[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    Check(mem::Write(source, input, sizeof(input)) == mem::AccessStatus::kOk,
+          "REP MOVS source bytes initialize");
+    ctx = X86Context{};
+    ctx.esi = source;
+    ctx.edi = destination;
+    ctx.ecx = 4;
+    SeedFlags(ctx);
+    const SubFlags rep_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(Runs(sub_0001121F, ctx) && ctx.esi == source + 4 && ctx.edi == destination + 4 && ctx.ecx == 0 &&
+              MatchesFlags(ctx, rep_flags),
+          "REP MOVSB advances ESI, EDI, ECX and preserves flags");
+    uint8_t copied[8]{};
+    Check(mem::Read(destination, copied, sizeof(copied)) == mem::AccessStatus::kOk &&
+              std::equal(std::begin(input), std::begin(input) + 4, std::begin(copied)),
+          "REP MOVSB copies each byte through checked guest memory");
+
+    const uint32_t words[] = {0x12345678, 0xAABBCCDD};
+    Check(mem::Write(source, words, sizeof(words)) == mem::AccessStatus::kOk,
+          "REP MOVSD source dwords initialize");
+    ctx = X86Context{};
+    ctx.esi = source;
+    ctx.edi = destination;
+    ctx.ecx = 2;
+    SeedFlags(ctx);
+    const SubFlags movsd_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(Runs(sub_00011222, ctx) && ctx.esi == source + sizeof(words) &&
+              ctx.edi == destination + sizeof(words) && ctx.ecx == 0 && MatchesFlags(ctx, movsd_flags),
+          "REP MOVSD advances full-width indices and count");
+    uint32_t copied_words[2]{};
+    Check(mem::Read(destination, copied_words, sizeof(copied_words)) == mem::AccessStatus::kOk &&
+              std::equal(std::begin(words), std::end(words), std::begin(copied_words)),
+          "REP MOVSD copies full dwords across the checked helper");
+
+    ctx = X86Context{};
+    ctx.eax = 0x123456AA;
+    ctx.edi = destination;
+    ctx.ecx = 4;
+    SeedFlags(ctx);
+    const SubFlags stosb_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(Runs(sub_00011225, ctx) && ctx.edi == destination + 4 && ctx.ecx == 0 &&
+              MatchesFlags(ctx, stosb_flags),
+          "REP STOSB advances EDI and ECX without changing flags");
+    std::fill(std::begin(copied), std::begin(copied) + 4, uint8_t(0xAA));
+    Check(mem::Read(destination, copied, 4) == mem::AccessStatus::kOk &&
+              std::all_of(std::begin(copied), std::begin(copied) + 4, [](uint8_t value) { return value == 0xAA; }),
+          "REP STOSB writes AL only");
+
+    ctx = X86Context{};
+    ctx.eax = 0xAABBCCDD;
+    ctx.edi = destination;
+    ctx.ecx = 2;
+    SeedFlags(ctx);
+    const SubFlags stosd_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(Runs(sub_00011228, ctx) && ctx.edi == destination + 8 && ctx.ecx == 0 &&
+              mem::Read(destination, copied_words, sizeof(copied_words)) == mem::AccessStatus::kOk &&
+              copied_words[0] == 0xAABBCCDD && copied_words[1] == 0xAABBCCDD && MatchesFlags(ctx, stosd_flags),
+          "REP STOSD writes EAX dwords, updates count and destination, and preserves flags");
+
+    Check(mem::Commit(0xAD000, mem::kPage), "backward REP STOSD destination page commits");
+    ctx = X86Context{};
+    ctx.eax = 0x55667788;
+    ctx.edi = 0xAD008;
+    ctx.ecx = 3;
+    ctx.df = 1;
+    Check(Runs(sub_00011228, ctx) && ctx.edi == 0xACFFC && ctx.ecx == 0 &&
+              mem::Read(0xAD000, copied_words, sizeof(copied_words)) == mem::AccessStatus::kOk &&
+              copied_words[0] == 0x55667788 && copied_words[1] == 0x55667788,
+          "backward REP STOSD follows DF and writes each descending dword");
+
+    const uint8_t overlap[] = {1, 2, 3, 4, 5};
+    Check(mem::Write(0x92000, overlap, sizeof(overlap)) == mem::AccessStatus::kOk,
+          "overlapping REP MOVSB fixture initializes");
+    ctx = X86Context{};
+    ctx.esi = 0x92000;
+    ctx.edi = 0x92001;
+    ctx.ecx = 4;
+    Check(Runs(sub_0001121F, ctx) && ctx.esi == 0x92004 && ctx.edi == 0x92005 && ctx.ecx == 0 &&
+              mem::Read(0x92000, copied, 5) == mem::AccessStatus::kOk &&
+              std::all_of(std::begin(copied), std::begin(copied) + 5,
+                          [](uint8_t value) { return value == 1; }),
+          "overlapping forward REP MOVSB preserves sequential string-instruction semantics");
+
+    const uint8_t backward_overlap[] = {1, 2, 3, 4, 5};
+    Check(mem::Write(0x92000, backward_overlap, sizeof(backward_overlap)) == mem::AccessStatus::kOk,
+          "backward overlapping REP MOVSB fixture initializes");
+    ctx = X86Context{};
+    ctx.esi = 0x92004;
+    ctx.edi = 0x92003;
+    ctx.ecx = 4;
+    ctx.df = 1;
+    Check(Runs(sub_0001121F, ctx) && ctx.esi == 0x92000 && ctx.edi == 0x91FFF && ctx.ecx == 0 &&
+              mem::Read(0x92000, copied, 5) == mem::AccessStatus::kOk &&
+              std::all_of(std::begin(copied), std::begin(copied) + 5,
+                          [](uint8_t value) { return value == 5; }),
+          "overlapping backward REP MOVSB follows per-iteration DF semantics");
+
+    const uint8_t backward[] = {9, 8, 7};
+    Check(mem::Write(0x93000, backward, sizeof(backward)) == mem::AccessStatus::kOk,
+          "backward REP MOVSB source initializes");
+    ctx = X86Context{};
+    ctx.esi = 0x93002;
+    ctx.edi = 0x94002;
+    ctx.ecx = 3;
+    ctx.df = 1;
+    Check(Runs(sub_0001121F, ctx) && ctx.esi == 0x92FFF && ctx.edi == 0x93FFF && ctx.ecx == 0 &&
+              mem::Read(0x94000, copied, 3) == mem::AccessStatus::kOk &&
+              std::equal(std::begin(backward), std::end(backward), std::begin(copied)),
+          "backward REP MOVSB follows DF and decrements indices");
+
+    ctx = X86Context{};
+    ctx.esi = UINT32_MAX;
+    ctx.edi = UINT32_MAX;
+    SeedFlags(ctx);
+    X86Context zero_count_after = ctx;
+    zero_count_after.esp += 4;
+    Check(Runs(sub_0001121F, ctx) && SameCoreState(ctx, zero_count_after),
+          "zero-count REP MOVSB touches no guest memory or index registers");
+
+    Check(mem::Commit(0x95000, 2 * mem::kPage) && mem::Commit(0x97000, mem::kPage),
+          "cross-page REP MOVSD fixture pages commit independently");
+    const uint32_t crossing_value = 0xDEADBEEF;
+    Check(mem::Write(0x95FFE, &crossing_value, sizeof(crossing_value)) == mem::AccessStatus::kOk,
+          "REP MOVSD dword straddles two guest pages");
+    ctx = X86Context{};
+    ctx.esi = 0x95FFE;
+    ctx.edi = 0x97000;
+    ctx.ecx = 1;
+    Check(Runs(sub_00011222, ctx) && ctx.esi == 0x96002 && ctx.edi == 0x97004 && ctx.ecx == 0 &&
+              mem::Read(0x97000, copied_words, sizeof(uint32_t)) == mem::AccessStatus::kOk &&
+              copied_words[0] == crossing_value,
+          "REP MOVSD validates a full element across independent 4 KB guest pages");
+
+    Check(mem::Commit(0x98000, mem::kPage) && mem::Commit(0x9A000, mem::kPage) &&
+              mem::Write(0x98FFF, input, 1) == mem::AccessStatus::kOk,
+          "REP MOVSB source fault fixture commits only its first guest page");
+    ctx = X86Context{};
+    ctx.esi = 0x98FFF;
+    ctx.edi = 0x9A000;
+    ctx.ecx = 2;
+    SeedFlags(ctx);
+    const SubFlags source_fault_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(ThrowsMemoryFault(sub_0001121F, ctx) && last_fault.instruction == 0x1121F &&
+              last_fault.address == 0x99000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && ctx.esi == 0x99000 && ctx.edi == 0x9A001 && ctx.ecx == 1 &&
+              MatchesFlags(ctx, source_fault_flags),
+          "REP MOVSB source fault reports next page and preserves one completed iteration");
+
+    Check(mem::Commit(0x9B000, mem::kPage) && mem::Commit(0x9C000, 2 * mem::kPage) &&
+              mem::Write(0x9B000, input, 2) == mem::AccessStatus::kOk &&
+              mem::Protect(0x9D000, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
+          "REP MOVSB destination page becomes read-only after the first writable page");
+    ctx = X86Context{};
+    ctx.esi = 0x9B000;
+    ctx.edi = 0x9CFFF;
+    ctx.ecx = 2;
+    SeedFlags(ctx);
+    const SubFlags destination_fault_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(ThrowsMemoryFault(sub_0001121F, ctx) && last_fault.instruction == 0x1121F &&
+              last_fault.address == 0x9D000 && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              last_fault.write && ctx.esi == 0x9B001 && ctx.edi == 0x9D000 && ctx.ecx == 1 &&
+              MatchesFlags(ctx, destination_fault_flags),
+          "REP MOVSB destination protection fault keeps exact partial progress");
+    Check(mem::Protect(0x9D000, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "REP MOVSB destination protection restores");
+
+    Check(mem::Commit(0xB3000, 2 * mem::kPage) && mem::Commit(0xB5000, mem::kPage) &&
+              mem::Write(0xB3FFF, input, 1) == mem::AccessStatus::kOk &&
+              mem::Decommit(0xB4000, mem::kPage),
+          "REP MOVSB source tail decommits after the first readable page");
+    ctx = X86Context{};
+    ctx.esi = 0xB3FFF;
+    ctx.edi = 0xB5000;
+    ctx.ecx = 2;
+    SeedFlags(ctx);
+    const SubFlags decommit_fault_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(ThrowsMemoryFault(sub_0001121F, ctx) && last_fault.instruction == 0x1121F &&
+              last_fault.address == 0xB4000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && ctx.esi == 0xB4000 && ctx.edi == 0xB5001 && ctx.ecx == 1 &&
+              MatchesFlags(ctx, decommit_fault_flags),
+          "REP MOVSB decommit fault retains the single completed iteration");
+
+    Check(mem::Commit(0xA1000, mem::kPage) && mem::Protect(0xA1000, mem::kPage, mem::kNoAccess) ==
+              mem::AccessStatus::kOk,
+          "REP STOSB destination protection fault fixture becomes inaccessible");
+    ctx = X86Context{};
+    ctx.edi = 0xA1000;
+    ctx.ecx = 1;
+    SeedFlags(ctx);
+    const X86Context before_stos_fault = ctx;
+    Check(ThrowsMemoryFault(sub_00011225, ctx) && last_fault.instruction == 0x11225 &&
+              last_fault.address == 0xA1000 && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              last_fault.write && SameCoreState(ctx, before_stos_fault),
+          "REP STOSB protection fault changes neither EDI, ECX, nor flags");
+    Check(mem::Protect(0xA1000, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "REP STOSB destination protection restores");
+
+    Check(mem::Commit(0xAB000, mem::kPage), "REP STOSD partial-fault destination page commits");
+    ctx = X86Context{};
+    ctx.eax = 0xCAFEBABE;
+    ctx.edi = 0xABFF8;
+    ctx.ecx = 3;
+    SeedFlags(ctx);
+    const SubFlags stosd_fault_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(ThrowsMemoryFault(sub_00011228, ctx) && last_fault.instruction == 0x11228 &&
+              last_fault.address == 0xAC000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              last_fault.write && ctx.eax == 0xCAFEBABE && ctx.edi == 0xAC000 && ctx.ecx == 1 &&
+              MatchesFlags(ctx, stosd_fault_flags) &&
+              mem::Read(0xABFF8, copied_words, sizeof(copied_words)) == mem::AccessStatus::kOk &&
+              copied_words[0] == 0xCAFEBABE && copied_words[1] == 0xCAFEBABE,
+          "REP STOSD write fault preserves two completed dwords and reports exact next-page progress");
+
+    Check(mem::Commit(0xA2000, mem::kPage) && mem::Write(0xA2000, input, 2) == mem::AccessStatus::kOk,
+          "REP wrap fixture destination and source bytes initialize");
+    Check(mem::Commit(0xFFFFF000, mem::kPage) && mem::Write(UINT32_MAX, input, 1) == mem::AccessStatus::kOk,
+          "REP byte source commits at final guest page");
+    ctx = X86Context{};
+    ctx.esi = UINT32_MAX;
+    ctx.edi = 0xA2000;
+    ctx.ecx = 2;
+    Check(ThrowsMemoryFault(sub_0001121F, ctx) && last_fault.instruction == 0x1121F &&
+              last_fault.address == 0 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && ctx.esi == 0 && ctx.edi == 0xA2001 && ctx.ecx == 1,
+          "REP MOVSB wraps 32-bit ESI and faults at zero after one completed iteration");
+
+    constexpr uint32_t kpcr = 0xA3000, ethread = 0xA4000, stack_top = 0xA7000, tls = 0xA6000;
+    Check(mem::Commit(kpcr, mem::kPage) && mem::Commit(ethread, mem::kPage) &&
+              kernel::InitializeThreadGuestMemory(kpcr, ethread, stack_top, mem::kPage, tls, 0x1234) ==
+                  mem::AccessStatus::kOk,
+          "synthetic KPCR and ETHREAD thread memory initializes through production helper");
+    ctx = X86Context{};
+    ctx.fs_base = kpcr;
+    Check(Runs(sub_00011259, ctx) && ctx.eax == (ethread & 0xFFFF),
+          "generated FS-relative MOVZX retains the checked KPCR base");
+    ctx = X86Context{};
+    ctx.fs_base = kpcr;
+    Check(Runs(sub_0001123F, ctx) && ctx.eax == ethread,
+          "generated FS absolute lookup reads KPCR ETHREAD pointer");
+    ctx.eax = ethread - kpcr;
+    ctx.ecx = 0;
+    Check(Runs(sub_00011246, ctx) && ctx.eax == tls,
+          "generated FS base plus 32-bit base/index lookup reaches ETHREAD TLS");
+    ctx = X86Context{};
+    ctx.fs_base = kpcr;
+    SeedFlags(ctx);
+    const X86Context before_fs_fault = ctx;
+    Check(mem::Protect(kpcr, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk &&
+              ThrowsMemoryFault(sub_0001123F, ctx) && last_fault.instruction == 0x1123F &&
+              last_fault.address == kpcr + 0x28 && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              !last_fault.write && SameCoreState(ctx, before_fs_fault),
+          "generated FS fault reports checked KPCR address and preserves guest state");
+    Check(mem::Protect(kpcr, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "synthetic KPCR page protection restores");
+
+    const struct {
+        X86Func* function;
+        uint32_t pc;
+    } unsupported[] = {{sub_0001122B, 0x1122B}, {sub_0001122D, 0x1122D}, {sub_00011230, 0x11230},
+                       {sub_00011234, 0x11234}, {sub_00011238, 0x11238}, {sub_0001123C, 0x1123C},
+                       {sub_0001124C, 0x1124C}, {sub_00011253, 0x11253}};
+    for (const auto& test : unsupported) {
+        ctx = X86Context{};
+        SeedFlags(ctx);
+        const X86Context before = ctx;
+        Check(ThrowsTrap(test.function, ctx) && last_trap_pc == test.pc && SameCoreState(ctx, before),
+              "unsupported REP prefix or FS/GS operand form remains trapped");
+    }
+}
+
+void CheckProtectionExportFailClosedTests() {
+    constexpr uint32_t stack = 0xA8000, page = 0xA9000, output = 0xAA000;
+    Check(mem::Commit(stack, mem::kPage) && mem::Commit(page, mem::kPage) && mem::Commit(output, mem::kPage),
+          "protection-export fixture stack, target, and output pages commit");
+    struct Invocation {
+        bool registered;
+        bool trapped;
+        uint32_t trap_pc;
+        X86Context context;
+    };
+    auto invoke = [&](uint32_t ordinal, const std::array<uint32_t, 4>& args, uint32_t count) {
+        std::array<uint32_t, 5> frame{};
+        frame[0] = 0x12345678;
+        std::copy_n(args.begin(), count, frame.begin() + 1);
+        Check(mem::Write(stack, frame.data(), (count + 1) * sizeof(uint32_t)) == mem::AccessStatus::kOk,
+              "protection-export stdcall frame initializes");
+        X86Context ctx{};
+        ctx.esp = stack;
+        const bool registered = kernel::HasExport(ordinal);
+        traps = 0;
+        last_trap_pc = 0;
+        if (registered) {
+            try {
+                x86_kernel(ctx, nullptr, ordinal);
+            } catch (const FixtureStop&) {
+            }
+        }
+        return Invocation{registered, traps == 1, last_trap_pc, ctx};
+    };
+    const auto query = invoke(179, {UINT32_MAX, 0, 0, 0}, 1);
+    Check(query.registered && query.trapped && query.trap_pc == 0x12345678 && query.context.esp == stack,
+          "MmQueryAddressProtect traps before interpreting its unverified protection contract");
+    uint32_t marker = 0xAABBCCDD;
+    Check(mem::Write(page, &marker, sizeof(marker)) == mem::AccessStatus::kOk,
+          "protection-export target page sentinel initializes");
+    const auto set = invoke(182, {page, mem::kPage, 2, 0}, 3);
+    uint32_t marker_after = 0;
+    Check(set.registered && set.trapped && set.trap_pc == 0x12345678 && set.context.esp == stack &&
+              mem::Read(page, &marker_after, sizeof(marker_after)) == mem::AccessStatus::kOk &&
+              marker_after == marker && mem::CheckAccess(page, sizeof(marker), mem::kWrite) == mem::AccessStatus::kOk,
+          "MmSetAddressProtect traps without mutating the target page");
+    const uint32_t old_protect_sentinel = 0x87654321;
+    Check(mem::Write(output, &old_protect_sentinel, sizeof(old_protect_sentinel)) == mem::AccessStatus::kOk,
+          "NtProtectVirtualMemory old-protection output sentinel initializes");
+    const auto nt = invoke(204, {UINT32_MAX, UINT32_MAX, 0x40, output}, 4);
+    uint32_t old_protect_after = 0;
+    Check(nt.registered && nt.trapped && nt.trap_pc == 0x12345678 && nt.context.esp == stack &&
+              mem::Read(output, &old_protect_after, sizeof(old_protect_after)) == mem::AccessStatus::kOk &&
+              old_protect_after == old_protect_sentinel,
+          "NtProtectVirtualMemory traps without dereferencing arguments or publishing old protection");
+    Check(mem::Decommit(stack, mem::kPage), "protection-export fixture stack decommits");
+    X86Context invalid_stack{};
+    invalid_stack.esp = stack;
+    bool checked_stack_fault = false;
+    try {
+        x86_kernel(invalid_stack, nullptr, 179);
+    } catch (const X86MemoryFault& fault) {
+        checked_stack_fault = fault.instruction == 0 && fault.address == stack && !fault.write &&
+                              fault.status == mem::AccessStatus::kUncommitted;
+    }
+    Check(checked_stack_fault && invalid_stack.esp == stack,
+          "unverified protection export uses a checked return-address read before trapping");
+}
+
 void CheckDispatchLeaseTests() {
     std::barrier lease_started(2), release_lease(2);
     std::atomic<bool> resolved{false}, reset_started{false}, reset_finished{false};
@@ -1659,7 +2058,7 @@ void CheckEntryChainTests() {
     SeedFlags(ctx);
     const X86Context before_pop_cross_fault = ctx;
     Check(ThrowsMemoryFault(sub_00011154, ctx) && last_fault.instruction == 0x11154 &&
-              last_fault.address == ctx.esp && last_fault.status == mem::AccessStatus::kUncommitted &&
+              last_fault.address == pop_cross + mem::kPage && last_fault.status == mem::AccessStatus::kUncommitted &&
               !last_fault.write && SameCoreState(ctx, before_pop_cross_fault),
           "POP cross-page read fault validates full dword before changing guest state");
 
@@ -2191,7 +2590,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     ctx.edi = 0x30FFE;
     ctx.esi = source;
     Check(ThrowsMemoryFault(sub_00011000, ctx) && last_fault.instruction == 0x11002 &&
-              last_fault.address == 0x30FFE && last_fault.status == mem::AccessStatus::kUncommitted && last_fault.write,
+              last_fault.address == 0x31000 && last_fault.status == mem::AccessStatus::kUncommitted && last_fault.write,
           "generated cross-page store rejects uncommitted tail at the store PC");
     uint16_t prefix_after = 0;
     Check(mem::Read(0x30FFE, &prefix_after, sizeof(prefix_after)) == mem::AccessStatus::kOk && prefix_after == prefix,
@@ -2253,6 +2652,8 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckIndirectCallTests();
     CheckKernel255AbiAndPreparationTests();
     CheckPostCallInstructionTests();
+    CheckNotRepAndFsTests();
+    CheckProtectionExportFailClosedTests();
     CheckDispatchLeaseTests();
 
     ctx = X86Context{};
@@ -2269,9 +2670,8 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     Check(ThrowsTrap(sub_00011037, ctx) && last_trap_pc == 0x11037 &&
               last_trap_reason.find("unimplemented:") != std::string::npos,
           "locked XADD remains blocked in checked mode");
-    Check(ThrowsTrap(sub_0001103C, ctx) && last_trap_pc == 0x1103C &&
-              last_trap_reason.find("unimplemented:") != std::string::npos,
-          "REP MOVSD remains blocked in checked mode");
+    Check(Runs(sub_0001103C, ctx) && ctx.ecx == 0 && ctx.esp == 4,
+          "checked REP MOVSD zero-count fixture completes without guest memory access");
 
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE_CLI
     RunReleaseBenchmarks(source, destination);

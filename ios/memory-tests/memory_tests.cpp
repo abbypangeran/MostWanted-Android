@@ -118,6 +118,27 @@ extern "C" int RunMemoryTests() {
               mem::Read(mem::kContiguousBase + physical_offset, &alias_byte, 1) == mem::AccessStatus::kOk &&
               alias_byte == physical_byte,
           "writes through either physical alias remain coherent");
+    uint8_t crossing_alias[2]{};
+    uint32_t first_invalid = 0;
+    Check(mem::ReadWithFault(mem::kContiguousBase + mem::kPhysicalSize - 1, crossing_alias,
+                             sizeof(crossing_alias), &first_invalid) == mem::AccessStatus::kInvalidAddress &&
+              first_invalid == mem::kContiguousBase + mem::kPhysicalSize,
+          "crossing contiguous alias end reports first invalid guest byte");
+    first_invalid = 0;
+    Check(mem::ReadWithFault(mem::kWriteCombineBase + mem::kPhysicalSize - 1, crossing_alias,
+                             sizeof(crossing_alias), &first_invalid) == mem::AccessStatus::kInvalidAddress &&
+              first_invalid == mem::kWriteCombineBase + mem::kPhysicalSize,
+          "crossing write-combined alias end reports first invalid guest byte");
+    first_invalid = 0;
+    Check(mem::ReadWithFault(mem::kContiguousBase - 1, crossing_alias, sizeof(crossing_alias), &first_invalid) ==
+                  mem::AccessStatus::kInvalidAddress &&
+              first_invalid == mem::kContiguousBase,
+          "crossing into contiguous alias reports first invalid guest byte");
+    first_invalid = 0;
+    Check(mem::ReadWithFault(mem::kWriteCombineBase - 1, crossing_alias, sizeof(crossing_alias), &first_invalid) ==
+                  mem::AccessStatus::kInvalidAddress &&
+              first_invalid == mem::kWriteCombineBase,
+          "crossing into write-combined alias reports first invalid guest byte");
     std::array<uint8_t, 2 * mem::kPage + 64> alias_source{}, alias_result{};
     for (size_t i = 0; i < alias_source.size(); ++i) alias_source[i] = uint8_t(i);
     Check(mem::Write(mem::kContiguousBase + physical_offset, alias_source.data(), alias_source.size()) ==
@@ -169,8 +190,11 @@ extern "C" int RunMemoryTests() {
     uint16_t crossing_prefix_before = 0, crossing_prefix_after = 0;
     Check(mem::Read(crossing_va, &crossing_prefix_before, sizeof(crossing_prefix_before)) == mem::AccessStatus::kOk,
           "cross-page prefix can be sampled before write");
-    Check(mem::Write(crossing_va, &crossing, sizeof(crossing)) == mem::AccessStatus::kPermissionDenied,
-          "cross-page write checks permissions on every guest page");
+    uint32_t first_denied_write = 0;
+    Check(mem::WriteWithFault(crossing_va, &crossing, sizeof(crossing), &first_denied_write) ==
+                  mem::AccessStatus::kPermissionDenied &&
+              first_denied_write == guest_va + mem::kPage,
+          "cross-page write reports the first protected guest byte at 4 KB granularity");
     Check(mem::Read(crossing_va, &crossing_prefix_after, sizeof(crossing_prefix_after)) == mem::AccessStatus::kOk &&
               crossing_prefix_after == crossing_prefix_before,
           "rejected cross-page write leaves its first page unchanged");

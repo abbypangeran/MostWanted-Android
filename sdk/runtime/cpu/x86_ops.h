@@ -83,18 +83,53 @@ template <class T>
 T x86_mem_read(uint32_t instruction, uint32_t address) {
     static_assert(std::is_trivially_copyable_v<T>);
     T value{};
-    const auto status = mem::Read(address, &value, sizeof(value));
+    uint32_t fault_address = address;
+    const auto status = mem::ReadWithFault(address, &value, sizeof(value), &fault_address);
     if (status != mem::AccessStatus::kOk)
-        throw X86MemoryFault{instruction, address, status, false};
+        throw X86MemoryFault{instruction, fault_address, status, false};
     return value;
 }
 
 template <class T>
 void x86_mem_write(uint32_t instruction, uint32_t address, T value) {
     static_assert(std::is_trivially_copyable_v<T>);
-    const auto status = mem::Write(address, &value, sizeof(value));
+    uint32_t fault_address = address;
+    const auto status = mem::WriteWithFault(address, &value, sizeof(value), &fault_address);
     if (status != mem::AccessStatus::kOk)
-        throw X86MemoryFault{instruction, address, status, true};
+        throw X86MemoryFault{instruction, fault_address, status, true};
+}
+
+template <class T>
+void x86_rep_movs_checked(X86Context& ctx, uint32_t instruction) {
+    while (ctx.ecx) {
+        const uint32_t source = ctx.esi, destination = ctx.edi;
+        T value{};
+        mem::ScopedLock lock;
+        uint32_t fault_address = source;
+        auto status = mem::ReadWithFault(source, &value, sizeof(value), &fault_address);
+        if (status != mem::AccessStatus::kOk) throw X86MemoryFault{instruction, fault_address, status, false};
+        fault_address = destination;
+        status = mem::WriteWithFault(destination, &value, sizeof(value), &fault_address);
+        if (status != mem::AccessStatus::kOk) throw X86MemoryFault{instruction, fault_address, status, true};
+        const uint32_t step = ctx.df ? 0u - uint32_t(sizeof(T)) : uint32_t(sizeof(T));
+        ctx.esi += step;
+        ctx.edi += step;
+        --ctx.ecx;
+    }
+}
+
+template <class T>
+void x86_rep_stos_checked(X86Context& ctx, uint32_t instruction) {
+    const T value = static_cast<T>(ctx.eax);
+    while (ctx.ecx) {
+        const uint32_t destination = ctx.edi;
+        mem::ScopedLock lock;
+        uint32_t fault_address = destination;
+        const auto status = mem::WriteWithFault(destination, &value, sizeof(value), &fault_address);
+        if (status != mem::AccessStatus::kOk) throw X86MemoryFault{instruction, fault_address, status, true};
+        ctx.edi += ctx.df ? 0u - uint32_t(sizeof(T)) : uint32_t(sizeof(T));
+        --ctx.ecx;
+    }
 }
 
 inline void x87_push(X86Context& ctx, double v) {

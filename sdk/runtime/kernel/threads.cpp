@@ -435,6 +435,11 @@ bool StartThread(ThreadRef t) {
 #ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
 void SetThreadPreparationFailureForTest(ThreadPreparationFailPoint point) { g_thread_fail_point = point; }
 uint32_t ThreadWorkerLaunchCountForTest() { return g_worker_launch_count.load(); }
+bool InitializePreparedThreadContextForTest(const ThreadRef& thread, X86Context& context) {
+    if (!thread || thread->state.load() != ThreadState::kPrepared) return false;
+    InitContext(*thread, context);
+    return true;
+}
 #endif
 
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn) {

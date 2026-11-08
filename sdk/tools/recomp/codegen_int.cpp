@@ -593,6 +593,11 @@ bool CodeGen::EmitString(uint32_t va, const ZydisDecodedInstruction& in, const Z
                              "zf = r == 0; sf = (uint32_t)(r >> %u) & 1; pf = X86_PARITY(r);",
                              T.c_str(), T.c_str(), w * 8 - 1, w * 8 - 1);
     std::string s;
+    if (an_.cfg.checked_memory) {
+        const char* helper = !std::strcmp(kind, "movs") ? "x86_rep_movs_checked" : "x86_rep_stos_checked";
+        Line(F("\t{ X86_SAVE_FLAGS(); %s<%s>(ctx, 0x%Xu); }", helper, CType(w * 8).c_str(), va));
+        return true;
+    }
     if (!std::strcmp(kind, "movs")) {
         if (rep) s = F("x86_rep_movs(ctx, base, %u);", w);
         else s = F("%s %s(ctx.edi) = %s(ctx.esi); ctx.esi += d; ctx.edi += d;", step.c_str(), M.c_str(), M.c_str());

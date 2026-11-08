@@ -71,6 +71,7 @@ if(MOSTWANTED_CHECKED_FIXTURE_DIR)
     target_sources(mostwanted_memory_tests PRIVATE
         recompiler-fixtures/fixture_runner.cpp
         ../sdk/runtime/cpu/dispatch.cpp
+        ../sdk/runtime/kernel/memory_protection.cpp
         ../sdk/runtime/kernel/objects.cpp
         ../sdk/runtime/kernel/ordinals.cpp
         ../sdk/runtime/kernel/threads.cpp

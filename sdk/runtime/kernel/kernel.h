@@ -269,6 +269,7 @@ bool StartThread(ThreadRef t);
 enum class ThreadPreparationFailPoint : uint8_t { kNone, kAfterStack, kAfterKpcr, kAfterEthread, kBeforePublish };
 void SetThreadPreparationFailureForTest(ThreadPreparationFailPoint point);
 uint32_t ThreadWorkerLaunchCountForTest();
+bool InitializePreparedThreadContextForTest(const ThreadRef& thread, X86Context& context);
 #endif
 [[noreturn]] void ExitThread(uint32_t code);
 void Resume(Thread& t);

@@ -197,7 +197,7 @@ int main() {
         "checked guest read fault at 0001114D for 00024000: uncommitted");
     bool call_missing_target = AbortsWithDiagnostic(
         Scenario::kCallMissingTarget,
-        "checked recompiler blocked instruction at 0001113F: unimplemented: call 0x00011200");
+        "checked recompiler blocked instruction at 0001113F: unimplemented: call 0x00013000");
     bool invalid_continuation = AbortsWithDiagnostic(Scenario::kInvalidContinuation,
                                                      "guest trap at 00011136: stale or invalid continuation");
     bool descriptor_overflow = AbortsWithDiagnostic(Scenario::kStringDescriptorOverflow,

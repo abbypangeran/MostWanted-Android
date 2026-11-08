@@ -328,19 +328,39 @@ bool IsCommitted(uint32_t va) {
     return g_base && !g_poisoned && (InPhysical(va) || g_committed[va >> 12] != 0);
 }
 
-static AccessStatus CheckAccessLocked(uint32_t va, std::size_t size, uint8_t permissions) {
+static AccessStatus CheckAccessLocked(uint32_t va, std::size_t size, uint8_t permissions,
+                                      uint32_t* fault_address = nullptr) {
+    if (fault_address) *fault_address = va;
     if (!g_base) return AccessStatus::kNotInitialized;
     if (g_poisoned) return AccessStatus::kHostError;
     if (!size) return AccessStatus::kOk;
     if (size > (1ull << 32) - va) return AccessStatus::kInvalidAddress;
     const uint64_t end = uint64_t(va) + size;
     if (OverlapsPhysical(va, end)) {
-        if (!IsPhysicalRange(va, end)) return AccessStatus::kInvalidAddress;
+        if (!IsPhysicalRange(va, end)) {
+            if (fault_address) {
+                if (InPhysical(va))
+                    *fault_address = va >= kWriteCombineBase ? kWriteCombineBase + kPhysicalSize
+                                                             : kContiguousBase + kPhysicalSize;
+                else if (va < kContiguousBase && end > kContiguousBase)
+                    *fault_address = kContiguousBase;
+                else if (va < kWriteCombineBase && end > kWriteCombineBase)
+                    *fault_address = kWriteCombineBase;
+            }
+            return AccessStatus::kInvalidAddress;
+        }
         return permissions & kExecute ? AccessStatus::kPermissionDenied : AccessStatus::kOk;
     }
     for (uint64_t p = va >> 12; p <= (end - 1) >> 12; ++p) {
-        if (!g_committed[size_t(p)]) return AccessStatus::kUncommitted;
-        if ((g_permissions[size_t(p)] & permissions) != permissions) return AccessStatus::kPermissionDenied;
+        const uint32_t page_address = uint32_t(p << 12);
+        if (!g_committed[size_t(p)]) {
+            if (fault_address) *fault_address = std::max(va, page_address);
+            return AccessStatus::kUncommitted;
+        }
+        if ((g_permissions[size_t(p)] & permissions) != permissions) {
+            if (fault_address) *fault_address = std::max(va, page_address);
+            return AccessStatus::kPermissionDenied;
+        }
     }
     return AccessStatus::kOk;
 }
@@ -435,17 +455,27 @@ AccessStatus Protect(uint32_t va, uint32_t size, uint8_t permissions) {
 }
 
 AccessStatus Read(uint32_t va, void* destination, std::size_t size) {
+    return ReadWithFault(va, destination, size, nullptr);
+}
+
+AccessStatus ReadWithFault(uint32_t va, void* destination, std::size_t size, uint32_t* fault_address) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (fault_address) *fault_address = va;
     if (size && !destination) return AccessStatus::kInvalidAddress;
-    AccessStatus status = CheckAccessLocked(va, size, kRead);
+    AccessStatus status = CheckAccessLocked(va, size, kRead, fault_address);
     if (status == AccessStatus::kOk && size) std::memcpy(destination, g_base + va, size);
     return status;
 }
 
 AccessStatus Write(uint32_t va, const void* source, std::size_t size) {
+    return WriteWithFault(va, source, size, nullptr);
+}
+
+AccessStatus WriteWithFault(uint32_t va, const void* source, std::size_t size, uint32_t* fault_address) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (fault_address) *fault_address = va;
     if (size && !source) return AccessStatus::kInvalidAddress;
-    AccessStatus status = CheckAccessLocked(va, size, kWrite);
+    AccessStatus status = CheckAccessLocked(va, size, kWrite, fault_address);
     if (status == AccessStatus::kOk && size) std::memcpy(g_base + va, source, size);
     return status;
 }
