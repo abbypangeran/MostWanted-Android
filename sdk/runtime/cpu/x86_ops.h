@@ -79,9 +79,19 @@ uint32_t x86_trace(X86Context& ctx, uint32_t va, uint32_t ret);  // ret 0 on ent
 uint64_t x86_rdtsc();
 void x86_cpuid(X86Context& ctx);
 
+// Phase 2C-15 test-only execution probe: observes every checked generated
+// access before it is performed.  The probe target defines this function; no
+// production build declares the macro.
+#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+void execution_probe_memory_access(uint32_t instruction, uint32_t address, std::size_t size, bool write);
+#endif
+
 template <class T>
 T x86_mem_read(uint32_t instruction, uint32_t address) {
     static_assert(std::is_trivially_copyable_v<T>);
+#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+    execution_probe_memory_access(instruction, address, sizeof(T), false);
+#endif
     T value{};
     uint32_t fault_address = address;
     const auto status = mem::ReadWithFault(address, &value, sizeof(value), &fault_address);
@@ -93,6 +103,9 @@ T x86_mem_read(uint32_t instruction, uint32_t address) {
 template <class T>
 void x86_mem_write(uint32_t instruction, uint32_t address, T value) {
     static_assert(std::is_trivially_copyable_v<T>);
+#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+    execution_probe_memory_access(instruction, address, sizeof(T), true);
+#endif
     uint32_t fault_address = address;
     const auto status = mem::WriteWithFault(address, &value, sizeof(value), &fault_address);
     if (status != mem::AccessStatus::kOk)
@@ -103,6 +116,10 @@ template <class T>
 void x86_rep_movs_checked(X86Context& ctx, uint32_t instruction) {
     while (ctx.ecx) {
         const uint32_t source = ctx.esi, destination = ctx.edi;
+#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+        execution_probe_memory_access(instruction, source, sizeof(T), false);
+        execution_probe_memory_access(instruction, destination, sizeof(T), true);
+#endif
         T value{};
         mem::ScopedLock lock;
         uint32_t fault_address = source;
@@ -123,6 +140,9 @@ void x86_rep_stos_checked(X86Context& ctx, uint32_t instruction) {
     const T value = static_cast<T>(ctx.eax);
     while (ctx.ecx) {
         const uint32_t destination = ctx.edi;
+#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+        execution_probe_memory_access(instruction, destination, sizeof(T), true);
+#endif
         mem::ScopedLock lock;
         uint32_t fault_address = destination;
         const auto status = mem::WriteWithFault(destination, &value, sizeof(value), &fault_address);

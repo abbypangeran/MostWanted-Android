@@ -45,6 +45,56 @@ add_custom_command(
 )
 add_custom_target(generate_checked_fixture DEPENDS ${GENERATED_SOURCE})
 
+# Phase 2C-15: a second synthetic image whose code occupies the audited startup
+# addresses and whose config instruments every reviewed instruction.
+add_executable(execution_probe_fixture_builder execution_probe_fixture_builder.cpp)
+set_property(TARGET execution_probe_fixture_builder PROPERTY CXX_STANDARD 20)
+target_include_directories(execution_probe_fixture_builder PRIVATE ${XBE_SDK}/runtime ${CMAKE_CURRENT_SOURCE_DIR})
+set(PROBE_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/probe_fixture)
+set(PROBE_FIXTURE_XBE ${PROBE_FIXTURE_DIR}/execution_probe_fixture.xbe)
+set(PROBE_FIXTURE_CONFIG ${PROBE_FIXTURE_DIR}/execution_probe_fixture.toml)
+add_custom_command(
+    OUTPUT ${PROBE_FIXTURE_XBE} ${PROBE_FIXTURE_CONFIG}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PROBE_FIXTURE_DIR}
+    COMMAND execution_probe_fixture_builder ${PROBE_FIXTURE_XBE} ${PROBE_FIXTURE_CONFIG}
+    DEPENDS execution_probe_fixture_builder
+    VERBATIM
+)
+set(PROBE_GENERATED_DIR ${PROBE_FIXTURE_DIR}/generated)
+set(PROBE_GENERATED_SOURCE ${PROBE_GENERATED_DIR}/x86_recomp.0.cpp)
+set(PROBE_GENERATED_MAPPING ${PROBE_GENERATED_DIR}/x86_func_mapping.cpp)
+add_custom_command(
+    OUTPUT ${PROBE_GENERATED_SOURCE} ${PROBE_GENERATED_DIR}/x86_recomp_shared.h ${PROBE_GENERATED_MAPPING}
+    COMMAND $<TARGET_FILE:xbe_recomp> ${PROBE_FIXTURE_CONFIG} ${PROBE_FIXTURE_XBE} ${PROBE_GENERATED_DIR}
+    DEPENDS xbe_recomp ${PROBE_FIXTURE_XBE} ${PROBE_FIXTURE_CONFIG}
+    VERBATIM
+)
+add_custom_target(generate_execution_probe_fixture DEPENDS ${PROBE_GENERATED_SOURCE})
+
+add_executable(execution_probe_tests
+    execution_probe.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
+    ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/crypto.cpp
+    ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
+    ${XBE_SDK}/runtime/xbe/image_loader.cpp
+    ${PROBE_GENERATED_SOURCE}
+    ${PROBE_GENERATED_MAPPING}
+)
+add_dependencies(execution_probe_tests generate_execution_probe_fixture)
+target_compile_features(execution_probe_tests PRIVATE cxx_std_20)
+target_include_directories(execution_probe_tests PRIVATE ${XBE_SDK}/runtime ${PROBE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(execution_probe_tests PRIVATE
+    MOSTWANTED_EXECUTION_PROBE_TESTS=1
+    EXECUTION_PROBE_FIXTURE_XBE="${PROBE_FIXTURE_XBE}"
+    EXECUTION_PROBE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+)
+target_link_libraries(execution_probe_tests PRIVATE Threads::Threads Zydis)
+
 add_executable(checked_recompiler_tests
     fixture_runner.cpp
     ${XBE_SDK}/runtime/cpu/dispatch.cpp
@@ -146,4 +196,5 @@ if(BUILD_TESTING)
     add_test(NAME checked_fault_handler_tests COMMAND checked_fault_handler_tests)
     add_test(NAME synthetic_startup_integration_tests COMMAND synthetic_startup_integration_tests ${FIXTURE_XBE})
     add_test(NAME vblank_runtime_tests COMMAND vblank_runtime_tests)
+    add_test(NAME execution_probe_tests COMMAND execution_probe_tests)
 endif()

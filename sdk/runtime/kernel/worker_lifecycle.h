@@ -100,6 +100,9 @@ bool StartKernelWorker(WorkerLifecycle::Task task);
 bool StopKernelWorkers();
 bool RestartKernelWorkers();
 bool KernelWorkersAccepting();
+#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+std::size_t KernelWorkerCountForTest();
+#endif
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
 void HoldKernelWorkerActivationForTest(bool hold);
 void FailNextKernelWorkerStartForTest();

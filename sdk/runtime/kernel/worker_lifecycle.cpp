@@ -331,6 +331,9 @@ bool StopKernelWorkers() {
 
 bool RestartKernelWorkers() { return g_kernel_workers.StartAccepting(); }
 bool KernelWorkersAccepting() { return g_kernel_workers.Accepting(); }
+#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+std::size_t KernelWorkerCountForTest() { return g_kernel_workers.OwnedCount(); }
+#endif
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
 void HoldKernelWorkerActivationForTest(bool hold) { g_kernel_workers.HoldActivationForTest(hold); }
 void FailNextKernelWorkerStartForTest() { g_kernel_workers.FailNextStartForTest(); }
