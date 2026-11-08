@@ -27,17 +27,29 @@ uint32_t g_real_import_original = 0;
 
 uint32_t g_real_worker_baseline = 0;
 
-void RestoreImportSlot() {
-    if (!g_real_import_slot) return;
+// test-only injection: leaves a wrong value so the readback below fails
+bool g_import_restore_fail_for_test = false;
+
+bool RestoreImportSlot() {
+    if (!g_real_import_slot) return true;
+    const uint32_t slot = g_real_import_slot;
+    const uint32_t original = g_real_import_original;
+    g_real_import_slot = 0;  // restored once, even on failure
+    bool wrote = ProtectRange(kRealImportPage, mem::kPage, mem::kRead | mem::kWrite);
+    if (wrote) wrote = mem::Write(slot, &original, sizeof(original)) == mem::AccessStatus::kOk;
+    if (wrote && g_import_restore_fail_for_test) {
+        const uint32_t wrong = original ^ 0xFFFFFFFFu;
+        mem::Write(slot, &wrong, sizeof(wrong));
+    }
+    const bool read_only = ProtectRange(kRealImportPage, mem::kPage, mem::kRead);
     uint32_t restored = 0;
-    bool ok = ProtectRange(kRealImportPage, mem::kPage, mem::kRead | mem::kWrite) &&
-              mem::Write(g_real_import_slot, &g_real_import_original, sizeof(g_real_import_original)) ==
-                  mem::AccessStatus::kOk &&
-              ProtectRange(kRealImportPage, mem::kPage, mem::kRead) &&
-              mem::Read(g_real_import_slot, &restored, sizeof(restored)) == mem::AccessStatus::kOk &&
-              restored == g_real_import_original;
-    std::printf("IMPORT restored=%08X ok=%d\n", restored, int(ok));
-    g_real_import_slot = 0;
+    const bool readback =
+        mem::Read(slot, &restored, sizeof(restored)) == mem::AccessStatus::kOk && restored == original;
+    const bool protected_read_only = mem::CheckAccess(kRealImportPage, 1, mem::kRead) == mem::AccessStatus::kOk &&
+                                     mem::CheckAccess(kRealImportPage, 1, mem::kWrite) != mem::AccessStatus::kOk;
+    const bool ok = wrote && read_only && readback && protected_read_only;
+    std::printf("IMPORT restored=%08X ok=%d read_only=%d\n", restored, int(ok), int(protected_read_only));
+    return ok;
 }
 
 struct RealFacts {
@@ -867,10 +879,12 @@ void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) 
     g_probe.have_stop = true;
 }
 
-// restores the authentic import slot before releasing the image
+// restores the authentic import slot before releasing the image; a failed
+// restore must fail the process, so it is propagated, not printed and dropped
 bool TeardownReal(const Options& options) {
-    RestoreImportSlot();
-    return Teardown(options);
+    const bool restored = RestoreImportSlot();
+    const bool freed = Teardown(options);
+    return restored && freed;
 }
 
 bool CancelRealPreparedThread(const RealFacts& facts, std::string& error) {
@@ -1050,11 +1064,21 @@ int RealChild(const std::string& scenario) {
                             patched.Parse(std::move(patched_bytes), patched_error);
         const bool accepted = parsed && ValidateRealRouteText(patched, patched_error);
         std::remove(path.c_str());
-        if (accepted) error = "patched import slot was accepted";
-        else if (!parsed) error = "could not prepare the import-slot copy";
-        else error = patched_error;
-        std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
-        exit_code = 3;
+        if (accepted || !parsed) {
+            // the negative test itself failed: report an internal failure, not a rejection
+            error = accepted ? "patched import slot was accepted" : "could not prepare the import-slot copy";
+            std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
+            exit_code = 5;
+        } else {
+            error = patched_error.empty() ? "import slot copy was rejected without a reason" : patched_error;
+            std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
+            exit_code = 3;
+        }
+    } else if (scenario == "restore-failure") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (ok) g_import_restore_fail_for_test = true;
+        else std::printf("SETUP fail %s\n", error.c_str());
+        exit_code = ok ? 0 : 4;
     } else if (scenario == "import-page-writable") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (ok) {
@@ -1095,13 +1119,13 @@ int RealChild(const std::string& scenario) {
     bool teardown_ok = false;
     if (scenario == "preflight" || scenario == "execute-permission" || scenario == "execute" ||
         scenario == "postcondition-counter" || scenario == "postcondition-result" ||
-        scenario == "import-page-writable" || scenario == "argument-span") {
+        scenario == "import-page-writable" || scenario == "argument-span" || scenario == "restore-failure") {
         teardown_ok = TeardownReal(options);
     } else {
         teardown_ok = TeardownReal(Options{});
     }
     if (!teardown_ok) {
-        if (scenario == "execute") std::printf("RESULT fail reason=\"teardown retained resources\"\n");
+        std::printf("RESULT fail reason=\"teardown or import restoration failed\"\n");
         exit_code = 5;
     } else if (execute_success) {
         std::printf("REAL_EXEC ok instructions=%u direct_calls=%u kernel_calls=%u import_reads=%u workers=%zu "
@@ -1280,6 +1304,18 @@ int RealParent(const std::string& mode, bool execute_real) {
                                supervised.output.find("RESULT ok supervision=1") != std::string::npos;
     std::printf("%s: supervised token/fd pathway is wired without execution\n", supervised_ok ? "PASS" : "FAIL");
     if (!supervised_ok) ++failed;
+
+    // an injected restore failure must fail the process and suppress REAL_EXEC ok
+    const ChildResult restore = SpawnChild(self, "restore-failure", std::chrono::seconds(15));
+    const int restore_exit = WIFEXITED(restore.status) ? WEXITSTATUS(restore.status) : -1;
+    const bool restore_ok = !restore.timed_out && restore_exit == 5 &&
+                            restore.output.find("IMPORT restored=") != std::string::npos &&
+                            restore.output.find("ok=0") != std::string::npos &&
+                            restore.output.find("RESULT fail reason=\"teardown or import restoration failed\"") !=
+                                std::string::npos &&
+                            restore.output.find("REAL_EXEC ok") == std::string::npos;
+    std::printf("%s: failed import restoration exits nonzero without REAL_EXEC ok\n", restore_ok ? "PASS" : "FAIL");
+    if (!restore_ok) ++failed;
 
     const int missing_flag = RealParent("run-once", false);
     std::printf("%s: --run-once without --execute-real is refused\n", missing_flag == 2 ? "PASS" : "FAIL");
