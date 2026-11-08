@@ -1460,3 +1460,86 @@ Targeted branch coverage is synthetic only: REP fixtures exercise zero/nonzero c
 - `RESTRICTED_EXECUTION_READINESS`: **NO-GO** — proposal only; instrumentation/execute enforcement and static-call blocker remain.
 - `REAL_GUEST_EXECUTION`: **NO-GO throughout Phase 2C-14.**
 - Integration and customer release: this phase remains on `feature/ios-port`; no merge to `main`, physical-device install, IPA, deployment, or release occurred.
+
+## Phase 2C-15 minimum viable real-XBE execution probe
+
+Baseline: `fac9b85aa6b170690ffce8fef0c81932e6880c4c` on `feature/ios-port`, 2026-11-08. This phase implements and synthetically validates a disposable, per-instruction execution probe. It does not execute real XBE instructions. The Apple `Boot()` guard, production callback gate, and production kernel-thunk policy are unchanged.
+
+### Probe boundary
+
+The reviewed prefix is `0x002B3916` to `0x002B5CDF`, one direct call at `0x002B396A` to `0x002B5CA7`, and a mandatory stop before `0x002B5CE0`. The hard limits remain 64 guest instructions, one direct call, zero kernel imports, zero indirect calls, zero callbacks, and zero workers. `ios/recompiler-fixtures/execution_probe_route.h` is the single source for all 50 allowed PCs, their lengths, both conditional-branch edges, the call target, and the forbidden import slot.
+
+| Mechanism | Implementation |
+| --- | --- |
+| Per-instruction instrumentation | The synthetic fixture config emits one recompiler `[[hook]]` for every route PC and one `after = true` hook at `0x002B5CDF`. Hooks record GPRs and flags before each instruction and infer branch outcomes from the next permitted transition. |
+| Execute enforcement | The entry and every hook check `mem::CheckAccess(pc, length, mem::kExecute)`; the call-site hook also checks the direct target's execute permission. A denied page fails before the instruction runs. |
+| Control-flow enforcement | The probe maintains the reviewed transition graph and rejects any PC, branch edge, call target, re-entry, or continuation entry outside it. `x86_resume` entry is tested separately. |
+| Memory enforcement | A test-only observer in `sdk/runtime/cpu/x86_ops.h` runs before every checked generated read/write (and every checked REP element). It rejects the ordinal-255 slot, addresses outside reviewed spans, overflow, and more than 256 memory operations. |
+| Fault reporting | The probe target replaces the aborting `x86_memory_fault`/`x86_checked_trap` handlers with structured failures carrying the first PC, address, and status. |
+| Isolation and timeout | The parent forks one disposable child per scenario, captures bounded output, kills the child with `SIGKILL` at an external deadline, and checks exit status. Each child allocates, runs, tears down, and reports zero workers and zero retained guest pages. |
+| Production guards | The probe does not link `memory_fault.cpp`'s aborting handlers and never calls `kernel::Boot()`, `CallGuest`, a callback, a kernel export, or a worker. The `guards` scenario confirms the Apple raw-base guard is still null. |
+
+### Synthetic evidence
+
+The synthetic image places synthetic instruction bytes at the real route addresses; its data values are synthetic and are not evidence about the retail image. `execution_probe_tests` passed in macOS ARM64 Debug and Release as part of 5/5 CTests. It produced 45 `PASS:` lines and zero `FAIL:` lines, including:
+
+| Scenario | Result |
+| --- | --- |
+| Data-dependent entry branch, taken | **PASS** — 49 instructions, `branch=taken`, one direct call, stop at `002B5CE0`, no import read. |
+| Data-dependent entry branch, not taken | **PASS** — 50 instructions, `branch=not-taken`, the conditional write to `0x00020000` recorded, stop at `002B5CE0`. |
+| Entry or helper page not executable | **PASS** — fails at `002B3916` or `002B396A` before the instruction/call. |
+| Direct call target not permitted | **PASS** — fails at `002B396A` without dispatching. |
+| Start at the helper entry | **PASS** — rejected at `002B5CA7` as not the reviewed entry. |
+| Generated continuation entry via `x86_resume` | **PASS** — rejected at `002B5CA7`; the continuation does not bypass counting/first-entry checks. |
+| Unreviewed memory page | **PASS** — fails at `002B394E` for `004EDC74`. |
+| Instruction budget | **PASS** — 10-instruction budget fails at the 11th step (`002B3940`). |
+| In-process deadline | **PASS** — fails at `002B3944` after the injected delay. |
+| External parent timeout | **PASS** — child killed at the parent deadline. |
+| Guest memory fault | **PASS** — reports PC `002B392E`, address `003ED3FC`, status `uncommitted`. |
+| Ordinal-255 slot read | **PASS** — rejected at PC `002B5CE0`, address `003C9E68`, before the access. |
+| Re-entry during a step | **PASS** — rejected at the nested entry `002B3916`. |
+| Teardown | **PASS** — every normal and failing child reports `system_used=0 contiguous_used=0 virtual_committed=0 workers=0 initialized=0`. |
+
+### Real-XBE static preparation
+
+The ignored local Black Edition image was used only for non-executing validation. It parsed as title `4541007B`, entry `002B3916`, base `00010000`, 15 sections, SHA-1 `f636a16af04171089f879a4bed646e185c734233`. Zydis decoded all 50 route instructions with the expected lengths, both conditional targets, and the direct call target `002B5CA7`. `0x002B5CE0` decodes to `CALL dword ptr [003C9E68]`, and the file-backed dword at `003C9E68` is `800000FF` (ordinal 255). No real instruction ran, no real data page was committed, and no import was patched or dispatched.
+
+### Remaining blockers to the first real-XBE experiment
+
+1. **Real probe mapping is not built.** The passing binary links the synthetic fixture mapping. Phase 2C-16 must generate a breakaway real-image mapping with the same 50 hooks and function-end overrides, then build a probe target against it. The current synthetic target cannot execute the real image.
+2. **Reviewed memory spans are unresolved.** The real values of `[0x10118]`, `[0x3ED3F4]`, and the pointer targets they name are runtime data. The probe may only admit pages reviewed for this experiment; if a value points outside them, it must fail closed. Reading those values from the prepared image is preparation, not execution, but their target spans still need static review.
+3. **Real stack and TLS preparation is not defined.** The synthetic run uses a dedicated committed stack page. The real entry needs a bounded guest stack with a reviewed initial ESP and no TLS dependency on this prefix; that allocation and its teardown are not yet wired.
+4. **Production `CheckedCall` still does not enforce execute permission.** The probe's per-PC and call-site hooks do. The real mapping must retain a hook at every entry and target; a continuation or generated entry without a hook would not be covered by production code alone.
+5. **Import policy is test-only.** The observer rejects `003C9E68`, but the real loader path can patch that slot to `0xFE0003FC`. The real probe must skip import patching and keep the slot unreadable, or prove the patch path never runs.
+6. **The downstream `0x00319804` return-contract mismatch is out of scope.** It is beyond the mandatory stop and is not a blocker for this prefix; do not extend the route to investigate it in Phase 2C-16.
+
+The known Android risk from Phase 2C-14 remains: the shared protection exports `MmQueryAddressProtect`, `MmSetAddressProtect`, and `NtProtectVirtualMemory` fail closed. Android `:app:assembleDebug` was rebuilt successfully after the test-only header changes; no Android guest runtime was exercised.
+
+### Proposed first real-XBE command (not run)
+
+Phase 2C-16 would add a real-image mode to the existing probe source and a real mapping target; neither is implemented in Phase 2C-15. The proposed sequence is:
+
+```sh
+# 1. Copy config/game.toml and append the Phase 2C-15 [[function]] end
+#    overrides and the 50 [[hook]] entries from execution_probe_route.h.
+#    Keep symbols, data and ABI entries unchanged.
+# 2. Regenerate the real probe mapping from the reviewed SHA-1 image.
+# 3. Configure/build a real-image probe target against that mapping.
+cmake -S ios/recompiler-fixtures -B .local/ios-port/phase2c16-real-probe -G Xcode \
+  -DEXECUTION_PROBE_REAL=ON \
+  -DEXECUTION_PROBE_REAL_XBE="$PWD/assets/default.xbe" \
+  -DEXECUTION_PROBE_REAL_GENERATED="$PWD/.local/ios-port/phase2c16-real-generated"
+cmake --build .local/ios-port/phase2c16-real-probe --config Debug --target execution_probe_tests
+# 4. Run once in the disposable parent/child mode.
+.local/ios-port/phase2c16-real-probe/Debug/execution_probe_tests --real-static --run-once
+```
+
+Expected trace on the real path: entry `002B3916`, the reviewed globals and branch at `002B392A`, the direct call at `002B396A`, the helper from `002B5CA7`, both helper-side ranges, and the final `002B5CDF`; 49 instructions if the entry branch is taken and 50 if not. Mandatory stop conditions: no execution of `002B5CE0`; zero reads of `003C9E68`; 64-instruction ceiling; one direct call total; zero imports, indirect calls, callbacks, and workers; any other PC, target, page, fault, or deadline aborts the child before the next instruction.
+
+### Decision
+
+- `PROBE_HARNESS`: **PASS (synthetic)** — isolated process, per-instruction trace, execute/transition/memory enforcement, fault reporting, and zero-resource teardown.
+- `REAL_XBE_STATIC_PREP`: **PASS** — identity, 50-instruction decode, stop instruction, and ordinal-255 slot verified without execution.
+- `PHASE_2C_16_RECOMMENDATION`: **GO, restricted** — authorize only the real probe mapping, the reviewed-span/stack preparation, and one bounded micro-execution. **NO-GO** for any run past `0x002B5CE0`, any import/callback/worker, or boot.
+- `REAL_GUEST_EXECUTION`: **NO-GO throughout Phase 2C-15.** No real XBE instruction ran.
+- Integration and release: work remains on `feature/ios-port`; no merge to `main`, physical-device install, IPA, deployment, or release occurred.
