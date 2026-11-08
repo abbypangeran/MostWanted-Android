@@ -1202,3 +1202,84 @@ Android's terminal failure was `ld.lld: error: undefined symbol: X86FuncMappingC
 - **GUEST_EXECUTION_READINESS: NO-GO.** Preserve the Apple `Boot()` guard. Do not authorize `CallGuest` through thread/APC/DPC/timer callbacks.
 
 **Phase 2C-12 decision: NO-GO.** The next acceptance work must bound callback target/argument lifetime, address the excluded detached workers, and restore Android's generated mapping before any restricted guest-execution proposal. No main merge, real XBE execution, physical iPhone installation, IPA, or release was performed. The authorized delivery route remains a normal fast-forward push of the reviewed feature branch.
+
+## Phase 2C-12 Android recovery and checked callback lifetimes
+
+Baseline: `f6fd270f003449f0f750f0967ed8041db7a06e4f` on `feature/ios-port`. This phase restores Android linkage from fresh ignored generated output, adds a callback ticket and scoped lifetime checks for the Apple boundary, and moves the vertical-blank loop into managed worker ownership. No actual XBE instruction, guest-thread activation, or real guest callback was executed. The Apple `Boot()` guard remains.
+
+### Stage A: Android generated mapping recovery
+
+`sdk/tools/recomp/codegen_emit.cpp` emits the function and continuation counts as `const std::size_t` definitions in the global namespace. `sdk/runtime/cpu/x86_context.h` declares both as `extern const std::size_t`; the generated mapping includes the shared generated header, so the definitions have external linkage. Fresh output was generated from the locally validated XBE (SHA-1 `f636a16af04171089f879a4bed646e185c734233`, title ID `4541007B`) under ignored `.local/ios-port/phase2c12-generated-game/`. It contains 28,848 function mappings and one continuation.
+
+The Android Release Ninja graph names the fresh `x86_func_mapping.cpp.o`, and `llvm-nm -g` on the linked `libmain.so` shows global `X86FuncMappingCount`, `X86ContinuationCount`, `X86FuncMappings`, and `X86Continuations` symbols. Gradle was given that generated directory explicitly and `:app:assembleDebug` completed with Java 21 and NDK 28.2.13676358. The SDK XML v4 compatibility messages were nonfatal. Generated game C++ and the XBE remain ignored and uncommitted.
+
+```sh
+env JAVA_HOME=/opt/homebrew/opt/openjdk@21 ANDROID_HOME=/Users/abbypangeran/Library/Android/sdk PATH=/opt/homebrew/opt/openjdk@21/bin:/Users/abbypangeran/Library/Android/sdk/platform-tools:/Users/abbypangeran/Library/Android/sdk/cmdline-tools/latest/bin:$PATH \
+  bash ./gradlew --no-daemon \
+  -PxbeGenerated="$PWD/.local/ios-port/phase2c12-generated-game" \
+  -PxbeImage="$PWD/.local/ios-port/default.xbe" :app:assembleDebug
+```
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `ANDROID_GENERATED_MAPPING` | **PASS** | Fresh mapping defines and links both global count symbols with the declared type and external linkage. |
+| `ANDROID_REGRESSION` | **PASS (build only)** | Full `:app:assembleDebug` succeeded with the fresh generated output. Android runtime was not exercised. |
+
+### Stages B–C: checked callback contract and synthetic tests
+
+`GuestCallbackTicket` stores the guest target VA and dispatch generation. On Apple, registration admits only a mapped generated function entry. Null, unmapped, continuation, kernel-thunk, host-thunk, uninitialized, and unknown targets reject. The guest callback VA is kept distinct from the dword argument values: queueing retains values, not arbitrary pointer pointees or page pins. A callback queued across dispatch-table replacement is stale; callback code pages are checked at registration and the complete dispatch code span is leased executable at dispatch time. The span is bounded by the existing 8 MiB dispatch-table limit. At invocation, the caller supplies explicit guest stack bounds; the boundary accepts at most 16 arguments and holds a writable lease over the full stack while validating the frame.
+
+The production Apple callback wrapper validates the ticket, active worker/dispatch gates, code span, and supplied stack, then returns `kExecutionDisabled` when those checks pass. It does not write the callback frame or invoke a function; an absent/invalid stack returns `kInvalidStack` first. The test-only wrapper writes a synthetic return sentinel and arguments under leases and invokes only the fixture's host substitute. `CallGuest` and production `x86_icall` remain trapped on Apple. Android callback dispatch keeps its existing legacy `CallGuest` behavior; this phase does not claim the new Apple target policy for Android.
+
+Thread-start callbacks are revalidated before activation and use the owning thread's stack bounds. APC queues retain callback tickets and argument values; dispatch rechecks the generation and stack. On Apple, timer APC/DPC entries capture expected callback metadata, and a stale timer DPC generation now rejects at queue time. Apple DPC records snapshot the routine, context, and two system arguments, compare the guest structure against the snapshot at dispatch, and hold a bounded structure lease while reading/updating it. `KeRemoveQueueDpc` removes a still-pending host record and clears `Inserted`; shutdown clears queued records and Apple `Inserted` state. A DPC already popped by its worker cannot be removed. The DPC guest address passed as callback argument is not pinned through a callback, and arbitrary argument pointees are not validated or pinned.
+
+The synthetic callback fixtures cover generated-entry registration and rejection classes, target mutation, code decommit/protection before dispatch, stale dispatch generation, stale timer-DPC generation, argument-count and stack failures, checked sentinel/argument writes through a host substitute, code and full-stack mutation waiting during an active substitute, dispatch reset exclusion, registration racing shutdown, repeated worker cycles, and memory teardown waiting for an active substitute. The generated fixture maps one code page; a multi-page map and arbitrary argument pointee lifetimes are not exercised. The production Apple wrapper is checked only through its disabled gate. No real callback or guest thread was activated.
+
+| Gate | Result | Evidence and limit |
+| --- | --- | --- |
+| `CALLBACK_TARGET_LIFETIME` | **PARTIAL** | Synthetic generated-entry targets, dispatch generation, code/stack leases, and checked stack-frame writes pass. Multi-page maps and pointer pointees remain untested/unpinned. |
+| `CALLBACK_CANCELLATION` | **PASS (synthetic queues only)** | APC shutdown, DPC removal/shutdown, stale generation rejection, and no synthetic callback after shutdown are exercised. An already popped DPC is in flight and cannot be removed. |
+
+### Stage D: vertical-blank worker ownership
+
+Both `src/d3d/d3d8.cpp` and `sdk/runtime/xdk/d3d8.cpp` now start the vertical-blank loop with `StartManagedHostThread`. Stop callbacks wake its condition-variable wait; stop is checked before device-state updates and callback dispatch. Managed-worker shutdown joins it before guest-memory teardown. CDevice fields used by the loop are accessed under a bounded page lease. The callback-info block remains allocated until guest-memory teardown, after the managed worker has joined.
+
+The worker's loop, pacing, focus pause, event behavior, and device-state transitions have no dedicated runtime test. Generic worker-lifecycle tests exercise managed creation failure, stop/wake/join, repeated lifecycle setup/teardown, and memory teardown ordering. The production iOS app and Android build compile the active `src/d3d/d3d8.cpp`; the alternate XDK implementation passes a syntax-only compile. Both VBlank callback paths pass no guest stack range because their host worker has no modeled guest thread stack, so the Apple callback boundary rejects them. DirectSound, input, XNet, threaded GPU, audio output, and other excluded workers remain outside this change.
+
+**`ADDITIONAL_WORKER_QUIESCENCE: PARTIAL`** — vertical-blank worker ownership is migrated and generic lifecycle behavior passes; the VBlank loop/device-state/callback path is not runtime-tested.
+
+### Stage E: startup dependency and execution-readiness assessment
+
+The static route remains `0x002B3916 → 0x002B396A → 0x002B5CA7 → 0x002B5CE0`, where guest `0x003C9E68` initially contains import ordinal 255 (`0x800000FF`) and image preparation resolves it to `0xFE0003FC` (`PsCreateSystemThreadEx`). The six outer arguments and ten export arguments, including start routine `0x002B38A2` and system routine `0x002B5C0F`, are recorded above in the Phase 2C-10 static map. The fixture-only ordinal-255 ABI bridge validates this shape but calls only inactive thread preparation; the production indirect-call policy still rejects kernel thunks. These facts are static XBE analysis plus synthetic fixtures, not runtime reachability evidence.
+
+| Startup boundary | Evidence | Classification |
+| --- | --- | --- |
+| XBE identity, parse, image preparation | Validated local XBE identity and loader/preparation tests; malformed and injected-failure cases roll back. `Boot()` does not continue into guest execution on Apple. | **Tested safe for preparation only** |
+| Ordinal-255 import and `PsCreateSystemThreadEx` ABI | Import value/patch target statically inspected; exact 10-argument ABI is covered through a synthetic generated-XBE bridge and fixture handler. | **Safe only in synthetic fixture; actual call blocked/unverified** |
+| Inactive thread preparation | Production helper initializes stack/TLS/KPCR/ETHREAD and output ownership in fixtures without adding an active thread or launching a worker. | **Safe only in synthetic fixture** |
+| Thread activation, system routine, start routine | `StartThread` validates callback tickets and uses managed workers, but no guest thread is activated. The static start/system paths contain unsupported or unresolved calls, dynamic pointers, and later `INT3`. | **Unsafe/unverified** |
+| Callback and wait services | Synthetic callback, worker-wait, APC/DPC cancellation, and shutdown tests pass; the Apple production callback returns disabled. Actual XBE callback/wait flow is not run. | **Safe only in synthetic fixtures** |
+| Graphics and audio | VBlank worker compiles and is managed, but has no dedicated loop test and its callback has no guest stack. Other graphics/audio paths retain raw or deferred guest pointers. | **Static/compile-only and unsafe/unverified** |
+| Filesystem | Contiguous IOSB lease/publication and worker ordering have focused tests. Scatter/gather buffers/status, other file metadata paths, and actual startup file flow remain raw or unverified; host I/O side effects are not transactional. | **Tested safe only for the covered contiguous IOSB cases; remainder unsafe/unverified** |
+
+The checked recompiler continues to trap unsupported 16-byte SIMD (`MOVUPS`), 10-byte x87 (`FLD`), implicit-memory exchange, `LOCKED XADD`, and `REP MOVSD` forms in synthetic tests. The statically inspected candidate start routine at `0x002B38A2` reaches an unsupported checked boundary at `0x002B58B8`; the system routine at `0x002B5C0F` begins with an instruction outside the checked set and later performs dynamic calls through `[0x003C9D30]` and EDI loaded from `[0x003C9D28]`, then reaches import `[0x003C9E64]` and `INT3`. The precise generated-code observations are not proof of runtime reachability.
+
+Raw guest access remains broad. Representative open paths include `G<T>()`/`R32()` object and synchronization fields in `sdk/runtime/kernel/objects.cpp` and `xboxkrnl.cpp`; `HostPtr()` critical-section atomics and DPC initialization in `xboxkrnl.cpp`; scatter/gather and file metadata buffers in `files.cpp`; D3D device/resource paths in both D3D implementations; generated `X86_MEM*`/`X86_PTR` outside the checked subset; and asynchronous audio, input, XNet, rendering, and GPU buffers. The current callback contract validates callback code and stack lifetime, not arbitrary guest addresses carried inside callback arguments.
+
+| Platform check | Result |
+| --- | --- |
+| macOS ARM64 worker/IOSB tests | Debug and Release CTests passed 1/1 each. |
+| Generated recompiler, ABI, and callback fixtures | Debug and Release CTests passed 2/2 each. |
+| iOS Simulator memory/preparation app | Completed with 841 `PASS:` lines and no `FAIL:` lines, including APC and queued-DPC removal/shutdown checks. |
+| iPhoneOS ARM64 | `mostwanted_ios` and `mostwanted_memory_tests` Debug targets compiled and linked as arm64 Mach-O apps; both are unsigned and neither was installed on hardware. |
+| Android | Fresh-map `:app:assembleDebug` passed; current map symbols and mapping object are present in linked `libmain.so`. Runtime was not exercised. |
+| Vulkan GPU readback | Not rerun; this phase did not modify Vulkan transfer or readback code. |
+
+**`EXECUTION_READINESS_REVIEW: NO-GO`. `GUEST_EXECUTION: NO-GO`.** Preserve the Apple `Boot()` guard. No bounded guest-execution experiment is justified until startup call reachability, remaining raw guest memory paths, callback argument pointee lifetime, a guest stack model for DPC/VBlank callbacks, and excluded workers are separately addressed and tested.
+
+### Phase 2C-12 delivery state
+
+- **Development:** callback ticket/lifetime boundary and VBlank managed-worker migration implemented; Stage A restored.
+- **Validation:** the platform and fixture evidence above passes within stated limits.
+- **Integration:** remains on `feature/ios-port`; no merge to `main`. A normal fast-forward push is authorized after final review.
+- **Deployment/customer release:** not performed.
