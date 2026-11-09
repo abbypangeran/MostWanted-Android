@@ -562,6 +562,18 @@ void execution_probe_memory_access(uint32_t instruction, uint32_t address, std::
         Fail("memory-operation budget exhausted", instruction, address, true);
 
     g_probe.memory.push_back({instruction, address, uint32_t(size), write});
+#if defined(EXECUTION_PROBE_INTEGRATED)
+    if (InImportPage(address, end)) {
+        const bool enter = instruction == 0x002B5986 && address == 0x003C9E44;
+        const bool leave = instruction == 0x002B59A9 && address == 0x003C9E40;
+        if (enter || leave) {
+            if (write || size != 4 || !g_probe.options.allow_kernel_call)
+                Fail("unreviewed critical-section import operand access", instruction, address, true);
+            ++g_probe.import_reads;
+            return;
+        }
+    }
+#endif
     if (InImportPage(address, end)) {
         // exactly one reviewed read per import slot, at the checked call's operand fetch.
         const ImportStep* import = FindImportStep(instruction);

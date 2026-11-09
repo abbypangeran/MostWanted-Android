@@ -345,3 +345,11 @@ The memory observer clears the root operation list before the secondary segment,
 ## Phase 2C-35R integrated cleanup ordering
 
 Failure cleanup runs before dispatch, image and memory teardown. It clears `Thread::ctx`, resets `g_prepared_thread`, cancels the prepared thread through `CancelPreparedThread` (valid with an open or already-closed handle), then verifies handle invalidation, output clearing, stack release, cancelled state and empty `kernel::Threads()`. Only after that result is known does it restore both import slots and call `TeardownReal`. A cancellation or restoration failure returns nonzero even when the subsequent teardown reports zero remaining bytes. The successful path still uses `CancelRealPreparedThread` once, after both segments' postconditions pass.
+
+## Phase 2C-37 critical-section helper memory contract
+
+The extended secondary route adds the critical-section object at `0046C8B0` and its empty list head at `0046C8CC`. The object's page is snapshot-checked and must return to its initialized state after enter/leave: `00040001` header, `FFFFFFFF` LockCount, zero recursion/owner, and sentinel list head/prev. The helper's only guest read of this object is the list head at `002B598C`; the test-only services update LockCount/RecursionCount/OwningThread through `mem::Write` and restore them.
+
+Import slots `003C9E44` (ordinal 277) and `003C9E40` (ordinal 294) are patched after the root slots are restored and before secondary entry. The integration observer admits exactly one 4-byte operand read at each slot from `002B5986`/`002B59A9`; every other import-page access fails. Both slots are restored with readback and the page is read-only after secondary completion.
+
+The helper's stack frame stays inside the retained stack. The empty list means no node memory is read. A non-empty list is rejected before `002B59A1`; `WalkCriticalListForTest` additionally enforces aligned, committed nodes inside a bounded span, a 16-node budget and cycle detection. Host writes in the critical-section services are not guest memory operations and are verified through the final object state and page snapshot.

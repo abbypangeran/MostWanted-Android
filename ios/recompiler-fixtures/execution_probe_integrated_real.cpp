@@ -33,20 +33,19 @@ bool ValidateMappingTextFromStrings(const std::string& header, const std::string
 #include "execution_probe.cpp"
 #undef main
 
-#include "execution_probe_secondary_route.h"
+#include "execution_probe_integrated_secondary_route.h"
 #include "kernel/guest_callback.h"
 
 namespace {
 
-namespace sec = execution_probe_secondary;
+namespace sec = execution_probe_integrated_secondary;
 
 constexpr uint32_t kIntegratedRootInstructions = 72;
-constexpr uint32_t kIntegratedSecondaryInstructions = 53;
+constexpr uint32_t kIntegratedSecondaryInstructions = 71;
 constexpr uint32_t kIntegratedTotalInstructions = kIntegratedRootInstructions + kIntegratedSecondaryInstructions;
-constexpr uint32_t kIntegratedDirectCalls = 3;
-constexpr uint32_t kIntegratedKernelCalls = 2;
-constexpr uint32_t kIntegratedImportReads = 2;
-constexpr uint32_t kSecondaryFrameBytes = 0x3C;
+constexpr uint32_t kIntegratedDirectCalls = 4;
+constexpr uint32_t kIntegratedKernelCalls = 4;
+constexpr uint32_t kIntegratedImportReads = 4;
 
 struct SecondaryFacts {
     uint32_t stack_base = 0, stack_top = 0, initial_esp = 0, entry_esp = 0;
@@ -54,6 +53,8 @@ struct SecondaryFacts {
     uint32_t kpcr = 0, ethread = 0, tls = 0, fs0 = 0;
     uint32_t tls_source = 0, tls_end = 0, tls_copy = 0, tls_zero = 0;
     uint32_t handle = 0, id = 0;
+    uint32_t critical_object = 0, critical_head = 0, critical_lock = 0;
+    uint32_t critical_recursion = 0, critical_owner = 0;
     uint32_t worker_baseline = 0;
     std::vector<uint32_t> snapshot_pages;
 };
@@ -85,6 +86,13 @@ struct SecondaryState {
 
 SecondaryState g_secondary;
 bool g_integrated_fail_secondary_step = false;
+
+bool ValidateCriticalSectionInitial(const SecondaryFacts& facts, std::string& error);
+bool VerifyCriticalSectionFinal(const SecondaryFacts& facts, std::string& error);
+bool PrepareCriticalSectionBridge(const SecondaryFacts& facts, std::string& error);
+void ReleaseCriticalSectionBridge();
+bool PatchCriticalSectionImports(std::string& error);
+bool RestoreCriticalSectionImports();
 
 const sec::RouteStep* FindSecondaryStep(uint32_t pc) {
     for (const sec::RouteStep& step : sec::kRoute)
@@ -121,6 +129,143 @@ void RecordSecondaryStep(uint32_t pc, X86Context& ctx, const sec::RouteStep& ste
     g_secondary.trace.push_back(record);
 }
 
+enum class CriticalFailMode : uint8_t { kNone, kEnterFail, kLeaveFail, kBadCleanup, kBadReturn, kWrongOwner };
+
+uint32_t g_critical_owner_ethread = 0;
+uint32_t g_critical_enter_calls = 0;
+uint32_t g_critical_leave_calls = 0;
+uint32_t g_critical_enter_esp = 0;
+uint32_t g_critical_leave_esp = 0;
+uint32_t g_critical_enter_return = 0;
+uint32_t g_critical_leave_return = 0;
+uint32_t g_critical_enter_arg = 0;
+uint32_t g_critical_leave_arg = 0;
+CriticalFailMode g_critical_fail_mode = CriticalFailMode::kNone;
+bool g_critical_restore_fail = false;
+
+bool WalkCriticalListForTest(uint32_t head, uint32_t sentinel, uint32_t span_begin, uint32_t span_end,
+                             uint32_t& target, uint32_t& nodes, std::string& error) {
+    target = 0;
+    nodes = 0;
+    uint32_t visited[sec::kCriticalMaxListNodes]{};
+    while (head != sentinel) {
+        if (nodes >= sec::kCriticalMaxListNodes) {
+            error = "critical-section list traversal budget exhausted";
+            return false;
+        }
+        if ((head & 3) != 0 || head < span_begin || uint64_t(head) + 8 > span_end) {
+            error = "critical-section list node is unaligned or outside the reviewed span";
+            return false;
+        }
+        for (uint32_t i = 0; i < nodes; ++i)
+            if (visited[i] == head) {
+                error = "critical-section list cycle detected";
+                return false;
+            }
+        visited[nodes] = head;
+        uint32_t next = 0, callback = 0;
+        if (mem::Read(head, &next, sizeof(next)) != mem::AccessStatus::kOk ||
+            mem::Read(head + 8, &callback, sizeof(callback)) != mem::AccessStatus::kOk) {
+            error = "critical-section list node is not readable";
+            return false;
+        }
+        ++nodes;
+        if (nodes == 1) target = callback;
+        if (next == sentinel) {
+            return true;
+        }
+        if ((next & 3) != 0 || next < span_begin || uint64_t(next) + 8 > span_end) {
+            error = "critical-section list next pointer is unaligned or outside the reviewed span";
+            return false;
+        }
+        head = next;
+    }
+    return true;
+}
+
+void ProbeCriticalEnter(X86Context& ctx, uint8_t*) {
+    ++g_critical_enter_calls;
+    g_critical_enter_esp = ctx.esp;
+    g_critical_enter_return = kernel::R32(ctx.esp);
+    uint32_t object = 0, lock = 0, recursion = 0, owner = 0;
+    const bool arg_ok = mem::Read(ctx.esp + 4, &object, sizeof(object)) == mem::AccessStatus::kOk;
+    g_critical_enter_arg = object;
+    if (!arg_ok || object != sec::kCriticalSection) {
+        kernel::Return(ctx, kernel::kInvalidParameter, 1);
+        return;
+    }
+    const bool state_ok =
+        mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock)) == mem::AccessStatus::kOk &&
+        mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion)) == mem::AccessStatus::kOk &&
+        mem::Read(sec::kCriticalOwner, &owner, sizeof(owner)) == mem::AccessStatus::kOk;
+    if (!state_ok || lock != 0xFFFFFFFF || recursion != 0 || owner != 0 ||
+        g_critical_fail_mode == CriticalFailMode::kEnterFail) {
+        kernel::Return(ctx, kernel::kInvalidParameter, 1);
+        return;
+    }
+    if (g_critical_fail_mode == CriticalFailMode::kBadCleanup) {
+        ctx.eax = kernel::kSuccess;
+        ctx.esp += 4;
+        return;
+    }
+    lock = 0;
+    recursion = 1;
+    owner = g_critical_owner_ethread;
+    if (mem::Write(sec::kCriticalLockCount, &lock, sizeof(lock)) != mem::AccessStatus::kOk ||
+        mem::Write(sec::kCriticalRecursion, &recursion, sizeof(recursion)) != mem::AccessStatus::kOk ||
+        mem::Write(sec::kCriticalOwner, &owner, sizeof(owner)) != mem::AccessStatus::kOk) {
+        kernel::Return(ctx, kernel::kAccessViolation, 1);
+        return;
+    }
+    kernel::Return(ctx, kernel::kSuccess, 1);
+    if (g_critical_fail_mode == CriticalFailMode::kBadReturn) {
+        const uint32_t invalid = 0xDEADBEEF;
+        mem::Write(ctx.esp - 8, &invalid, sizeof(invalid));
+    }
+}
+
+void ProbeCriticalLeave(X86Context& ctx, uint8_t*) {
+    ++g_critical_leave_calls;
+    g_critical_leave_esp = ctx.esp;
+    g_critical_leave_return = kernel::R32(ctx.esp);
+    uint32_t object = 0, lock = 0, recursion = 0, owner = 0;
+    const bool arg_ok = mem::Read(ctx.esp + 4, &object, sizeof(object)) == mem::AccessStatus::kOk;
+    g_critical_leave_arg = object;
+    if (!arg_ok || object != sec::kCriticalSection) {
+        kernel::Return(ctx, kernel::kInvalidParameter, 1);
+        return;
+    }
+    const bool state_ok =
+        mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock)) == mem::AccessStatus::kOk &&
+        mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion)) == mem::AccessStatus::kOk &&
+        mem::Read(sec::kCriticalOwner, &owner, sizeof(owner)) == mem::AccessStatus::kOk;
+    if (!state_ok || g_critical_enter_calls != 1 || lock != 0 || recursion != 1 ||
+        owner != g_critical_owner_ethread || g_critical_fail_mode == CriticalFailMode::kLeaveFail ||
+        g_critical_fail_mode == CriticalFailMode::kWrongOwner) {
+        kernel::Return(ctx, kernel::kInvalidParameter, 1);
+        return;
+    }
+    if (g_critical_fail_mode == CriticalFailMode::kBadCleanup) {
+        ctx.eax = kernel::kSuccess;
+        ctx.esp += 4;
+        return;
+    }
+    lock = 0xFFFFFFFF;
+    recursion = 0;
+    owner = 0;
+    if (mem::Write(sec::kCriticalLockCount, &lock, sizeof(lock)) != mem::AccessStatus::kOk ||
+        mem::Write(sec::kCriticalRecursion, &recursion, sizeof(recursion)) != mem::AccessStatus::kOk ||
+        mem::Write(sec::kCriticalOwner, &owner, sizeof(owner)) != mem::AccessStatus::kOk) {
+        kernel::Return(ctx, kernel::kAccessViolation, 1);
+        return;
+    }
+    kernel::Return(ctx, kernel::kSuccess, 1);
+    if (g_critical_fail_mode == CriticalFailMode::kBadReturn) {
+        const uint32_t invalid = 0xDEADBEEF;
+        mem::Write(ctx.esp - 8, &invalid, sizeof(invalid));
+    }
+}
+
 void SecondaryStep(uint32_t pc, X86Context& ctx) {
     if (!g_secondary.running) Fail("secondary instruction outside its segment", pc);
     if (g_secondary.in_step) Fail("re-entry during a secondary step", pc);
@@ -129,7 +274,6 @@ void SecondaryStep(uint32_t pc, X86Context& ctx) {
 
     if (pc == sec::kStartRoutine) Fail("start routine entry is forbidden", pc);
     if (pc == sec::kStackHelper) Fail("stack helper entry is forbidden", pc);
-    if (pc == sec::kNextHelper) Fail("next helper entry is forbidden", pc);
     if (pc == sec::kSehHandler) Fail("exception handler entry is forbidden", pc);
 
     const sec::RouteStep* step = FindSecondaryStep(pc);
@@ -154,6 +298,9 @@ void SecondaryStep(uint32_t pc, X86Context& ctx) {
         }
     }
 
+    if (step->kind == sec::StepKind::kForbidden)
+        Fail("unreviewed dynamic list callback target", pc);
+
     if (step->kind == sec::StepKind::kCall) {
         if (g_secondary.direct_calls >= sec::kMaximumDirectCalls) Fail("secondary direct call budget exhausted", pc);
         const dispatch::ResolvedTarget target = dispatch::ResolveTarget(step->next);
@@ -164,15 +311,35 @@ void SecondaryStep(uint32_t pc, X86Context& ctx) {
         ++g_secondary.direct_calls;
     }
 
+    if (step->kind == sec::StepKind::kKernelCall) {
+        if (g_secondary.kernel_calls >= sec::kMaximumKernelCalls) Fail("secondary kernel call budget exhausted", pc);
+        const bool enter = pc == sec::kCriticalEnterCall;
+        const bool leave = pc == sec::kCriticalLeaveCall;
+        if (!enter && !leave) Fail("secondary kernel call is not a reviewed import", pc);
+        const uint32_t slot = enter ? sec::kCriticalEnterSlot : sec::kCriticalLeaveSlot;
+        const uint32_t ordinal = enter ? sec::kCriticalEnterOrdinal : sec::kCriticalLeaveOrdinal;
+        uint32_t target = 0;
+        if (mem::Read(slot, &target, sizeof(target)) != mem::AccessStatus::kOk ||
+            target != dispatch::KernelThunkAddress(ordinal))
+            Fail("secondary critical-section import slot is not the reviewed thunk", pc);
+        if (mem::CheckAccess(step->next, 1, mem::kExecute) != mem::AccessStatus::kOk)
+            Fail("secondary kernel call return PC is not executable", pc);
+        ++g_secondary.kernel_calls;
+    }
+
     if (step->kind == sec::StepKind::kRet) {
         if (ctx.checked_call == nullptr) Fail("secondary checked RET has no active call frame", pc);
-        if (ctx.checked_call->return_address != sec::kSehReturn)
+        if (ctx.checked_call->return_address != step->next)
             Fail("secondary checked RET frame does not expect the reviewed return", pc);
     }
 
     if (step->kind == sec::StepKind::kStop) {
-        if (g_secondary.direct_calls != sec::kMaximumDirectCalls)
-            Fail("secondary stop reached without the reviewed call", pc);
+        if (g_secondary.direct_calls != sec::kMaximumDirectCalls ||
+            g_secondary.kernel_calls != sec::kMaximumKernelCalls)
+            Fail("secondary stop reached without the reviewed calls", pc);
+        g_secondary.import_reads = g_probe.import_reads;
+        if (g_secondary.import_reads != sec::kMaximumImportReads)
+            Fail("secondary stop reached without the reviewed import reads", pc);
         if (!kernel::Threads().empty()) Fail("a guest thread became active during the secondary segment", pc);
         if (kernel::ThreadWorkerLaunchCountForTest() != g_secondary.worker_baseline)
             Fail("a kernel worker was activated during the secondary segment", pc);
@@ -208,12 +375,11 @@ void SecondaryStep(uint32_t pc, X86Context& ctx) {
 
 #define DEFINE_SECONDARY_STEP(pc, len, kind, next, alt) \
     void SecondaryStep_##pc(X86Context& ctx, uint8_t*) { SecondaryStep(pc, ctx); }
-EXECUTION_PROBE_SECONDARY_ROUTE(DEFINE_SECONDARY_STEP)
+EXECUTION_PROBE_INTEGRATED_SECONDARY_ROUTE(DEFINE_SECONDARY_STEP)
 #undef DEFINE_SECONDARY_STEP
 
 void SecondaryStep_0x002B38A2(X86Context& ctx, uint8_t*) { SecondaryStep(0x002B38A2, ctx); }
 void SecondaryStep_0x002B58B8(X86Context& ctx, uint8_t*) { SecondaryStep(0x002B58B8, ctx); }
-void SecondaryStep_0x002B597D(X86Context& ctx, uint8_t*) { SecondaryStep(0x002B597D, ctx); }
 
 namespace {
 
@@ -264,10 +430,21 @@ bool ValidateSecondaryRouteText(const xbe::Image& image, std::string& error) {
                 return false;
             }
         }
-        if (step.kind == sec::StepKind::kRet &&
-            (instruction.mnemonic != ZYDIS_MNEMONIC_RET || instruction.operand_count_visible != 0)) {
-            error = "secondary route RET is not a plain return";
-            return false;
+        if (step.kind == sec::StepKind::kRet) {
+            if (instruction.mnemonic != ZYDIS_MNEMONIC_RET) {
+                error = "secondary route RET is not a return";
+                return false;
+            }
+            if (step.pc == 0x002B59B2) {
+                if (instruction.operand_count_visible != 1 ||
+                    operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE || operands[0].imm.value.u != 4) {
+                    error = "secondary helper RET is not RET 0x04";
+                    return false;
+                }
+            } else if (instruction.operand_count_visible != 0) {
+                error = "secondary route RET is not a plain return";
+                return false;
+            }
         }
         for (uint32_t j = 0; j < step.length; ++j) {
             hash ^= image.file[size_t(offset) + j];
@@ -406,7 +583,7 @@ bool InitializeSecondaryContext(const kernel::ThreadRef& thread, X86Context& ctx
     facts.stack_top = thread->stack_top;
     facts.initial_esp = ctx.esp;
     facts.entry_esp = ctx.esp - sec::kCallbackFrameBytes;
-    facts.stop_esp = facts.entry_esp - kSecondaryFrameBytes;
+    facts.stop_esp = facts.entry_esp - 0x38;
     facts.stop_ebp = facts.entry_esp - 4;
     facts.registration = facts.entry_esp - 0x14;
     facts.kpcr = thread->kpcr;
@@ -438,7 +615,9 @@ bool InitializeSecondaryContext(const kernel::ThreadRef& thread, X86Context& ctx
     facts.snapshot_pages = {uint32_t((thread->stack_top - 1) & ~(mem::kPage - 1)),
                             thread->kpcr & ~(mem::kPage - 1),
                             kRealRdataPage,
-                            kRealImageBase};
+                            kRealImageBase,
+                            sec::kCriticalSection & ~(mem::kPage - 1)};
+    if (!ValidateCriticalSectionInitial(facts, error)) return false;
     return true;
 }
 
@@ -456,10 +635,11 @@ void ConfigureSecondaryMemoryPolicy(const SecondaryFacts& facts) {
         {sec::kTlsGlobalZeroFill, sec::kTlsGlobalZeroFill + 4, false},
         {facts.tls, facts.tls + sec::kTlsBlockSize, true},
         {facts.stack_base, facts.stack_top, true},
+        {sec::kCriticalSection, sec::kCriticalSection + 0x24, true},
     };
     g_probe.options.snapshot_pages = facts.snapshot_pages;
-    g_probe.options.allow_kernel_call = false;
-    g_probe.options.kernel_call_budget = 0;
+    g_probe.options.allow_kernel_call = true;
+    g_probe.options.kernel_call_budget = sec::kMaximumKernelCalls;
     g_probe.options.allow_call_target = true;
     g_probe.options.direct_call_budget = sec::kMaximumDirectCalls;
     g_probe.options.instruction_budget = sec::kMaximumInstructions;
@@ -674,18 +854,35 @@ bool VerifySecondaryMemoryOperations(const SecondaryFacts& facts, std::string& e
         error = "the zero-remainder REP STOSB unexpectedly wrote";
         return false;
     }
+    if (CountSecondaryOps(0x002B598C, sec::kCriticalListHead, false) != 1) {
+        error = "critical-section list-head read count is not one";
+        return false;
+    }
+    unsigned import_records = 0;
     for (const MemoryRecord& record : g_probe.memory) {
-        if (record.address >= 0x003C9000 && record.address < 0x003CA000) {
-            error = "an import-page access was recorded in the secondary segment";
+        if (record.address < 0x003C9000 || record.address >= 0x003CA000) continue;
+        const bool enter = record.pc == sec::kCriticalEnterCall && record.address == sec::kCriticalEnterSlot;
+        const bool leave = record.pc == sec::kCriticalLeaveCall && record.address == sec::kCriticalLeaveSlot;
+        if ((!enter && !leave) || record.write || record.size != 4) {
+            error = "an unreviewed import-page access was recorded in the secondary segment";
             return false;
         }
+        ++import_records;
+    }
+    if (import_records != 2 || g_probe.import_reads != 2) {
+        error = "critical-section import operand read counts are not one per slot";
+        return false;
+    }
+    for (const MemoryRecord& record : g_probe.memory) {
+        if (record.address >= 0x003C9000 && record.address < 0x003CA000) continue;
         const bool external =
             (record.address == facts.kpcr && (record.pc == 0x00319809 || record.pc == 0x00319838)) ||
             (record.address == facts.kpcr + 0x28 && record.pc == 0x002B5C1F) ||
             (record.address == facts.ethread + 0x28 && record.pc == 0x002B5C28) ||
             (record.address == sec::kTlsGlobalEnd && record.pc == 0x002B5C34) ||
             (record.address == sec::kTlsGlobalSource && record.pc == 0x002B5C3A) ||
-            (record.address == sec::kTlsGlobalZeroFill && record.pc == 0x002B5C57);
+            (record.address == sec::kTlsGlobalZeroFill && record.pc == 0x002B5C57) ||
+            (record.address == sec::kCriticalListHead && record.pc == 0x002B598C);
         if (external) continue;
         if (record.address >= facts.tls &&
             record.address + record.size <= uint64_t(facts.tls) + sec::kTlsBlockSize)
@@ -699,19 +896,19 @@ bool VerifySecondaryMemoryOperations(const SecondaryFacts& facts, std::string& e
 
 bool VerifySecondaryPostconditions(const SecondaryFacts& facts, std::string& error) {
     if (!g_secondary.have_stop || g_secondary.stop.pc != sec::kStopBefore) {
-        error = "secondary mandatory stop is not 002B5C76";
+        error = "secondary mandatory stop is not 002B5C7B";
         return false;
     }
     if (g_secondary.executed != kIntegratedSecondaryInstructions ||
         g_secondary.trace.size() != kIntegratedSecondaryInstructions) {
-        error = "expected 53 secondary instructions";
+        error = "expected 71 secondary instructions";
         return false;
     }
-    if (g_secondary.trace.empty() || g_secondary.trace.back().pc != 0x002B5C74) {
-        error = "the last secondary PC is not 002B5C74";
+    if (g_secondary.trace.empty() || g_secondary.trace.back().pc != 0x002B59B2) {
+        error = "the last secondary PC is not 002B59B2";
         return false;
     }
-    if (g_secondary.direct_calls != 1 || g_secondary.kernel_calls != 0 || g_secondary.import_reads != 0) {
+    if (g_secondary.direct_calls != 2 || g_secondary.kernel_calls != 2 || g_secondary.import_reads != 2) {
         error = "secondary call or import counts are not the reviewed set";
         return false;
     }
@@ -734,19 +931,27 @@ bool VerifySecondaryPostconditions(const SecondaryFacts& facts, std::string& err
         return false;
     }
     uint32_t pushed = 0;
-    if (mem::Read(g_secondary.stop.esp, &pushed, sizeof(pushed)) != mem::AccessStatus::kOk || pushed != 1) {
-        error = "the secondary push 1 stack slot is not the reviewed value";
+    if (mem::Read(g_secondary.stop.esp, &pushed, sizeof(pushed)) != mem::AccessStatus::kOk || pushed != 0) {
+        error = "the secondary stop stack slot is not the saved EDI value";
         return false;
     }
     const StepRecord* branch = nullptr;
-    for (const StepRecord& step : g_secondary.trace)
+    const StepRecord* list_branch = nullptr;
+    for (const StepRecord& step : g_secondary.trace) {
         if (step.pc == sec::kTlsFillBranch) branch = &step;
+        if (step.pc == 0x002B59A6) list_branch = &step;
+    }
     if (!branch || !branch->branch_valid || branch->branch_taken) {
         error = "secondary TLS zero-fill branch is not the authentic not-taken path";
         return false;
     }
+    if (!list_branch || !list_branch->branch_valid || list_branch->branch_taken) {
+        error = "secondary critical-section list branch is not the empty-list path";
+        return false;
+    }
     if (!VerifySecondarySeh(facts, error)) return false;
     if (!VerifySecondaryTls(facts, error)) return false;
+    if (!VerifyCriticalSectionFinal(facts, error)) return false;
     if (!VerifySecondaryMemoryOperations(facts, error)) return false;
     if (!kernel::Threads().empty() || kernel::ThreadWorkerLaunchCountForTest() != facts.worker_baseline) {
         error = "a guest thread or worker became active during the secondary segment";
@@ -806,6 +1011,7 @@ void PrintSecondaryFailure(const ProbeFailure& failure) {
 }
 
 bool RunSecondarySegment(const kernel::ThreadRef& thread, SecondaryFacts& facts, std::string& error) {
+    if (!PrepareCriticalSectionBridge(facts, error)) return false;
     X86Context context{};
     if (!InitializeSecondaryContext(thread, context, facts, error)) return false;
     ConfigureSecondaryMemoryPolicy(facts);
@@ -900,6 +1106,166 @@ bool VerifyImportRestoration(const RealFacts& facts, std::string& error) {
     return true;
 }
 
+RealImportPatch g_critical_imports[] = {
+    {sec::kCriticalEnterSlot, 0, 0, sec::kCriticalEnterOrdinal, sec::kCriticalEnterEncoding, false},
+    {sec::kCriticalLeaveSlot, 0, 0, sec::kCriticalLeaveOrdinal, sec::kCriticalLeaveEncoding, false},
+};
+
+bool PatchCriticalSectionImports(std::string& error) {
+    if (!ProtectRange(kRealImportPage, mem::kPage, mem::kRead | mem::kWrite)) {
+        error = "could not open the import page for critical-section patches";
+        return false;
+    }
+    bool ok = true;
+    for (RealImportPatch& patch : g_critical_imports) {
+        uint32_t authentic = 0;
+        if (mem::Read(patch.slot, &authentic, sizeof(authentic)) != mem::AccessStatus::kOk ||
+            authentic != patch.encoding) {
+            error = patch.ordinal == sec::kCriticalEnterOrdinal
+                        ? "enter-critical-section slot is not the authentic ordinal-277 encoding"
+                        : "leave-critical-section slot is not the authentic ordinal-294 encoding";
+            ok = false;
+            break;
+        }
+        const uint32_t target = dispatch::KernelThunkAddress(patch.ordinal);
+        if (!target || mem::Write(patch.slot, &target, sizeof(target)) != mem::AccessStatus::kOk) {
+            error = "could not patch a critical-section import slot";
+            ok = false;
+            break;
+        }
+        patch.original = authentic;
+        patch.target = target;
+        patch.active = true;
+    }
+    const bool read_only = ProtectRange(kRealImportPage, mem::kPage, mem::kRead);
+    if (!read_only || !ok) {
+        if (error.empty()) error = "could not protect the import page read-only";
+        return false;
+    }
+    for (const RealImportPatch& patch : g_critical_imports) {
+        uint32_t readback = 0;
+        if (!patch.active || mem::Read(patch.slot, &readback, sizeof(readback)) != mem::AccessStatus::kOk ||
+            readback != patch.target) {
+            error = "critical-section import patch did not read back";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool RestoreCriticalSectionImports() {
+    bool active = false;
+    for (const RealImportPatch& patch : g_critical_imports) active |= patch.active;
+    if (!active) return true;
+    bool wrote = ProtectRange(kRealImportPage, mem::kPage, mem::kRead | mem::kWrite);
+    for (RealImportPatch& patch : g_critical_imports) {
+        if (!patch.active) continue;
+        if (wrote) wrote = mem::Write(patch.slot, &patch.original, sizeof(patch.original)) == mem::AccessStatus::kOk;
+        if (wrote && g_critical_restore_fail) {
+            const uint32_t wrong = patch.original ^ 0xFFFFFFFFu;
+            mem::Write(patch.slot, &wrong, sizeof(wrong));
+        }
+    }
+    const bool read_only = ProtectRange(kRealImportPage, mem::kPage, mem::kRead);
+    bool ok = wrote && read_only;
+    for (RealImportPatch& patch : g_critical_imports) {
+        if (!patch.active) continue;
+        patch.active = false;
+        uint32_t restored = 0;
+        const bool readback =
+            mem::Read(patch.slot, &restored, sizeof(restored)) == mem::AccessStatus::kOk && restored == patch.original;
+        ok = ok && readback;
+        std::printf("IMPORT critical slot=%08X restored=%08X ok=%d\n", patch.slot, restored, int(readback));
+    }
+    std::printf("IMPORT critical restored=%d read_only=%d\n", int(ok), int(read_only));
+    return ok;
+}
+
+bool PrepareCriticalSectionBridge(const SecondaryFacts& facts, std::string& error) {
+    kernel::RegisterExport(sec::kCriticalEnterOrdinal, "RtlEnterCriticalSection", ProbeCriticalEnter);
+    kernel::RegisterExport(sec::kCriticalLeaveOrdinal, "RtlLeaveCriticalSection", ProbeCriticalLeave);
+    if (!dispatch::SetKernel277FixtureBridge(true) || !dispatch::SetKernel294FixtureBridge(true)) {
+        error = "critical-section test bridges were not authorized";
+        return false;
+    }
+    g_critical_owner_ethread = facts.ethread;
+    g_critical_enter_calls = 0;
+    g_critical_leave_calls = 0;
+    g_critical_enter_esp = 0;
+    g_critical_leave_esp = 0;
+    g_critical_enter_return = 0;
+    g_critical_leave_return = 0;
+    g_critical_enter_arg = 0;
+    g_critical_leave_arg = 0;
+    g_critical_fail_mode = CriticalFailMode::kNone;
+    return true;
+}
+
+void ReleaseCriticalSectionBridge() {
+    dispatch::SetKernel277FixtureBridge(false);
+    dispatch::SetKernel294FixtureBridge(false);
+}
+
+bool ValidateCriticalSectionInitial(const SecondaryFacts& facts, std::string& error) {
+    uint32_t header = 0, lock = 0, recursion = 0, owner = 0, head = 0, prev = 0;
+    if (mem::Read(sec::kCriticalSection, &header, sizeof(header)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalOwner, &owner, sizeof(owner)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalListHead, &head, sizeof(head)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalListHead + 4, &prev, sizeof(prev)) != mem::AccessStatus::kOk) {
+        error = "could not read the reviewed critical-section object";
+        return false;
+    }
+    if (header != 0x00040001 || lock != 0xFFFFFFFF || recursion != 0 || owner != 0) {
+        error = "critical-section object is not in the authentic initialized state";
+        return false;
+    }
+    if (head != sec::kCriticalListSentinel || prev != sec::kCriticalListSentinel) {
+        error = "critical-section list is not empty";
+        return false;
+    }
+    if (mem::CheckAccess(sec::kCriticalSection, 0x24, mem::kReadWrite) != mem::AccessStatus::kOk) {
+        error = "critical-section object is not writable";
+        return false;
+    }
+    (void)facts;
+    return true;
+}
+
+bool VerifyCriticalSectionFinal(const SecondaryFacts& facts, std::string& error) {
+    uint32_t header = 0, lock = 0, recursion = 0, owner = 0, head = 0, prev = 0;
+    if (mem::Read(sec::kCriticalSection, &header, sizeof(header)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalOwner, &owner, sizeof(owner)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalListHead, &head, sizeof(head)) != mem::AccessStatus::kOk ||
+        mem::Read(sec::kCriticalListHead + 4, &prev, sizeof(prev)) != mem::AccessStatus::kOk) {
+        error = "could not read the final critical-section state";
+        return false;
+    }
+    if (header != 0x00040001 || lock != 0xFFFFFFFF || recursion != 0 || owner != 0) {
+        error = "critical-section object did not return to its initialized state";
+        return false;
+    }
+    if (head != sec::kCriticalListSentinel || prev != sec::kCriticalListSentinel) {
+        error = "critical-section list changed on the empty path";
+        return false;
+    }
+    if (g_critical_enter_calls != 1 || g_critical_leave_calls != 1) {
+        error = "critical-section enter/leave counts are not one each";
+        return false;
+    }
+    if (g_critical_enter_esp != facts.entry_esp - 0x54 || g_critical_enter_return != sec::kCriticalEnterReturn ||
+        g_critical_enter_arg != sec::kCriticalSection ||
+        g_critical_leave_esp != facts.entry_esp - 0x58 || g_critical_leave_return != sec::kCriticalLeaveReturn ||
+        g_critical_leave_arg != sec::kCriticalSection) {
+        error = "critical-section ABI or stack frame mismatch";
+        return false;
+    }
+    return true;
+}
+
 bool CleanupIntegrated(Options& options) {
     bool thread_ok = kernel::Threads().empty();
     if (g_prepared_thread) {
@@ -933,8 +1299,10 @@ bool CleanupIntegrated(Options& options) {
                     kernel::Threads().size());
     }
     const bool imports_restored = RestoreImportSlots();
+    const bool critical_restored = RestoreCriticalSectionImports();
+    ReleaseCriticalSectionBridge();
     const bool teardown_ok = TeardownReal(options);
-    const bool ok = thread_ok && imports_restored && teardown_ok;
+    const bool ok = thread_ok && imports_restored && critical_restored && teardown_ok;
     if (!ok) std::printf("RESULT fail reason=\"integrated cleanup did not complete\"\n");
     return ok;
 }
@@ -966,7 +1334,12 @@ void PrintIntegratedFacts(const RealFacts& root_facts, const SecondaryFacts& sec
                 secondary.kpcr, secondary.ethread, secondary.tls, secondary.fs0, secondary.registration);
     std::printf("PREFLIGHT secondary tls: source=%08X end=%08X copy=%u zero=%u\n", secondary.tls_source,
                 secondary.tls_end, secondary.tls_copy, secondary.tls_zero);
-    std::printf("PREFLIGHT cleanup: one retained ThreadRef, one cancellation, zero workers, zero resources\n");
+    std::printf("PREFLIGHT critical: object=%08X list=%08X lock=%08X recursion=%u owner=%08X "
+                "enter=%08X leave=%08X\n",
+                sec::kCriticalSection, sec::kCriticalListSentinel, 0xFFFFFFFFu, 0u, 0u, sec::kCriticalEnterSlot,
+                sec::kCriticalLeaveSlot);
+    std::printf("PREFLIGHT cleanup: one retained ThreadRef, one cancellation, four restored imports, zero workers, "
+                "zero resources\n");
     std::printf("PREFLIGHT PASS\n");
 }
 
@@ -1013,6 +1386,16 @@ int RunIntegratedPreflight(const std::string& scenario) {
             candidate->ctx = nullptr;
             kernel::CancelPreparedThread(candidate);
             return finish(error.c_str(), false);
+        }
+        if (!PatchCriticalSectionImports(error)) {
+            candidate->ctx = nullptr;
+            kernel::CancelPreparedThread(candidate);
+            return finish(error.c_str(), false);
+        }
+        if (!RestoreCriticalSectionImports()) {
+            candidate->ctx = nullptr;
+            kernel::CancelPreparedThread(candidate);
+            return finish("critical-section import restoration failed", false);
         }
         PrintIntegratedFacts(facts, secondary);
         candidate->ctx = nullptr;
@@ -1196,6 +1579,215 @@ int RunIntegratedPreflight(const std::string& scenario) {
         if (valid) return finish("corrupted secondary state was accepted", false);
         return finish(error.c_str(), true);
     }
+    if (scenario == "critical-services" || scenario == "critical-service-failure" ||
+        scenario == "critical-abi-bad-cleanup") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        const uint32_t page = 0x60010000;
+        if (!mem::Commit(page, mem::kPage)) return finish("could not commit the critical-section test page", false);
+        uint32_t return_address = 0x11111111, arg = sec::kCriticalSection;
+        mem::Write(page, &return_address, sizeof(return_address));
+        mem::Write(page + 4, &arg, sizeof(arg));
+        mem::Write(page + 0x10, &return_address, sizeof(return_address));
+        mem::Write(page + 0x14, &arg, sizeof(arg));
+        g_critical_owner_ethread = 0xDEADBEEF;
+        g_critical_enter_calls = 0;
+        g_critical_leave_calls = 0;
+        g_critical_fail_mode = CriticalFailMode::kNone;
+        X86Context ctx{};
+        bool valid = true;
+        if (scenario == "critical-services") {
+            ctx.esp = page;
+            ProbeCriticalEnter(ctx, nullptr);
+            valid = valid && ctx.eax == kernel::kSuccess && ctx.esp == page + 8;
+            uint32_t lock = 0, recursion = 0, owner = 0;
+            mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock));
+            mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion));
+            mem::Read(sec::kCriticalOwner, &owner, sizeof(owner));
+            valid = valid && lock == 0 && recursion == 1 && owner == g_critical_owner_ethread;
+            ctx.esp = page + 0x10;
+            ProbeCriticalLeave(ctx, nullptr);
+            valid = valid && ctx.eax == kernel::kSuccess && ctx.esp == page + 0x18;
+            mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock));
+            mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion));
+            mem::Read(sec::kCriticalOwner, &owner, sizeof(owner));
+            valid = valid && lock == 0xFFFFFFFF && recursion == 0 && owner == 0;
+            arg = 0x0046C8B8;
+            mem::Write(page + 4, &arg, sizeof(arg));
+            ctx.esp = page;
+            ProbeCriticalEnter(ctx, nullptr);
+            valid = valid && ctx.eax == kernel::kInvalidParameter;
+            arg = sec::kCriticalSection;
+            mem::Write(page + 4, &arg, sizeof(arg));
+            ctx.esp = page + 0x10;
+            ProbeCriticalLeave(ctx, nullptr);
+            valid = valid && ctx.eax == kernel::kInvalidParameter;
+            ctx.esp = page;
+            ProbeCriticalEnter(ctx, nullptr);
+            const uint32_t wrong_owner = 0x12345678;
+            mem::Write(sec::kCriticalOwner, &wrong_owner, sizeof(wrong_owner));
+            ctx.esp = page + 0x10;
+            ProbeCriticalLeave(ctx, nullptr);
+            valid = valid && ctx.eax == kernel::kInvalidParameter;
+            const uint32_t initial = 0xFFFFFFFF, zero = 0;
+            mem::Write(sec::kCriticalLockCount, &initial, sizeof(initial));
+            mem::Write(sec::kCriticalRecursion, &zero, sizeof(zero));
+            mem::Write(sec::kCriticalOwner, &zero, sizeof(zero));
+        } else if (scenario == "critical-service-failure") {
+            g_critical_fail_mode = CriticalFailMode::kEnterFail;
+            ctx.esp = page;
+            ProbeCriticalEnter(ctx, nullptr);
+            valid = valid && ctx.eax == kernel::kInvalidParameter;
+            g_critical_fail_mode = CriticalFailMode::kNone;
+            ctx.esp = page;
+            ProbeCriticalEnter(ctx, nullptr);
+            g_critical_fail_mode = CriticalFailMode::kLeaveFail;
+            ctx.esp = page + 0x10;
+            ProbeCriticalLeave(ctx, nullptr);
+            valid = valid && ctx.eax == kernel::kInvalidParameter;
+            g_critical_fail_mode = CriticalFailMode::kNone;
+            const uint32_t initial = 0xFFFFFFFF, zero = 0;
+            mem::Write(sec::kCriticalLockCount, &initial, sizeof(initial));
+            mem::Write(sec::kCriticalRecursion, &zero, sizeof(zero));
+            mem::Write(sec::kCriticalOwner, &zero, sizeof(zero));
+        } else {
+            g_critical_fail_mode = CriticalFailMode::kBadCleanup;
+            ctx.esp = page;
+            ProbeCriticalEnter(ctx, nullptr);
+            valid = valid && ctx.esp == page + 4;
+            g_critical_fail_mode = CriticalFailMode::kNone;
+        }
+        mem::Decommit(page, mem::kPage);
+        if (!valid) return finish("critical-section service contract mismatch", false);
+        std::printf("RESULT ok %s\n", scenario.c_str());
+        return finish(nullptr, false);
+    }
+    if (scenario == "critical-lock-held-cleanup") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        const uint32_t page = 0x60010000;
+        if (!mem::Commit(page, mem::kPage)) return finish("could not commit the lock test page", false);
+        uint32_t return_address = 0x11111111, arg = sec::kCriticalSection;
+        mem::Write(page, &return_address, sizeof(return_address));
+        mem::Write(page + 4, &arg, sizeof(arg));
+        g_critical_owner_ethread = 0xDEADBEEF;
+        g_critical_enter_calls = 0;
+        X86Context ctx{};
+        ctx.esp = page;
+        ProbeCriticalEnter(ctx, nullptr);
+        mem::Decommit(page, mem::kPage);
+        const bool cleanup_ok = CleanupIntegrated(options);
+        std::printf("RESULT %s lock-held cleanup\n", cleanup_ok ? "ok" : "fail");
+        return cleanup_ok ? 0 : 5;
+    }
+    if (scenario == "helper-import-slot" || scenario == "helper-ret-mismatch") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        g_secondary = SecondaryState{};
+        g_secondary.running = true;
+        g_secondary.first_step = false;
+        X86Context ctx{};
+        bool rejected = false;
+        if (scenario == "helper-import-slot") {
+            if (!PatchCriticalSectionImports(error)) return finish(error.c_str(), false);
+            const uint32_t bad = 0xDEADBEEF;
+            ProtectRange(kRealImportPage, mem::kPage, mem::kRead | mem::kWrite);
+            mem::Write(sec::kCriticalEnterSlot, &bad, sizeof(bad));
+            ProtectRange(kRealImportPage, mem::kPage, mem::kRead);
+            g_secondary.previous_pc = 0x002B5985;
+            try {
+                SecondaryStep(sec::kCriticalEnterCall, ctx);
+            } catch (const ProbeFailure& failure) {
+                rejected = std::string(failure.reason).find("not the reviewed thunk") != std::string::npos;
+            }
+            RestoreCriticalSectionImports();
+        } else {
+            X86CheckedCallFrame frame{nullptr, 0xDEADBEEF, false};
+            ctx.checked_call = &frame;
+            g_secondary.previous_pc = 0x002B59B1;
+            try {
+                SecondaryStep(0x002B59B2, ctx);
+            } catch (const ProbeFailure& failure) {
+                rejected = std::string(failure.reason).find("does not expect the reviewed return") !=
+                           std::string::npos;
+            }
+        }
+        g_secondary.running = false;
+        if (!rejected) return finish("helper contract violation was not rejected", false);
+        std::printf("RESULT ok %s\n", scenario.c_str());
+        return finish(nullptr, false);
+    }
+    if (scenario == "critical-restore-failure") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (!PatchCriticalSectionImports(error)) return finish(error.c_str(), false);
+        g_critical_restore_fail = true;
+        const bool restored = RestoreCriticalSectionImports();
+        const bool cleanup_ok = CleanupIntegrated(options);
+        (void)cleanup_ok;
+        if (restored) return finish("critical-section restoration failure was accepted", false);
+        std::printf("RESULT ok critical-section restoration failed\n");
+        return 5;
+    }
+    if (scenario == "list-empty" || scenario == "list-nonempty" || scenario == "list-cycle" ||
+        scenario == "list-uncommitted" || scenario == "list-corrupt") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (scenario == "list-empty") {
+            if (!ValidateCriticalSectionInitial(SecondaryFacts{}, error)) return finish(error.c_str(), false);
+            std::printf("RESULT ok empty critical-section list\n");
+            return finish(nullptr, false);
+        }
+        const uint32_t page = 0x60010000;
+        if (!mem::Commit(page, mem::kPage)) return finish("could not commit the list test page", false);
+        const uint32_t sentinel = page + 0x100;
+        uint32_t next = page + 0x10, callback = 0xDEADBEEF;
+        mem::Write(page, &next, sizeof(next));
+        mem::Write(page + 8, &callback, sizeof(callback));
+        next = sentinel;
+        callback = 0;
+        mem::Write(page + 0x10, &next, sizeof(next));
+        mem::Write(page + 0x18, &callback, sizeof(callback));
+        uint32_t target = 0, nodes = 0;
+        bool walked = false;
+        if (scenario == "list-nonempty") {
+            walked = WalkCriticalListForTest(page, sentinel, page, page + 0x100, target, nodes, error);
+            walked = walked && target == 0xDEADBEEF && nodes == 2;
+        } else if (scenario == "list-cycle") {
+            next = page;
+            mem::Write(page, &next, sizeof(next));
+            walked = !WalkCriticalListForTest(page, sentinel, page, page + 0x100, target, nodes, error);
+        } else if (scenario == "list-corrupt") {
+            next = page + 2;
+            mem::Write(page, &next, sizeof(next));
+            walked = !WalkCriticalListForTest(page, sentinel, page, page + 0x100, target, nodes, error);
+        } else {
+            walked = !WalkCriticalListForTest(0x60020000, sentinel, page, page + 0x100, target, nodes, error);
+        }
+        mem::Decommit(page, mem::kPage);
+        if (!walked) return finish("critical-section list walker accepted a bad list", false);
+        std::printf("RESULT ok %s\n", scenario.c_str());
+        return finish(nullptr, false);
+    }
+    if (scenario == "list-dynamic-call") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        g_secondary = SecondaryState{};
+        g_secondary.running = true;
+        g_secondary.first_step = false;
+        g_secondary.previous_pc = 0x002B599F;
+        X86Context ctx{};
+        bool rejected = false;
+        try {
+            SecondaryStep(0x002B59A1, ctx);
+        } catch (const ProbeFailure& failure) {
+            rejected = std::string(failure.reason).find("unreviewed dynamic list callback target") != std::string::npos;
+        }
+        g_secondary.running = false;
+        if (!rejected) return finish("dynamic list callback was not rejected", false);
+        std::printf("RESULT ok dynamic list callback rejected\n");
+        return finish(nullptr, false);
+    }
     if (scenario == "cleanup-open-handle" || scenario == "cleanup-closed-handle") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (!ok) return finish(error.c_str(), false);
@@ -1350,6 +1942,10 @@ int RunIntegratedExecute() {
         std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
         return CleanupIntegrated(options) ? 3 : 5;
     }
+    if (!PatchCriticalSectionImports(error)) {
+        std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
+        return CleanupIntegrated(options) ? 3 : 5;
+    }
     SecondaryFacts secondary;
     if (!RunSecondarySegment(thread, secondary, error)) {
         std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
@@ -1357,6 +1953,11 @@ int RunIntegratedExecute() {
         return CleanupIntegrated(options) ? 3 : 5;
     }
     thread->ctx = nullptr;
+    if (!RestoreCriticalSectionImports()) {
+        std::printf("RESULT fail reason=\"critical-section import restoration failed\"\n");
+        return CleanupIntegrated(options) ? 3 : 5;
+    }
+    ReleaseCriticalSectionBridge();
     const uint32_t secondary_instructions = g_secondary.executed;
     const uint32_t secondary_direct = g_secondary.direct_calls;
     const uint32_t secondary_kernel = g_secondary.kernel_calls;
@@ -1365,8 +1966,9 @@ int RunIntegratedExecute() {
     const uint32_t combined_direct = root_direct + secondary_direct;
     const uint32_t combined_kernel = root_kernel + secondary_kernel;
     const uint32_t combined_imports = root_imports + secondary_imports;
-    if (secondary_instructions != kIntegratedSecondaryInstructions || secondary_direct != 1 ||
-        secondary_kernel != 0 || secondary_imports != 0 || combined_instructions != kIntegratedTotalInstructions ||
+    if (secondary_instructions != kIntegratedSecondaryInstructions || secondary_direct != 2 ||
+        secondary_kernel != 2 ||
+        secondary_imports != 2 || combined_instructions != kIntegratedTotalInstructions ||
         combined_direct != kIntegratedDirectCalls || combined_kernel != kIntegratedKernelCalls ||
         combined_imports != kIntegratedImportReads) {
         std::printf("RESULT fail reason=\"combined segment totals are not the reviewed set\"\n");
@@ -1383,7 +1985,7 @@ int RunIntegratedExecute() {
     std::printf("INTEGRATED_REAL_EXEC ok instructions=%u root=%u secondary=%u direct_calls=%u kernel_calls=%u "
                 "import_reads=%u workers=%zu last=%08X stop=%08X\n",
                 combined_instructions, root_instructions, secondary_instructions, combined_direct, combined_kernel,
-                combined_imports, kernel::KernelWorkerCountForTest(), uint32_t(0x002B5C74), sec::kStopBefore);
+                combined_imports, kernel::KernelWorkerCountForTest(), uint32_t(0x002B59B2), sec::kStopBefore);
     return 0;
 }
 
@@ -1393,7 +1995,7 @@ namespace integrated_probe {
 
 using execution_probe::kRoute;
 using execution_probe::kRouteCount;
-namespace sec = execution_probe_secondary;
+namespace sec = execution_probe_integrated_secondary;
 
 bool ValidateMappingTextFromStrings(const std::string& header, const std::string& source,
                                     const std::string& mapping, std::string& error) {
@@ -1463,16 +2065,21 @@ bool ValidateMappingTextFromStrings(const std::string& header, const std::string
         error = "generated integrated source does not contain exactly the reviewed direct calls";
         return false;
     }
-    if (Occurrences(source, "x86_checked_indirect_call") != 2 ||
-        Occurrences(source, "0x3C9E68u") != 1 || Occurrences(source, "0x3C9D4Cu") != 1) {
-        error = "generated integrated source does not contain the two import calls";
+    if (Occurrences(source, "x86_checked_indirect_call") != 4 ||
+        source.find("x86_checked_indirect_call(ctx, base, 0x3C9E68u, 0x2B5CE6u, 0x2B5CE0u)") == std::string::npos ||
+        source.find("x86_checked_indirect_call(ctx, base, 0x3C9D4Cu, 0x2B2763u, 0x2B275Du)") == std::string::npos ||
+        source.find("x86_checked_indirect_call(ctx, base, 0x3C9E44u, 0x2B598Cu, 0x2B5986u)") == std::string::npos ||
+        source.find("x86_checked_indirect_call(ctx, base, 0x3C9E40u, 0x2B59AFu, 0x2B59A9u)") == std::string::npos ||
+        Occurrences(source, "0x3C9E44u") != 1 || Occurrences(source, "0x3C9E40u") != 1) {
+        error = "generated integrated source does not contain the four reviewed import calls";
         return false;
     }
-    if (Occurrences(source, "x86_checked_ret") != 4 ||
+    if (Occurrences(source, "x86_checked_ret") != 5 ||
         source.find("x86_checked_ret(ctx, 0x2B5D12u, 24)") == std::string::npos ||
         source.find("x86_checked_ret(ctx, 0x2B2774u, 4)") == std::string::npos ||
         source.find("x86_checked_ret(ctx, 0x2B3987u, 0)") == std::string::npos ||
-        source.find("x86_checked_ret(ctx, 0x31983Eu, 0)") == std::string::npos) {
+        source.find("x86_checked_ret(ctx, 0x31983Eu, 0)") == std::string::npos ||
+        source.find("x86_checked_ret(ctx, 0x2B59B2u, 4)") == std::string::npos) {
         error = "generated integrated source does not contain the reviewed RETs";
         return false;
     }
@@ -1490,8 +2097,8 @@ bool ValidateMappingTextFromStrings(const std::string& header, const std::string
         error = "generated integrated source contains an unexpected X86Resume path";
         return false;
     }
-    for (const char* after_boundary : {"// 002B5D15", "// 002B2777", "// 002B3988", "// 002B5C7B",
-                                       "// 0031983F", "// 002B38A7", "// 002B58BD", "// 002B597E"}) {
+    for (const char* after_boundary : {"// 002B5D15", "// 002B2777", "// 002B3988", "// 002B5C7E",
+                                       "// 0031983F", "// 002B38A7", "// 002B58BD", "// 002B59B5"}) {
         if (source.find(after_boundary) != std::string::npos) {
             error = "generated integrated source decoded past a reviewed boundary";
             return false;
@@ -1597,6 +2204,19 @@ int main(int argc, char** argv) {
         {"handoff-bad-tls", 3, "TLS pointer slot"},
         {"handoff-seh", 3, "SEH saved"},
         {"handoff-tls-contents", 3, "TLS zero-fill mismatch"},
+        {"critical-services", 0, "RESULT ok critical-services"},
+        {"critical-service-failure", 0, "RESULT ok critical-service-failure"},
+        {"critical-abi-bad-cleanup", 0, "RESULT ok critical-abi-bad-cleanup"},
+        {"critical-restore-failure", 5, "critical-section restoration failed"},
+        {"critical-lock-held-cleanup", 0, "lock-held cleanup"},
+        {"helper-import-slot", 0, "RESULT ok helper-import-slot"},
+        {"helper-ret-mismatch", 0, "RESULT ok helper-ret-mismatch"},
+        {"list-empty", 0, "empty critical-section list"},
+        {"list-nonempty", 0, "RESULT ok list-nonempty"},
+        {"list-cycle", 0, "RESULT ok list-cycle"},
+        {"list-corrupt", 0, "RESULT ok list-corrupt"},
+        {"list-uncommitted", 0, "RESULT ok list-uncommitted"},
+        {"list-dynamic-call", 0, "dynamic list callback rejected"},
         {"cleanup-open-handle", 0, "CLEANUP thread="},
         {"cleanup-closed-handle", 0, "CLEANUP thread="},
         {"cleanup-twice", 0, "cleanup-twice"},

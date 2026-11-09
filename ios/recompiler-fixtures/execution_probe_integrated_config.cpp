@@ -5,7 +5,7 @@
 #include <sstream>
 
 #include "execution_probe_route.h"
-#include "execution_probe_secondary_route.h"
+#include "execution_probe_integrated_secondary_route.h"
 
 int main(int argc, char** argv) {
     if (argc != 3) {
@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
               "end = 0x002B382A\n\n"
               "[[function]]\n"
               "at = 0x002B5C0F\n"
-              "end = 0x002B5C7B\n\n"
+              "end = 0x002B5C7E\n\n"
               "[[function]]\n"
               "at = 0x00319804\n"
               "end = 0x0031983F\n\n"
@@ -61,18 +61,18 @@ int main(int argc, char** argv) {
               "end = 0x002B58BD\n\n"
               "[[function]]\n"
               "at = 0x002B597D\n"
-              "end = 0x002B597E\n";
+              "end = 0x002B59B5\n";
     for (const auto& step : execution_probe::kRoute) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
                << step.pc << "\"\n";
     }
-    for (const auto& step : execution_probe_secondary::kRoute) {
+    for (const auto& step : execution_probe_integrated_secondary::kRoute) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\ncall = \"SecondaryStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
                << step.pc << "\"\n";
     }
-    for (uint32_t pc : execution_probe_secondary::kTrapPcs) {
+    for (uint32_t pc : execution_probe_integrated_secondary::kTrapPcs) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << pc
                << "\ncall = \"SecondaryStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
                << pc << "\"\n";

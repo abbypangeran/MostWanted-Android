@@ -2315,3 +2315,109 @@ New fault-injection scenarios cover cleanup with an open handle, cleanup after `
 Reviewed failure exits: before preparation, after preparation with an open handle, after handle closure, after import-restoration failure, after handoff validation failure, after secondary context/ticket/execution failure, during final cancellation, and during final teardown. The only paths without a `CleanupIntegrated` call are `mem::Init` failure (no memory or thread exists) and `RestartKernelWorkers` failure (no thread or patched import exists). No authentic XBE instruction was executed.
 
 Updated decision: **GO for one later supervised integrated run remains**, conditional on review and explicit authorisation; **NO-GO for extending beyond the 125-instruction boundary**.
+
+## Phase 2C-37 critical-section helper and system-routine continuation
+
+### Reviewed helper contract
+
+`0x002B597D..0x002B59B2` is the complete empty-list path:
+
+```
+002B597D push ebx
+002B597E push esi
+002B597F push edi
+002B5980 mov ebx, 0x46C8B0
+002B5985 push ebx
+002B5986 call [0x003C9E44]      ; ordinal 277, RtlEnterCriticalSection
+002B598C mov esi, [0x0046C8CC]
+002B5992 mov edi, 0x46C8CC
+002B5997 jmp 0x002B59A4
+002B59A4 cmp esi, edi
+002B59A6 jnz 0x002B5999         ; not taken for the empty list
+002B59A8 push ebx
+002B59A9 call [0x003C9E40]      ; ordinal 294, RtlLeaveCriticalSection
+002B59AF pop edi
+002B59B0 pop esi
+002B59B1 pop ebx
+002B59B2 ret 0x04
+```
+
+- Caller: `push 1` at `002B5C74`, `call 002B597D` at `002B5C76`.
+- Helper entry ESP is `callback_entry_esp - 0x40`; the one stack argument is `1` at `[entry_esp+4]`, ignored on the empty path.
+- EBX/ESI/EDI are callee-saved and restored. `RET 0x04` pops the return address and the argument, returning to `002B5C7B`.
+- Both imports are 1-argument stdcall calls: `003C9E44` = `80000115` (ordinal 277) and `003C9E40` = `80000126` (ordinal 294).
+- The helper returns EAX 0 from the leave service and preserves ECX/EDX.
+
+### Authentic critical-section and list state
+
+The object at `0046C8B0` is in the authentic initialized state:
+
+| Field | Value |
+|---|---|
+| header | `00040001` |
+| WaitListHead | self at `0046C8B8` |
+| LockCount | `FFFFFFFF` |
+| RecursionCount | `00000000` |
+| OwningThread | `00000000` |
+| helper list head/prev | `0046C8CC` / `0046C8CC` |
+
+The helper's list is **empty** in the prepared image. The root sequence does not touch this object. The `jnz` at `002B59A6` is therefore not taken and `002B5999..002B59A1` does not execute. A non-empty list would reach the dynamic call at `002B59A1`; that instruction is a forbidden pre-instruction boundary.
+
+### Test-only kernel services
+
+Ordinals 277/294 are registered only under `MOSTWANTED_CHECKED_KERNEL_ABI_TESTS` and are reachable only through the checked import slots. The handlers validate the exact object pointer `0046C8B0`, the exact one-argument stdcall frame and the reviewed layout. Enter requires `LockCount=FFFFFFFF`, recursion 0 and owner 0, then sets `LockCount=0`, recursion 1 and owner to the retained thread's ETHREAD. Leave requires the inverse state and restores the initialized values. Invalid pointers, repeated leave, wrong owner, unexpected nesting and injected service failures return an error without changing state. No host worker is involved. All four import slots are restored with readback.
+
+### Extended generated route
+
+| Item | Value |
+|---|---|
+| Secondary route entries | 76 (54 prefix + 17 helper + 1 stop + 4 alternate loop-body) |
+| Route bytes/hash | 226 bytes, FNV-1a `B3408A252D44C99D` |
+| Executed secondary instructions | 71 |
+| Combined executed instructions | 143 (72 root + 71 secondary) |
+| Direct calls | 4 (root 2, SEH call, helper call) |
+| Kernel calls | 4 (root 2, helper 2) |
+| Import operand reads | 4 (root 2, helper 2) |
+| Stop | pre-instruction `002B5C7B`, before `push [ebp+0x0C]` |
+| Mapping | 11 functions, 0 continuations, 156 hooks |
+
+The system routine's decode end is `002B5C7E` so `002B5C7B` is a hooked instruction; the helper's decode end is `002B59B5` so `RET 0x04` is emitted. The stop prevents the dynamic start-routine call at `002B5C7E`.
+
+### Synthetic and regression tests
+
+Integrated probe, Debug and Release, 45 PASS checks:
+
+- Critical-section normal enter/leave, invalid pointer, repeated leave, wrong owner, injected enter/leave failure, bad stdcall cleanup, restoration failure and cleanup with the lock held.
+- Empty list; non-empty list with two reviewed nodes; cycle; corrupt pointer; uncommitted pointer; dynamic callback rejection at `002B59A1`.
+- Helper import slot mismatch and checked RET return mismatch.
+- Existing root/secondary handoff, cleanup, cancellation, import restoration and supervision scenarios.
+
+Root and secondary standalone preflight/self-test pass in Debug and Release. `ctest` is 6/6 in both configurations. No authentic XBE instruction was executed.
+
+### Remaining unsupported operations
+
+- Non-empty list dynamic call `[eax+0x08]` at `002B59A1`.
+- `002B5C7E` dynamic start-routine call and the rest of the system routine.
+- Start routine `002B38A2`, SEH epilog, handler `00319858`, `PsTerminateSystemThread` and exception delivery.
+- `StartThread`, worker activation, production `Boot()` and Apple guards remain disabled.
+
+### Decision
+
+**GO for one later supervised Release run** of the 143-instruction integrated prefix, after independent review and explicit authorisation:
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_integrated_real_preflight \
+  --run-once --execute-real
+```
+
+**NO-GO for the dynamic list callback or start-routine activation** until those targets are separately reviewed.
+
+### Guest-thread activation assessment
+
+Replacing the synchronous test-only secondary execution with a real worker requires:
+
+1. **StartThread and callback lifetime.** `StartThread` prepares start- and system-routine tickets, registers the thread and launches a kernel worker. The start routine `002B38A2` is currently trap-only and must be reviewed/mapped; the system-routine callback must survive registration and worker scheduling.
+2. **Worker context and ordering.** The worker needs `t_current`, `InitContext`, FS/KPCR/ETHREAD/TLS ownership and the real stack. The current probe invokes `CallGuestCallbackForTest` synchronously on the host thread; a worker changes ordering with the root caller and requires a join/synchronisation contract.
+3. **Termination and join.** The current path cancels a prepared thread. Worker execution needs `PsTerminateSystemThread`/exit semantics, worker stop and join, cancellation while active, SEH/TLS teardown and a parent-side timeout. The existing image preparation, checked ABI, memory observer, route hooks and callback tickets are reusable; the synchronous callback and prepared-thread cancellation are not.
+
+First three blockers: start routine mapping/callback contract; real worker context/scheduling; active-thread termination and join.
