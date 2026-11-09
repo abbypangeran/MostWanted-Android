@@ -31,6 +31,7 @@ std::mutex g_synthetic_worker_lock;
 SyntheticWorkerAuthorization g_synthetic_worker_auth;
 bool g_synthetic_worker_armed = false;
 bool g_synthetic_worker_claimed = false;
+Thread* g_synthetic_worker_owner = nullptr;
 SyntheticWorkerPreCallbackHook g_synthetic_worker_hook = nullptr;
 #endif
 #ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
@@ -367,6 +368,7 @@ void DisarmSyntheticWorker() {
     std::lock_guard lock(g_synthetic_worker_lock);
     g_synthetic_worker_armed = false;
     g_synthetic_worker_claimed = false;
+    g_synthetic_worker_owner = nullptr;
     g_synthetic_worker_auth = {};
 }
 
@@ -384,12 +386,19 @@ SyntheticWorkerClaim ClaimSyntheticWorker(uint32_t target, uint32_t context, uin
         target < g_synthetic_worker_auth.code_base || target >= g_synthetic_worker_auth.code_end)
         return SyntheticWorkerClaim::kRejected;
     g_synthetic_worker_claimed = true;
+    g_synthetic_worker_owner = Current();
     return SyntheticWorkerClaim::kClaimed;
+}
+
+bool SyntheticWorkerClaimHeld() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_worker_claimed && g_synthetic_worker_owner == Current();
 }
 
 void FinishSyntheticWorker() {
     std::lock_guard lock(g_synthetic_worker_lock);
     g_synthetic_worker_claimed = false;
+    g_synthetic_worker_owner = nullptr;
     g_synthetic_worker_armed = false;
     g_synthetic_worker_auth = {};
 }

@@ -2885,3 +2885,49 @@ Guest-originated `PsTerminateSystemThread`/ordinal-258 was not implemented in th
 | Authentic Phase 2C-41 experiment | Not rerun | Not rerun |
 
 **Customer release:** Not performed. R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-4 — synthetic guest-originated termination
+
+**PHASE_2D4_GUEST_TERMINATION = PASS.** The Phase 2C-41 authentic experiment remained frozen and was not rerun. A generated synthetic guest callback now requests its own termination through a checked, test-only ordinal-258 bridge, and the fixture proves exact exit status, non-return, managed unwinding, waiter signalling, handle retention and exactly-once resource finalization.
+
+### Checked bridge and ABI
+
+- `dispatch::SetKernel258FixtureBridge` is compiled only with `MOSTWANTED_CHECKED_KERNEL_ABI_TESTS`; the bridge entry is disabled by default and is enabled only by the checked fixture. The production `PsTerminateSystemThread` registration and Apple execution guard are unchanged.
+- The bridge uses the existing checked-call path: a 32-bit guest `call dword ptr [0xA5100]` resolves the synthetic slot to `KernelThunkAddress(258)`, validates the return address inside the generated fixture image, requires one stdcall argument, and enforces the exact `RET` cleanup.
+- The fixture registers ordinal 258 as `PsTerminateSystemThread` with `ExitThread(a[0])`, mirroring the production export body. `ExitThread` marks the thread `kExited` with the guest status, signals waiters, then throws the managed termination exception.
+- The test handler rejects any call made without the claimed synthetic-worker authorization and returns `kInvalidParameter` instead of terminating. It is reachable only through the enabled checked bridge and the synthetic worker claim.
+
+### Guest route
+
+- `0x11283 mov eax, [esp+4]` receives the start context.
+- `0x11287 push eax` places the exit status as the single stdcall argument.
+- `0x11288 call dword ptr [0xA5100]` enters the checked ordinal-258 bridge; the return address is `0x1128E`.
+- `0x1128E mov dword ptr [0xA5104], 0xDEADBEEF` is the deliberately detectable post-termination instruction. Successful termination unwinds before it, so the marker stays zero.
+- `0x11298 ret` is reachable only on the rejected-call path.
+
+### Lifecycle evidence
+
+- Successful worker: exit status `0x2468ACE0`, state `kExited`, `Wait` returns `kWait0`, retained handle preserves `exit_code`, `Thread::ctx` cleared, callback tickets cleared, ETHREAD/KPCR/stack allocations released, `Threads()` empty, zero workers, system-allocation baseline restored, authorization consumed.
+- Post-call marker remained `0`, proving no guest instruction ran after termination.
+- `dispatch::Init` after completion proves the checked call and page leases unwound before teardown.
+- Handle closure while the handler is blocked retains the thread state and guest allocation fields until finalization; the retained `ThreadRef` then rejects a second cancellation.
+- With the bridge disabled, the checked call traps at `0x11288` with a kernel-thunk rejection before dispatch and does not write the marker.
+- Host shutdown during a blocked termination waits for worker quiescence, then observes `kExited`, the exact exit status, released resources and zero workers. `mem::Shutdown` is never allowed to dispose of a live owned thread.
+- Unclaimed bridge use, stale dispatch generation and an undersized callback stack all fail closed before termination.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture suite | 538 PASS / 0 FAIL | 538 PASS / 0 FAIL |
+| Recompiler fixture CTest | 6/6 passed | 6/6 passed |
+| Darwin memory/worker CTest | 1/1 passed | 1/1 passed |
+| Authentic Phase 2C-41 experiment | Not rerun | Not rerun |
+
+### Remaining limits
+
+- Termination is synthetic-only. The bridge is compiled under the checked ABI test macro, disabled by default, and requires the synthetic worker claim; authentic XBE images and production `Boot()` cannot reach it.
+- The production ordinal-258 export is still a host-side `ExitThread(a[0])` path; no authentic guest instruction has executed it. Authentic guest termination remains a separate bounded package with the same checked-dispatch and lifecycle prerequisites.
+- No authentic start routine, `002B38A2`, `002B5C7B` continuation, SEH handler, production `Boot()` change, iPhone install or `main` merge occurred.
+
+**Customer release:** Not performed. R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

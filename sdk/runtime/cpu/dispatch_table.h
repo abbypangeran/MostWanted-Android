@@ -19,6 +19,7 @@ bool SetKernel255FixtureBridge(bool enabled);
 bool SetKernel187FixtureBridge(bool enabled);
 bool SetKernel277FixtureBridge(bool enabled);
 bool SetKernel294FixtureBridge(bool enabled);
+bool SetKernel258FixtureBridge(bool enabled);
 #endif
 
 enum class TargetKind {

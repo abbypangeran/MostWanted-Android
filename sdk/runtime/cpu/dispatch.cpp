@@ -45,6 +45,7 @@ FixtureBridge g_fixture_bridges[] = {
     {187, "NtClose", 1, false},
     {277, "RtlEnterCriticalSection", 1, false},
     {294, "RtlLeaveCriticalSection", 1, false},
+    {258, "PsTerminateSystemThread", 1, false},
 };
 
 bool SetFixtureBridge(uint32_t ordinal, bool enabled) {
@@ -147,6 +148,7 @@ bool SetKernel255FixtureBridge(bool enabled) { return SetFixtureBridge(255, enab
 bool SetKernel187FixtureBridge(bool enabled) { return SetFixtureBridge(187, enabled); }
 bool SetKernel277FixtureBridge(bool enabled) { return SetFixtureBridge(277, enabled); }
 bool SetKernel294FixtureBridge(bool enabled) { return SetFixtureBridge(294, enabled); }
+bool SetKernel258FixtureBridge(bool enabled) { return SetFixtureBridge(258, enabled); }
 #endif
 
 ResolvedTarget ResolveTarget(uint32_t guest) {

@@ -29,6 +29,7 @@ enum class SyntheticWorkerClaim : uint8_t { kNotAuthorized, kClaimed, kRejected 
 bool ArmSyntheticWorker(const SyntheticWorkerAuthorization& authorization);
 void DisarmSyntheticWorker();
 SyntheticWorkerClaim ClaimSyntheticWorker(uint32_t target, uint32_t context, uint64_t dispatch_generation);
+bool SyntheticWorkerClaimHeld();
 bool SyntheticWorkerExitMatches(uint32_t code);
 void FinishSyntheticWorker();
 bool SyntheticWorkerArmed();

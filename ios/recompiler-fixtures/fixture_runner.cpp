@@ -82,6 +82,50 @@ void ReleaseSyntheticHook() {
     }
     g_synthetic_hook_cv.notify_all();
 }
+
+std::atomic<uint32_t> g_kernel258_calls{0};
+std::mutex g_kernel258_lock;
+std::condition_variable g_kernel258_cv;
+bool g_kernel258_gate = false;
+bool g_kernel258_entered = false;
+bool g_kernel258_release = false;
+
+void ResetKernel258Gate(bool gate) {
+    std::lock_guard lock(g_kernel258_lock);
+    g_kernel258_gate = gate;
+    g_kernel258_entered = false;
+    g_kernel258_release = false;
+}
+
+bool WaitKernel258Entered() {
+    std::unique_lock lock(g_kernel258_lock);
+    return g_kernel258_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_kernel258_entered; });
+}
+
+void ReleaseKernel258Gate() {
+    {
+        std::lock_guard lock(g_kernel258_lock);
+        g_kernel258_release = true;
+    }
+    g_kernel258_cv.notify_all();
+}
+
+void Kernel258FixtureHandler(X86Context& ctx, uint8_t*) {
+    ++g_kernel258_calls;
+    if (!kernel::SyntheticWorkerClaimHeld()) {
+        kernel::Return(ctx, kernel::kInvalidParameter, 1);
+        return;
+    }
+    {
+        std::unique_lock lock(g_kernel258_lock);
+        if (g_kernel258_gate) {
+            g_kernel258_entered = true;
+            g_kernel258_cv.notify_all();
+            g_kernel258_cv.wait(lock, [] { return g_kernel258_release; });
+        }
+    }
+    kernel::ExitThread(kernel::R32(ctx.esp + 4));
+}
 #endif
 X86MemoryFault last_fault{};
 uint32_t last_trap_pc = 0;
@@ -1195,6 +1239,261 @@ void CheckSyntheticWorkerLifecycle() {
               "a retained completed ThreadRef cannot release allocations reused by a newer thread");
         Check(kernel::CancelPreparedThread(reused) && mem::Query().system_used == baseline.system_used,
               "the newer prepared thread cancels cleanly after the stale-reference check");
+    }
+
+    // Phase 2D-4: guest-originated termination through a checked ordinal-258 bridge.
+    {
+        constexpr uint32_t fixture_base = 0x11000;
+        constexpr uint32_t termination_target = 0x11283;
+        constexpr uint32_t import_slot = output_page + 0x100;
+        constexpr uint32_t marker = output_page + 0x104;
+        constexpr uint32_t exit_status = 0x2468ACE0;
+
+        Check(mem::Commit(fixture_base, mem::kPage) &&
+                  mem::Protect(fixture_base, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+              "synthetic termination fixture code page prepares");
+        Check(dispatch::Init(error), "checked fixture mapping exposes the synthetic termination guest function");
+        kernel::RegisterExport(258, "PsTerminateSystemThread", Kernel258FixtureHandler);
+        Check(dispatch::SetKernel258FixtureBridge(true),
+              "ordinal-258 checked bridge enables for the synthetic termination fixture");
+        const uint32_t slot_value = dispatch::KernelThunkAddress(258);
+        Check(mem::Write(import_slot, &slot_value, sizeof(slot_value)) == mem::AccessStatus::kOk,
+              "synthetic ordinal-258 import slot targets the checked kernel thunk");
+
+        auto write_marker = [&](uint32_t value) {
+            return mem::Write(marker, &value, sizeof(value)) == mem::AccessStatus::kOk;
+        };
+        auto read_marker = [&] {
+            uint32_t value = 0;
+            return mem::Read(marker, &value, sizeof(value)) == mem::AccessStatus::kOk ? value : 0xFFFFFFFFu;
+        };
+        auto termination_generation = [&]() -> uint64_t {
+            kernel::GuestCallbackTicket ticket;
+            return kernel::PrepareGuestCallback(termination_target, kernel::GuestCallbackClass::kThreadStart, ticket) ==
+                           kernel::GuestCallbackStatus::kReady
+                       ? ticket.dispatch_generation
+                       : 0;
+        };
+        auto arm_termination = [&](uint32_t context, uint64_t generation) {
+            kernel::SyntheticWorkerAuthorization authorization;
+            authorization.target = termination_target;
+            authorization.context = context;
+            authorization.expected_exit = context;
+            authorization.code_base = fixture_base;
+            authorization.code_end = X86CodeEnd;
+            authorization.dispatch_generation = generation;
+            authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+            return kernel::ArmSyntheticWorker(authorization);
+        };
+
+        // No synthetic worker holds a claim: the bridge rejects the call and the
+        // guest continues to its marker, so the post-call instruction is observable.
+        {
+            Check(write_marker(0), "direct termination marker clears");
+            kernel::GuestCallbackTicket ticket;
+            Check(kernel::PrepareGuestCallback(termination_target, kernel::GuestCallbackClass::kFixture, ticket) ==
+                      kernel::GuestCallbackStatus::kReady,
+                  "direct termination fixture ticket registers");
+            const uint32_t stack_top = mem::AllocStack(0x4000);
+            const uint32_t calls_before = g_kernel258_calls.load();
+            X86Context direct{};
+            direct.esp = stack_top - 0x40;
+            const std::array<uint32_t, 1> argument{exit_status};
+            uint32_t result = 0;
+            const auto status = kernel::CallGuestCallbackForTest(direct, ticket, termination_target, argument,
+                                                                 stack_top - 0x4000, 0x4000, result);
+            Check(stack_top && status == kernel::GuestCallbackStatus::kInvoked && result == kernel::kInvalidParameter &&
+                      read_marker() == 0xDEADBEEF && g_kernel258_calls.load() == calls_before + 1,
+                  "an unclaimed guest termination call is rejected without terminating the caller");
+            Check(mem::FreeStack(stack_top), "direct termination fixture stack releases");
+        }
+
+        // A dispatch reset invalidates the ticket before execution.
+        {
+            Check(write_marker(0), "stale termination marker clears");
+            kernel::GuestCallbackTicket ticket;
+            Check(kernel::PrepareGuestCallback(termination_target, kernel::GuestCallbackClass::kFixture, ticket) ==
+                          kernel::GuestCallbackStatus::kReady &&
+                      dispatch::Init(error),
+                  "direct termination ticket and dispatch generation prepare");
+            const uint32_t stack_top = mem::AllocStack(0x4000);
+            const uint32_t calls_before = g_kernel258_calls.load();
+            X86Context direct{};
+            direct.esp = stack_top - 0x40;
+            const std::array<uint32_t, 1> argument{exit_status};
+            uint32_t result = 0;
+            const auto status = kernel::CallGuestCallbackForTest(direct, ticket, termination_target, argument,
+                                                                 stack_top - 0x4000, 0x4000, result);
+            Check(stack_top && status == kernel::GuestCallbackStatus::kStaleDispatch && read_marker() == 0 &&
+                      g_kernel258_calls.load() == calls_before,
+                  "a stale dispatch generation rejects the termination callback before execution");
+            Check(mem::FreeStack(stack_top), "stale termination fixture stack releases");
+        }
+
+        // An undersized callback stack fails closed before the guest function runs.
+        {
+            Check(write_marker(0), "invalid-stack termination marker clears");
+            kernel::GuestCallbackTicket ticket;
+            Check(kernel::PrepareGuestCallback(termination_target, kernel::GuestCallbackClass::kFixture, ticket) ==
+                      kernel::GuestCallbackStatus::kReady,
+                  "invalid-stack termination ticket registers");
+            const uint32_t stack_top = mem::AllocStack(0x4000);
+            const uint32_t calls_before = g_kernel258_calls.load();
+            X86Context direct{};
+            direct.esp = stack_top - 0x4000 + 4;
+            const std::array<uint32_t, 1> argument{exit_status};
+            uint32_t result = 0;
+            const auto status = kernel::CallGuestCallbackForTest(direct, ticket, termination_target, argument,
+                                                                 stack_top - 0x4000, 0x4000, result);
+            Check(stack_top && status == kernel::GuestCallbackStatus::kInvalidStack && read_marker() == 0 &&
+                      g_kernel258_calls.load() == calls_before,
+                  "insufficient termination callback stack fails before guest execution");
+            Check(mem::FreeStack(stack_top), "invalid-stack termination fixture stack releases");
+        }
+
+        // The claimed synthetic worker terminates itself through ordinal 258.
+        {
+            Check(write_marker(0), "successful termination marker clears");
+            kernel::ThreadRef terminating;
+            if (!prepare(terminating, termination_target, exit_status, output_page)) return;
+            uint32_t handle = 0;
+            mem::Read(output_page, &handle, sizeof(handle));
+            const uint32_t ethread = terminating->ethread;
+            const uint32_t kpcr = terminating->kpcr;
+            const uint32_t stack = terminating->stack_top;
+            const uint64_t generation = termination_generation();
+            const uint32_t calls_before = g_kernel258_calls.load();
+            Check(generation != 0 && arm_termination(exit_status, generation),
+                  "synthetic termination authorization arms for the checked fixture image");
+            const bool started = kernel::StartThread(terminating);
+            const uint32_t wait = started ? wait_thread(terminating) : kernel::kTimeout;
+            const bool joined = join_workers();
+            const auto retained = kernel::FromHandle(handle);
+            const auto retained_thread = std::static_pointer_cast<kernel::Thread>(retained);
+            Check(started && wait == kernel::kWait0 && joined &&
+                      terminating->state.load() == kernel::ThreadState::kExited &&
+                      terminating->exit_code.load() == exit_status && terminating->ctx == nullptr &&
+                      terminating->resources_released && !terminating->start_routine_ticket.target &&
+                      !terminating->system_routine_ticket.target && !terminating->ethread && !terminating->kpcr &&
+                      !terminating->stack_top && !mem::AllocationSize(ethread) && !mem::AllocationSize(kpcr) &&
+                      !mem::IsCommitted(stack - 1) && retained.get() == terminating.get() &&
+                      retained_thread && retained_thread->exit_code.load() == exit_status && read_marker() == 0 &&
+                      g_kernel258_calls.load() == calls_before + 1 && kernel::KernelWorkerCountForTest() == 0 &&
+                      kernel::Threads().empty() && !kernel::SyntheticWorkerArmed() &&
+                      mem::Query().system_used == baseline.system_used,
+                  "synthetic guest terminates through ordinal 258 with the exact status and no post-call instruction");
+            Check(!kernel::CancelPreparedThread(terminating) && mem::Query().system_used == baseline.system_used,
+                  "a terminated synthetic worker rejects a second cancellation without touching allocations");
+            Check(dispatch::Init(error), "synthetic termination dispatch and page leases unwind after completion");
+            kernel::CloseHandle(handle);
+        }
+
+        // The guest blocks inside ordinal 258; the host closes the handle, then
+        // releases termination and observes finalization after the callback.
+        {
+            ResetKernel258Gate(true);
+            kernel::ThreadRef closing;
+            if (!prepare(closing, termination_target, exit_status ^ 1, output_page)) return;
+            uint32_t handle = 0;
+            mem::Read(output_page, &handle, sizeof(handle));
+            const uint32_t ethread = closing->ethread;
+            const uint32_t kpcr = closing->kpcr;
+            const uint32_t stack = closing->stack_top;
+            const uint64_t generation = termination_generation();
+            Check(generation != 0 && arm_termination(exit_status ^ 1, generation),
+                  "authorization arms for handle closure during guest termination");
+            const bool started = kernel::StartThread(closing);
+            const bool entered = WaitKernel258Entered();
+            const bool closed = kernel::CloseHandle(handle);
+            // The checked kernel bridge holds g_lock while the handler waits, so
+            // inspect owner fields rather than call memory queries here.
+            const bool retained_active = started && entered && closed &&
+                                         closing->state.load() == kernel::ThreadState::kActive &&
+                                         !closing->resources_released && closing->ethread == ethread &&
+                                         closing->kpcr == kpcr && closing->stack_top == stack &&
+                                         ethread != 0 && kpcr != 0 && stack != 0 && !kernel::FromHandle(handle);
+            ReleaseKernel258Gate();
+            const uint32_t wait = started ? wait_thread(closing) : kernel::kTimeout;
+            const bool joined = join_workers();
+            Check(retained_active && wait == kernel::kWait0 &&
+                      closing->state.load() == kernel::ThreadState::kExited &&
+                      closing->exit_code.load() == (exit_status ^ 1) && closing->resources_released &&
+                      !closing->ethread && !closing->kpcr && !closing->stack_top &&
+                      kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used,
+                  "closing the handle during guest termination retains resources until the worker finalizes");
+            ResetKernel258Gate(false);
+        }
+
+        // With the bridge disabled the checked call is rejected before dispatch.
+        {
+            Check(dispatch::SetKernel258FixtureBridge(false),
+                  "ordinal-258 checked bridge disables after synthetic termination coverage");
+            Check(write_marker(0), "disabled-bridge marker clears");
+            kernel::GuestCallbackTicket ticket;
+            Check(kernel::PrepareGuestCallback(termination_target, kernel::GuestCallbackClass::kFixture, ticket) ==
+                      kernel::GuestCallbackStatus::kReady,
+                  "disabled-bridge termination ticket registers");
+            const uint32_t stack_top = mem::AllocStack(0x4000);
+            const uint32_t calls_before = g_kernel258_calls.load();
+            const int traps_before = traps;
+            X86Context direct{};
+            direct.esp = stack_top - 0x40;
+            const std::array<uint32_t, 1> argument{exit_status};
+            uint32_t result = 0;
+            bool rejected = false;
+            try {
+                (void)kernel::CallGuestCallbackForTest(direct, ticket, termination_target, argument, stack_top - 0x4000,
+                                                       0x4000, result);
+            } catch (const FixtureStop&) {
+                rejected = true;
+            }
+            Check(stack_top && rejected && traps == traps_before + 1 && last_trap_pc == 0x11288 &&
+                      last_trap_reason.find("kernel export thunk") != std::string::npos && read_marker() == 0 &&
+                      g_kernel258_calls.load() == calls_before,
+                  "an unbridged ordinal-258 call traps before dispatch and executes no post-call instruction");
+            Check(mem::FreeStack(stack_top) && dispatch::Init(error),
+                  "disabled-bridge termination stack and dispatch leases release");
+            Check(dispatch::SetKernel258FixtureBridge(true),
+                  "ordinal-258 checked bridge re-enables for the shutdown test");
+        }
+
+        // Termination quiesces before memory teardown completes.
+        {
+            ResetKernel258Gate(true);
+            kernel::ThreadRef shutdown_thread;
+            if (!prepare(shutdown_thread, termination_target, exit_status ^ 2, output_page)) return;
+            uint32_t handle = 0;
+            mem::Read(output_page, &handle, sizeof(handle));
+            const uint64_t generation = termination_generation();
+            Check(generation != 0 && arm_termination(exit_status ^ 2, generation),
+                  "authorization arms for guest termination during host shutdown");
+            const bool started = kernel::StartThread(shutdown_thread);
+            const bool entered = WaitKernel258Entered();
+            std::atomic<bool> shutdown_done{false};
+            std::thread shutdown([&] {
+                mem::Shutdown();
+                shutdown_done.store(true);
+            });
+            bool waited = false;
+            for (int i = 0; i < 100 && !waited; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                // mem::IsInitialized() locks g_lock, which the blocked bridge holds.
+                waited = !shutdown_done.load() && !kernel::KernelWorkersAccepting();
+            }
+            ReleaseKernel258Gate();
+            shutdown.join();
+            const bool terminated = shutdown_thread->state.load() == kernel::ThreadState::kExited &&
+                                    shutdown_thread->exit_code.load() == (exit_status ^ 2) &&
+                                    shutdown_thread->resources_released;
+            kernel::CloseHandle(handle);
+            Check(started && entered && waited && shutdown_done.load() && terminated &&
+                      kernel::KernelWorkerCountForTest() == 0 && !mem::IsInitialized(),
+                  "host shutdown waits for guest termination to quiesce before releasing memory");
+            ResetKernel258Gate(false);
+            Check(dispatch::SetKernel258FixtureBridge(false),
+                  "ordinal-258 checked bridge disables after the shutdown test");
+            if (!initialize()) return;
+        }
     }
 
     kernel::StopKernelWorkers();

@@ -171,6 +171,16 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0x67, 0x0F, 0xBE, 0x00, 0xC3                  // 16-bit MOVSX memory must trap
     });
     code.insert(code.end(), {0x8B, 0x44, 0x24, 0x04, 0xC3});  // mov eax, [esp+4]; ret
+    // 0x11283: terminate through the checked ordinal-258 slot at 0xA5100; the
+    // marker at 0xA5104 must stay untouched when termination succeeds.
+    code.insert(code.end(), {
+        0x8B, 0x44, 0x24, 0x04,                          // mov eax, [esp+4]
+        0x50,                                            // push eax
+        0xFF, 0x15, 0x00, 0x51, 0x0A, 0x00,              // call dword ptr [0xA5100]
+        0xC7, 0x05, 0x04, 0x51, 0x0A, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, // mov dword ptr [0xA5104], 0xDEADBEEF
+        0xC3                                             // ret
+    });
+    if (code.size() != 0x299) return false;
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
     std::copy_n("XBEH", 4, image.begin());
@@ -545,7 +555,8 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "\n[[function]]\nat = 0x1126B\nend = 0x11270\n"
               "\n[[function]]\nat = 0x11270\nend = 0x11279\n"
               "\n[[function]]\nat = 0x11279\nend = 0x1127E\n"
-              "\n[[function]]\nat = 0x1127E\nend = 0x11283\n";
+              "\n[[function]]\nat = 0x1127E\nend = 0x11283\n"
+              "\n[[function]]\nat = 0x11283\nend = 0x11299\n";
     return bool(config);
 }
 
