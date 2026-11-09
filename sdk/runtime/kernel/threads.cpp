@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "kernel/kernel.h"
+#include "kernel/synthetic_worker.h"
 #include "kernel/thread_memory.h"
 #include "kernel/worker_lifecycle.h"
 
@@ -25,6 +26,13 @@ struct GuestThreadTermination {};
 std::mutex g_threads_lock;
 std::vector<ThreadRef> g_threads;
 std::atomic<uint32_t> g_next_id{0x10};
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+std::mutex g_synthetic_worker_lock;
+SyntheticWorkerAuthorization g_synthetic_worker_auth;
+bool g_synthetic_worker_armed = false;
+bool g_synthetic_worker_claimed = false;
+SyntheticWorkerPreCallbackHook g_synthetic_worker_hook = nullptr;
+#endif
 #ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
 std::atomic<ThreadPreparationFailPoint> g_thread_fail_point{ThreadPreparationFailPoint::kNone};
 std::atomic<uint32_t> g_worker_launch_count{0};
@@ -341,6 +349,71 @@ bool FinalizeThreadResources(const ThreadRef& thread, bool memory_shutdown) {
 
 }  // namespace
 
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+bool ArmSyntheticWorker(const SyntheticWorkerAuthorization& authorization) {
+    if (authorization.image_identity != kSyntheticWorkerImageIdentity || !authorization.target ||
+        !authorization.code_base || authorization.code_end <= authorization.code_base ||
+        authorization.target < authorization.code_base || authorization.target >= authorization.code_end ||
+        !authorization.dispatch_generation)
+        return false;
+    std::lock_guard lock(g_synthetic_worker_lock);
+    if (g_synthetic_worker_armed || g_synthetic_worker_claimed) return false;
+    g_synthetic_worker_auth = authorization;
+    g_synthetic_worker_armed = true;
+    return true;
+}
+
+void DisarmSyntheticWorker() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    g_synthetic_worker_armed = false;
+    g_synthetic_worker_claimed = false;
+    g_synthetic_worker_auth = {};
+}
+
+bool SyntheticWorkerArmed() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_worker_armed;
+}
+
+SyntheticWorkerClaim ClaimSyntheticWorker(uint32_t target, uint32_t context, uint64_t dispatch_generation) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    if (!g_synthetic_worker_armed) return SyntheticWorkerClaim::kNotAuthorized;
+    if (g_synthetic_worker_claimed) return SyntheticWorkerClaim::kRejected;
+    if (target != g_synthetic_worker_auth.target || context != g_synthetic_worker_auth.context ||
+        dispatch_generation != g_synthetic_worker_auth.dispatch_generation ||
+        target < g_synthetic_worker_auth.code_base || target >= g_synthetic_worker_auth.code_end)
+        return SyntheticWorkerClaim::kRejected;
+    g_synthetic_worker_claimed = true;
+    return SyntheticWorkerClaim::kClaimed;
+}
+
+void FinishSyntheticWorker() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    g_synthetic_worker_claimed = false;
+    g_synthetic_worker_armed = false;
+    g_synthetic_worker_auth = {};
+}
+
+bool SyntheticWorkerExitMatches(uint32_t code) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_worker_claimed && code == g_synthetic_worker_auth.expected_exit;
+}
+
+void SetSyntheticWorkerPreCallbackHookForTest(SyntheticWorkerPreCallbackHook hook) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    g_synthetic_worker_hook = hook;
+}
+
+void CallSyntheticWorkerPreCallbackHookForTest() {
+    SyntheticWorkerPreCallbackHook hook = nullptr;
+    {
+        std::lock_guard lock(g_synthetic_worker_lock);
+        hook = g_synthetic_worker_hook;
+    }
+    if (hook) hook();
+}
+#endif
+
 uint32_t PrepareSystemThreadEx(uint32_t handle_out, uint32_t stack_size, uint32_t tls_size, uint32_t id_out,
                                uint32_t start_routine, uint32_t start_context, bool suspended,
                                uint32_t system_routine, ThreadRef& prepared) {
@@ -448,12 +521,46 @@ bool StartThread(ThreadRef t) {
                             const std::array<uint32_t, 1> start_arguments{t->start_context};
                             const uint32_t stack_base = t->stack_top - t->stack_size;
                             uint32_t code = 0;
-                            const GuestCallbackStatus callback_status =
+                            GuestCallbackStatus callback_status = GuestCallbackStatus::kCancelled;
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+                            bool synthetic_claimed = false;
+                            struct SyntheticFinishGuard {
+                                bool& claimed;
+                                ~SyntheticFinishGuard() {
+                                    if (claimed) FinishSyntheticWorker();
+                                }
+                            } synthetic_finish{synthetic_claimed};
+                            const uint32_t claim_target = t->system_routine ? 0 : t->start_routine;
+                            const uint32_t claim_context = t->system_routine ? 0 : t->start_context;
+                            const SyntheticWorkerClaim synthetic_claim = ClaimSyntheticWorker(
+                                claim_target, claim_context, t->start_routine_ticket.dispatch_generation);
+                            if (synthetic_claim == SyntheticWorkerClaim::kClaimed) {
+                                synthetic_claimed = true;
+                                CallSyntheticWorkerPreCallbackHookForTest();
+                                callback_status = CallGuestCallbackForTest(
+                                    ctx, t->start_routine_ticket, t->start_routine, start_arguments, stack_base,
+                                    t->stack_size, code);
+                                if (callback_status == GuestCallbackStatus::kInvoked &&
+                                    !SyntheticWorkerExitMatches(code))
+                                    callback_status = GuestCallbackStatus::kRejectedTarget;
+                            } else if (synthetic_claim == SyntheticWorkerClaim::kRejected) {
+                                callback_status = GuestCallbackStatus::kRejectedTarget;
+                            } else {
+                                callback_status =
+                                    t->system_routine
+                                        ? CallGuestCallback(ctx, t->system_routine_ticket, t->system_routine,
+                                                            system_arguments, stack_base, t->stack_size, code)
+                                        : CallGuestCallback(ctx, t->start_routine_ticket, t->start_routine,
+                                                            start_arguments, stack_base, t->stack_size, code);
+                            }
+#else
+                            callback_status =
                                 t->system_routine
                                     ? CallGuestCallback(ctx, t->system_routine_ticket, t->system_routine,
                                                         system_arguments, stack_base, t->stack_size, code)
                                     : CallGuestCallback(ctx, t->start_routine_ticket, t->start_routine,
                                                         start_arguments, stack_base, t->stack_size, code);
+#endif
                             if (callback_status == GuestCallbackStatus::kInvoked) {
                                 LOGI("thread %X returned %08X", t->id, code);
                                 MarkExited(*t, code);

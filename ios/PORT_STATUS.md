@@ -2845,3 +2845,43 @@ Both the complete fixture target set and memory test target set build in Debug a
 **Remaining blockers:** Guest callback return and guest-import termination are unvalidated; post-stop exception propagation across guest frames is unverified; open handles survive `mem::Shutdown` until `CloseHandle`; a full game link is unavailable without generated game inputs.
 **Next action:** Implement the separately gated synthetic-only StartThread adapter with explicit synthetic-image authorization, then prove return/termination and lease teardown before any authentic single-worker proposal.
 **Customer release:** Not performed; no game boot, authentic XBE continuation, or authentic guest-thread concurrency claim.
+
+## Phase 2D-3 — synthetic-only single-worker StartThread activation
+
+**PHASE_2D3_SYNTHETIC_WORKER = PASS.** The Phase 2C-41 authentic experiment remained frozen and was not rerun. A compile-time-gated adapter now lets exactly one explicitly authorized synthetic guest callback run through the production `StartThread` lifecycle, and the fixture proves callback return, argument delivery, cancellation, handle retention, shutdown quiescence and resource finalization end to end.
+
+### Authorization and execution architecture
+
+- `sdk/runtime/kernel/synthetic_worker.h` declares the test-only `SyntheticWorkerAuthorization` (target, start context, expected exit, synthetic code range, dispatch generation, image identity) and the arm/claim/finish API.
+- The implementation is compiled only when `MOSTWANTED_SYNTHETIC_WORKER_TESTS` is defined; the header requires `MOSTWANTED_GUEST_CALLBACK_TESTS` and errors otherwise. The checked fixture target defines both; production builds contain neither the API nor the StartThread branch.
+- `ArmSyntheticWorker` rejects a wrong image identity (`0x4C4C5632`), a zero target/generation, an inverted or zero code range, a target outside that range, and a second arm while one is pending.
+- `ClaimSyntheticWorker` atomically enforces one claim, requires the exact target, start context, current dispatch generation and synthetic code range, and rejects a second concurrent claim. `FinishSyntheticWorker` clears the claim and consumes the authorization, so each arm covers one worker.
+- `StartThread` uses the existing ticket preparation, registration, state transitions, managed worker, stack/KPCR/ETHREAD/TLS setup, dispatch/page leases and Phase 2D-2 finalizer. Only the callback dispatch line is test-gated: a claimed synthetic worker calls `CallGuestCallbackForTest`; an armed-but-mismatched worker is cancelled as `kRejectedTarget`; with no authorization the unchanged production `CallGuestCallback` path runs and still returns `kExecutionDisabled` on Apple.
+- The synthetic fixture gains `sub_0001127E` (`mov eax, [esp+4]; ret`) and maps synthetic dispatch target `0x90010` to it. The exit code is the start context, so argument delivery and generated-instruction execution are both observable. `0x90030` maps to a different generated function for the wrong-target test. No authentic XBE bytes or generated game code were added to tracked source.
+
+### Deterministic coverage and evidence
+
+The checked fixture suite reports **505 PASS, 0 FAIL** in Debug and Release; the new block covers:
+
+- Successful synthetic worker: exit code `0x13572468`, `kExited`, handle retains the signaled object, tickets cleared, ETHREAD/KPCR/stack allocations released, pointer binding gone, `kernel::Threads().empty()`, zero workers, system-allocation baseline restored.
+- Second concurrent activation rejected while the first is held at a condition-variable pre-callback hook; the rejected worker is cancelled with exit code 0 and finalizes after join.
+- Wrong start context, a different mapped synthetic target, stale dispatch generation, wrong image identity, out-of-range target and authentic Xbox entry (`0x002B3916`) all fail closed; the authentic entry never enters the worker path.
+- Launch failure restores `kPrepared` with tickets clear and leaves the authorization armed; prepared cancellation releases resources without a callback; handle closure while active retains ETHREAD/KPCR/stack until completion.
+- Shutdown cancels an activation-held worker before dispatch; a claimed worker blocked before its callback makes host shutdown wait, then quiesce/release memory without invoking the callback.
+- Completed `ThreadRef` rejects a second cancellation; after memory shutdown/reinitialization a stale completed reference cannot release allocations reused by a new prepared thread; the new thread cancels back to baseline.
+- `dispatch::Init` after completion proves callback dispatch leases unwound.
+
+### Termination boundary
+
+Guest-originated `PsTerminateSystemThread`/ordinal-258 was not implemented in this phase. The existing 2D-2 host-task `ExitThread` test still covers managed C++ unwinding, waiter signalling and exactly-once resource release, but it is not evidence of a guest instruction-to-kernel termination path. A checked synthetic ordinal-258 bridge remains a separate bounded package. No authentic ordinal-258 bridge, authentic start routine, `002B38A2`, `002B5C7B` continuation, production `Boot()`, iPhone install or `main` merge occurred.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture suite, including synthetic worker | 505 PASS / 0 FAIL | 505 PASS / 0 FAIL |
+| Recompiler fixture CTest | 6/6 passed | 6/6 passed |
+| Darwin memory/worker CTest | 1/1 passed | 1/1 passed |
+| Authentic Phase 2C-41 experiment | Not rerun | Not rerun |
+
+**Customer release:** Not performed. R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

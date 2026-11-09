@@ -21,6 +21,7 @@
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
+#include "kernel/synthetic_worker.h"
 #include "kernel/thread_memory.h"
 #include "x86_recomp_shared.h"
 
@@ -50,6 +51,38 @@ bool g_callback_fake_release = false;
 size_t g_callback_page_mutation_waits = 0;
 std::array<uint32_t, 17> g_callback_fake_stack{};
 size_t g_callback_fake_stack_words = 0;
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+std::mutex g_synthetic_hook_lock;
+std::condition_variable g_synthetic_hook_cv;
+bool g_synthetic_hook_entered = false;
+bool g_synthetic_hook_release = false;
+
+void SyntheticWorkerPreCallbackHook() {
+    std::unique_lock lock(g_synthetic_hook_lock);
+    g_synthetic_hook_entered = true;
+    g_synthetic_hook_cv.notify_all();
+    g_synthetic_hook_cv.wait(lock, [] { return g_synthetic_hook_release; });
+}
+
+void ResetSyntheticHook() {
+    std::lock_guard lock(g_synthetic_hook_lock);
+    g_synthetic_hook_entered = false;
+    g_synthetic_hook_release = false;
+}
+
+bool WaitSyntheticHookEntered() {
+    std::unique_lock lock(g_synthetic_hook_lock);
+    return g_synthetic_hook_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_synthetic_hook_entered; });
+}
+
+void ReleaseSyntheticHook() {
+    {
+        std::lock_guard lock(g_synthetic_hook_lock);
+        g_synthetic_hook_release = true;
+    }
+    g_synthetic_hook_cv.notify_all();
+}
+#endif
 X86MemoryFault last_fault{};
 uint32_t last_trap_pc = 0;
 std::string last_trap_reason;
@@ -847,6 +880,327 @@ void CheckGuestThreadLifecycle() {
     mem::Shutdown();
 #endif
 }
+
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+void CheckSyntheticWorkerLifecycle() {
+    constexpr uint32_t code_page = 0x90000;
+    constexpr uint32_t target = code_page + 0x10;
+    constexpr uint32_t other_target = code_page + 0x30;
+    constexpr uint32_t output_page = 0xA5000;
+    constexpr uint32_t start_context = 0x13572468;
+    static const X86FuncMapping functions[] = {{target, sub_0001127E}, {other_target, sub_000110EF}};
+    const dispatch::Metadata metadata{code_page, code_page + mem::kPage, target, functions, {}};
+    std::string error;
+    auto initialize = [&] {
+        const bool ready = mem::Init() && mem::Commit(code_page, mem::kPage) && mem::Commit(output_page, mem::kPage) &&
+                           mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                           dispatch::Init(metadata, error) && kernel::RestartKernelWorkers();
+        Check(ready, "synthetic worker fixture memory, dispatch and workers initialize");
+        return ready;
+    };
+    auto prepare = [&](kernel::ThreadRef& thread, uint32_t start, uint32_t context, uint32_t outputs) {
+        const uint32_t status = kernel::PrepareSystemThreadEx(outputs, 0x10000, 0x20, outputs + 4, start, context,
+                                                              false, 0, thread);
+        return status == kernel::kSuccess && bool(thread);
+    };
+    auto generation = [&]() -> uint64_t {
+        kernel::GuestCallbackTicket ticket;
+        return kernel::PrepareGuestCallback(target, kernel::GuestCallbackClass::kThreadStart, ticket) ==
+                       kernel::GuestCallbackStatus::kReady
+                   ? ticket.dispatch_generation
+                   : 0;
+    };
+    auto arm = [&](uint32_t start, uint32_t context, uint64_t dispatch_generation) {
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.context = context;
+        authorization.expected_exit = start_context;
+        authorization.code_base = code_page;
+        authorization.code_end = code_page + mem::kPage;
+        authorization.dispatch_generation = dispatch_generation;
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        return kernel::ArmSyntheticWorker(authorization);
+    };
+    auto wait_thread = [](const kernel::ThreadRef& thread) {
+        return kernel::Wait({std::static_pointer_cast<kernel::Object>(thread)}, false, -100'000'000, false);
+    };
+    auto join_workers = [] { return kernel::StopKernelWorkers() && kernel::RestartKernelWorkers(); };
+
+    if (!initialize()) return;
+    const mem::Stats baseline = mem::Query();
+    const uint32_t callbacks_before = g_callback_fake_calls.load();
+    kernel::ThreadRef completed_thread;
+
+    {
+        if (!prepare(completed_thread, target, start_context, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        const uint32_t ethread = completed_thread->ethread;
+        const uint32_t kpcr = completed_thread->kpcr;
+        const uint32_t stack = completed_thread->stack_top;
+        const uint64_t dispatch_generation = generation();
+        Check(dispatch_generation != 0 && arm(target, start_context, dispatch_generation),
+              "synthetic worker authorization arms for the synthetic image");
+        const bool started = kernel::StartThread(completed_thread);
+        const uint32_t wait = started ? wait_thread(completed_thread) : kernel::kTimeout;
+        const bool joined = join_workers();
+        const auto retained = kernel::FromHandle(handle);
+        Check(started && wait == kernel::kWait0 && joined &&
+                  completed_thread->state.load() == kernel::ThreadState::kExited &&
+                  completed_thread->exit_code.load() == start_context && retained.get() == completed_thread.get() &&
+                  completed_thread->resources_released && !completed_thread->start_routine_ticket.target &&
+                  !completed_thread->system_routine_ticket.target && !completed_thread->ethread &&
+                  !completed_thread->kpcr && !completed_thread->stack_top &&
+                  !kernel::IsPointerBoundForTest(ethread, completed_thread.get()) && !mem::AllocationSize(ethread) &&
+                  !mem::AllocationSize(kpcr) && !mem::IsCommitted(stack - 1) &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used && !kernel::SyntheticWorkerArmed() &&
+                  g_callback_fake_calls.load() == callbacks_before,
+              "authorized synthetic guest callback executes once, returns its argument, and finalizes exactly once");
+        Check(!kernel::CancelPreparedThread(completed_thread) && mem::Query().system_used == baseline.system_used,
+              "completed synthetic worker rejects a second cancellation without touching allocations");
+        Check(dispatch::Init(metadata, error), "synthetic callback dispatch leases unwind after worker completion");
+        kernel::CloseHandle(handle);
+    }
+
+    {
+        kernel::GuestCallbackTicket authentic_ticket;
+        Check(kernel::PrepareGuestCallback(0x002B3916u, kernel::GuestCallbackClass::kThreadStart, authentic_ticket) ==
+                      kernel::GuestCallbackStatus::kRejectedTarget,
+              "an authentic Xbox entry is not a registered synthetic callback target");
+        kernel::ThreadRef authentic_thread;
+        if (!prepare(authentic_thread, 0x002B3916u, start_context, output_page)) return;
+        Check(!arm(0x002B3916u, start_context, generation()),
+              "an authentic start routine cannot arm the synthetic worker");
+        const bool started = kernel::StartThread(authentic_thread);
+        Check(!started && authentic_thread->state.load() == kernel::ThreadState::kPrepared &&
+                  !authentic_thread->start_routine_ticket.target && kernel::KernelWorkerCountForTest() == 0 &&
+                  kernel::Threads().empty(),
+              "an authentic Xbox start routine cannot enter the synthetic worker path");
+        Check(kernel::CancelPreparedThread(authentic_thread) && mem::Query().system_used == baseline.system_used,
+              "authentic-target preparation cancels without retaining resources");
+    }
+
+    {
+        ResetSyntheticHook();
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(SyntheticWorkerPreCallbackHook);
+        kernel::ThreadRef first, second;
+        if (!prepare(first, target, start_context, output_page) ||
+            !prepare(second, target, start_context, output_page + 0x40))
+            return;
+        Check(arm(target, start_context, generation()), "synthetic worker re-arms for the concurrency test");
+        const bool first_started = kernel::StartThread(first);
+        const bool hook_entered = WaitSyntheticHookEntered();
+        const bool second_started = kernel::StartThread(second);
+        const uint32_t second_wait = second_started ? wait_thread(second) : kernel::kTimeout;
+        const bool second_rejected = second_started && second_wait == kernel::kWait0 &&
+                                     second->state.load() == kernel::ThreadState::kCancelled &&
+                                     second->exit_code.load() == 0;
+        ReleaseSyntheticHook();
+        const uint32_t first_wait = first_started ? wait_thread(first) : kernel::kTimeout;
+        const bool joined = join_workers();
+        Check(first_started && hook_entered && second_rejected && first_wait == kernel::kWait0 &&
+                  first->state.load() == kernel::ThreadState::kExited &&
+                  first->exit_code.load() == start_context && first->resources_released &&
+                  second->resources_released && !second->start_routine_ticket.target &&
+                  kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used &&
+                  !kernel::SyntheticWorkerArmed(),
+              "a second concurrent synthetic activation is rejected while the first holds the worker claim");
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(nullptr);
+    }
+
+    {
+        kernel::ThreadRef wrong_context;
+        if (!prepare(wrong_context, target, start_context ^ 1, output_page)) return;
+        Check(arm(target, start_context, generation()), "authorization arms for the wrong-context test");
+        const bool started = kernel::StartThread(wrong_context);
+        const uint32_t wait = started ? wait_thread(wrong_context) : kernel::kTimeout;
+        join_workers();
+        Check(started && wait == kernel::kWait0 &&
+                  wrong_context->state.load() == kernel::ThreadState::kCancelled &&
+                  wrong_context->exit_code.load() == 0 && wrong_context->resources_released &&
+                  kernel::SyntheticWorkerArmed(),
+              "a mismatched synthetic start context is rejected without consuming the authorization");
+        kernel::DisarmSyntheticWorker();
+    }
+
+    {
+        kernel::ThreadRef wrong_target;
+        if (!prepare(wrong_target, other_target, start_context, output_page)) return;
+        Check(arm(target, start_context, generation()), "authorization arms for the wrong-target test");
+        const bool started = kernel::StartThread(wrong_target);
+        const uint32_t wait = started ? wait_thread(wrong_target) : kernel::kTimeout;
+        join_workers();
+        Check(started && wait == kernel::kWait0 &&
+                  wrong_target->state.load() == kernel::ThreadState::kCancelled &&
+                  wrong_target->exit_code.load() == 0 && wrong_target->resources_released &&
+                  kernel::SyntheticWorkerArmed(),
+              "a different synthetic dispatch target cannot claim the authorization");
+        kernel::DisarmSyntheticWorker();
+    }
+
+    {
+        kernel::ThreadRef stale;
+        if (!prepare(stale, target, start_context, output_page)) return;
+        Check(arm(target, start_context, generation()), "authorization arms for the stale-generation test");
+        Check(dispatch::Init(metadata, error), "synthetic dispatch map advances its generation");
+        const bool started = kernel::StartThread(stale);
+        const uint32_t wait = started ? wait_thread(stale) : kernel::kTimeout;
+        join_workers();
+        Check(started && wait == kernel::kWait0 && stale->state.load() == kernel::ThreadState::kCancelled &&
+                  stale->exit_code.load() == 0 && stale->resources_released && kernel::SyntheticWorkerArmed(),
+              "a stale synthetic dispatch generation cannot execute the callback");
+        kernel::DisarmSyntheticWorker();
+    }
+
+    {
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = target;
+        authorization.context = start_context;
+        authorization.expected_exit = start_context;
+        authorization.code_base = code_page;
+        authorization.code_end = code_page + mem::kPage;
+        authorization.dispatch_generation = generation();
+        authorization.image_identity = 0;
+        Check(!kernel::ArmSyntheticWorker(authorization) && !kernel::SyntheticWorkerArmed(),
+              "a wrong synthetic image identity cannot arm the worker");
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        authorization.code_end = code_page;
+        Check(!kernel::ArmSyntheticWorker(authorization) && !kernel::SyntheticWorkerArmed(),
+              "an out-of-range synthetic target cannot arm the worker");
+    }
+
+    {
+        kernel::ThreadRef launch;
+        if (!prepare(launch, target, start_context, output_page)) return;
+        Check(arm(target, start_context, generation()), "authorization arms for the launch-failure test");
+        kernel::FailNextKernelWorkerStartForTest();
+        const bool started = kernel::StartThread(launch);
+        Check(!started && launch->state.load() == kernel::ThreadState::kPrepared &&
+                  !launch->start_routine_ticket.target && !launch->system_routine_ticket.target &&
+                  kernel::Threads().empty() && kernel::KernelWorkerCountForTest() == 0 &&
+                  kernel::SyntheticWorkerArmed(),
+              "failed synthetic worker launch rolls back and leaves the authorization armed");
+        Check(kernel::CancelPreparedThread(launch) && mem::Query().system_used == baseline.system_used,
+              "launch-failure cancellation restores the guest allocation baseline");
+        kernel::DisarmSyntheticWorker();
+    }
+
+    {
+        kernel::ThreadRef cancelled;
+        if (!prepare(cancelled, target, start_context, output_page)) return;
+        Check(arm(target, start_context, generation()), "authorization arms for the pre-activation cancellation test");
+        Check(kernel::CancelPreparedThread(cancelled) &&
+                  cancelled->state.load() == kernel::ThreadState::kCancelled && cancelled->resources_released &&
+                  kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used &&
+                  kernel::SyntheticWorkerArmed(),
+              "cancellation before activation releases the synthetic thread without a callback");
+        kernel::DisarmSyntheticWorker();
+    }
+
+    {
+        ResetSyntheticHook();
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(SyntheticWorkerPreCallbackHook);
+        kernel::ThreadRef active;
+        if (!prepare(active, target, start_context, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        const uint32_t ethread = active->ethread;
+        const uint32_t kpcr = active->kpcr;
+        const uint32_t stack = active->stack_top;
+        Check(arm(target, start_context, generation()), "authorization arms for the handle-close test");
+        const bool started = kernel::StartThread(active);
+        const bool hook_entered = WaitSyntheticHookEntered();
+        const bool closed = kernel::CloseHandle(handle);
+        const bool retained = started && hook_entered && closed &&
+                              active->state.load() == kernel::ThreadState::kActive && !active->resources_released &&
+                              kernel::KernelWorkerCountForTest() == 1 && mem::AllocationSize(ethread) != 0 &&
+                              mem::AllocationSize(kpcr) != 0 && mem::IsCommitted(stack - 1) &&
+                              !kernel::FromHandle(handle);
+        ReleaseSyntheticHook();
+        const uint32_t wait = started ? wait_thread(active) : kernel::kTimeout;
+        const bool joined = join_workers();
+        Check(retained && wait == kernel::kWait0 && active->state.load() == kernel::ThreadState::kExited &&
+                  active->exit_code.load() == start_context && active->resources_released &&
+                  !mem::AllocationSize(ethread) && !mem::AllocationSize(kpcr) && !mem::IsCommitted(stack - 1) &&
+                  kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used,
+              "closing the handle while the synthetic worker is active retains resources until completion");
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(nullptr);
+    }
+
+    {
+        kernel::HoldKernelWorkerActivationForTest(true);
+        kernel::ThreadRef shutdown_thread;
+        if (!prepare(shutdown_thread, target, start_context, output_page)) {
+            kernel::HoldKernelWorkerActivationForTest(false);
+            return;
+        }
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        Check(arm(target, start_context, generation()), "authorization arms for the activation-shutdown test");
+        const bool started = kernel::StartThread(shutdown_thread);
+        mem::Shutdown();
+        kernel::HoldKernelWorkerActivationForTest(false);
+        const bool cancelled = shutdown_thread->state.load() == kernel::ThreadState::kCancelled &&
+                               shutdown_thread->exit_code.load() == 0 && shutdown_thread->resources_released;
+        kernel::CloseHandle(handle);
+        Check(started && cancelled && kernel::KernelWorkerCountForTest() == 0 && !mem::IsInitialized() &&
+                  kernel::SyntheticWorkerArmed(),
+              "shutdown cancels an activation-held synthetic worker before dispatch");
+        kernel::DisarmSyntheticWorker();
+        if (!initialize()) return;
+    }
+
+    {
+        ResetSyntheticHook();
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(SyntheticWorkerPreCallbackHook);
+        kernel::ThreadRef active;
+        if (!prepare(active, target, start_context, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        Check(arm(target, start_context, generation()), "authorization arms for the quiescent-shutdown test");
+        const bool started = kernel::StartThread(active);
+        const bool hook_entered = WaitSyntheticHookEntered();
+        std::atomic<bool> shutdown_done{false};
+        std::thread shutdown([&] {
+            mem::Shutdown();
+            shutdown_done.store(true);
+        });
+        bool waited = false;
+        for (int i = 0; i < 100 && !waited; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            waited = !shutdown_done.load() && !kernel::KernelWorkersAccepting() && mem::IsInitialized();
+        }
+        ReleaseSyntheticHook();
+        shutdown.join();
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(nullptr);
+        const bool cancelled = active->state.load() == kernel::ThreadState::kCancelled &&
+                               active->exit_code.load() == 0 && active->resources_released;
+        kernel::CloseHandle(handle);
+        Check(started && hook_entered && waited && shutdown_done.load() && cancelled &&
+                  kernel::KernelWorkerCountForTest() == 0 && !mem::IsInitialized(),
+              "host shutdown waits for the active synthetic callback to quiesce before releasing memory");
+        Check(g_callback_fake_calls.load() == callbacks_before,
+              "synthetic shutdown quiescence did not run the host substitute");
+        if (!initialize()) return;
+    }
+
+    {
+        kernel::ThreadRef reused;
+        if (!prepare(reused, target, start_context, output_page)) return;
+        Check(!kernel::CancelPreparedThread(completed_thread) &&
+                  reused->state.load() == kernel::ThreadState::kPrepared &&
+                  mem::AllocationSize(reused->ethread) != 0 && mem::AllocationSize(reused->kpcr) != 0 &&
+                  mem::IsCommitted(reused->stack_top - 1),
+              "a retained completed ThreadRef cannot release allocations reused by a newer thread");
+        Check(kernel::CancelPreparedThread(reused) && mem::Query().system_used == baseline.system_used,
+              "the newer prepared thread cancels cleanly after the stale-reference check");
+    }
+
+    kernel::StopKernelWorkers();
+    mem::Shutdown();
+}
+#endif
 
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE_CLI
 void RunReleaseBenchmarks(uint32_t source, uint32_t destination) {
@@ -3048,6 +3402,9 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
 
     CheckGuestCallbackContract();
     CheckGuestThreadLifecycle();
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    CheckSyntheticWorkerLifecycle();
+#endif
     mem::Shutdown();
     return failures ? 1 : 0;
 }
