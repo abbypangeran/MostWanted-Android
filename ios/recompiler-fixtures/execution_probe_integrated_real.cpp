@@ -1336,6 +1336,12 @@ bool RunSecondarySegment(const kernel::ThreadRef& thread, SecondaryFacts& facts,
     PrintMemoryDiff(snapshot);
     if (!VerifySecondaryPostconditions(facts, error)) return false;
     if (!VerifySecondarySnapshot(facts, snapshot, error)) return false;
+    std::printf("ABI critical-section: enter_esp=%08X leave_esp=%08X enter_return=%08X leave_return=%08X arg=%08X\n",
+                g_critical_enter_esp, g_critical_leave_esp, g_critical_enter_return, g_critical_leave_return,
+                g_critical_enter_arg);
+    std::printf("CRITICAL owner=%08X held=%08X/%u/%08X released=%08X/%u/%08X\n", g_critical_actual_ethread,
+                g_critical_held_lock, g_critical_held_recursion, g_critical_held_owner, g_critical_after_lock,
+                g_critical_after_recursion, g_critical_after_owner);
     return true;
 }
 
@@ -1536,9 +1542,20 @@ bool VerifyCriticalSectionFinal(const SecondaryFacts& facts, std::string& error)
     }
     if (g_critical_enter_esp != facts.entry_esp - 0x54 || g_critical_enter_return != sec::kCriticalEnterReturn ||
         g_critical_enter_arg != sec::kCriticalSection ||
-        g_critical_leave_esp != facts.entry_esp - 0x58 || g_critical_leave_return != sec::kCriticalLeaveReturn ||
+        // enter's stdcall cleanup removes its argument; the helper's 002B59A8
+        // push ebx restores the same pre-call level before the leave call
+        g_critical_leave_esp != facts.entry_esp - 0x54 || g_critical_leave_return != sec::kCriticalLeaveReturn ||
         g_critical_leave_arg != sec::kCriticalSection) {
-        error = "critical-section ABI or stack frame mismatch";
+        char detail[384];
+        std::snprintf(detail, sizeof(detail),
+                      "critical-section ABI mismatch: enter esp=%08X expected=%08X return=%08X expected=%08X "
+                      "arg=%08X expected=%08X; leave esp=%08X expected=%08X return=%08X expected=%08X "
+                      "arg=%08X expected=%08X",
+                      g_critical_enter_esp, facts.entry_esp - 0x54, g_critical_enter_return,
+                      sec::kCriticalEnterReturn, g_critical_enter_arg, sec::kCriticalSection, g_critical_leave_esp,
+                      facts.entry_esp - 0x54, g_critical_leave_return, sec::kCriticalLeaveReturn, g_critical_leave_arg,
+                      sec::kCriticalSection);
+        error = detail;
         return false;
     }
     return true;
@@ -1645,6 +1662,73 @@ bool DriveSecondaryBranch(uint32_t predecessor, uint32_t conditional, uint32_t s
     }
     g_secondary.running = false;
     return accepted;
+}
+
+struct CriticalSectionAbiDrive {
+    bool enter_ok = false, leave_ok = false, pops_ok = false;
+    uint32_t enter_esp = 0, leave_esp = 0;
+    uint32_t enter_return = 0, leave_return = 0;
+    uint32_t enter_arg = 0, leave_arg = 0;
+    uint32_t final_esp = 0;
+    uint32_t restored_ebx = 0, restored_esi = 0, restored_edi = 0;
+};
+
+bool DriveCriticalSectionHelperAbi(const SecondaryFacts& facts, uint32_t enter_return, uint32_t enter_arg,
+                                   uint32_t leave_return, uint32_t leave_arg, int32_t leave_delta,
+                                   CriticalSectionAbiDrive& out, std::string& error) {
+    const uint32_t helper_entry = facts.entry_esp - 0x40;
+    const uint32_t saved_ebx = 0x11112222, saved_esi = 0x33334444, saved_edi = 0x55556666;
+    const uint32_t helper_return = sec::kStopBefore, helper_arg = 1;
+    const uint32_t enter_esp = helper_entry - 0x14;
+    const uint32_t leave_esp = uint32_t(int32_t(enter_esp) + leave_delta);
+    auto write = [](uint32_t address, uint32_t value) {
+        return mem::Write(address, &value, sizeof(value)) == mem::AccessStatus::kOk;
+    };
+    if (!write(helper_entry - 4, saved_ebx) || !write(helper_entry - 8, saved_esi) ||
+        !write(helper_entry - 12, saved_edi) || !write(helper_entry, helper_return) ||
+        !write(helper_entry + 4, helper_arg) || !write(enter_esp, enter_return) ||
+        !write(enter_esp + 4, enter_arg)) {
+        error = "could not write the reviewed helper ABI stack";
+        return false;
+    }
+    X86Context ctx{};
+    ctx.esp = enter_esp;
+    ctx.ebx = 0xAAAA0001;
+    ctx.esi = 0xAAAA0002;
+    ctx.edi = 0xAAAA0003;
+    ProbeCriticalEnter(ctx, nullptr);
+    out.enter_esp = g_critical_enter_esp;
+    out.enter_return = g_critical_enter_return;
+    out.enter_arg = g_critical_enter_arg;
+    out.enter_ok = ctx.eax == kernel::kSuccess && ctx.esp == helper_entry - 0x0C && ctx.ebx == 0xAAAA0001 &&
+                   ctx.esi == 0xAAAA0002 && ctx.edi == 0xAAAA0003;
+    // the authentic enter cleanup returns to the pre-call level; the helper's
+    // 002B59A8 push ebx then writes the leave frame at the same address
+    if (!write(leave_esp, leave_return) || !write(leave_esp + 4, leave_arg)) {
+        error = "could not write the reviewed helper leave frame";
+        return false;
+    }
+    ctx.esp = leave_esp;
+    ProbeCriticalLeave(ctx, nullptr);
+    out.leave_esp = g_critical_leave_esp;
+    out.leave_return = g_critical_leave_return;
+    out.leave_arg = g_critical_leave_arg;
+    out.leave_ok = ctx.eax == kernel::kSuccess && ctx.esp == leave_esp + 8 && ctx.ebx == 0xAAAA0001 &&
+                   ctx.esi == 0xAAAA0002 && ctx.edi == 0xAAAA0003;
+    if (leave_delta != 0) return true;
+    const uint32_t saved_at = ctx.esp;
+    uint32_t return_address = 0;
+    if (mem::Read(saved_at, &out.restored_edi, sizeof(out.restored_edi)) != mem::AccessStatus::kOk ||
+        mem::Read(saved_at + 4, &out.restored_esi, sizeof(out.restored_esi)) != mem::AccessStatus::kOk ||
+        mem::Read(saved_at + 8, &out.restored_ebx, sizeof(out.restored_ebx)) != mem::AccessStatus::kOk ||
+        mem::Read(saved_at + 12, &return_address, sizeof(return_address)) != mem::AccessStatus::kOk) {
+        error = "could not read the reviewed helper saved registers";
+        return false;
+    }
+    out.final_esp = helper_entry + 8;
+    out.pops_ok = out.restored_edi == saved_edi && out.restored_esi == saved_esi && out.restored_ebx == saved_ebx &&
+                  return_address == sec::kStopBefore && out.final_esp == facts.stop_esp;
+    return true;
 }
 
 int RunIntegratedPreflight(const std::string& scenario) {
@@ -1805,6 +1889,103 @@ int RunIntegratedPreflight(const std::string& scenario) {
                     scenario.c_str(), ethread, secondary.kpcr, g_critical_held_lock, g_critical_held_recursion,
                     g_critical_held_owner, g_critical_after_lock, g_critical_after_recursion,
                     g_critical_after_owner);
+        return finish(nullptr, false);
+    }
+    if (scenario == "abi-correct" || scenario == "abi-enter-return-mismatch" ||
+        scenario == "abi-enter-arg-mismatch" || scenario == "abi-leave-return-mismatch" ||
+        scenario == "abi-leave-arg-mismatch" || scenario == "abi-leave-esp-mismatch") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        const bool cleanup_case = scenario == "abi-leave-esp-mismatch";
+        kernel::ThreadRef candidate;
+        if (cleanup_case) {
+            if (!PrepareCandidateThread(facts, g_prepared_thread, error)) return finish(error.c_str(), false);
+        } else if (!PrepareCandidateThread(facts, candidate, error)) {
+            return finish(error.c_str(), false);
+        }
+        const kernel::ThreadRef thread = cleanup_case ? g_prepared_thread : candidate;
+        if (cleanup_case && !PatchCriticalSectionImports(error)) {
+            thread->ctx = nullptr;
+            CleanupIntegrated(options);
+            return finish(error.c_str(), false);
+        }
+        X86Context context{};
+        SecondaryFacts secondary;
+        if (!InitializeSecondaryContext(thread, context, secondary, error)) {
+            thread->ctx = nullptr;
+            if (cleanup_case) CleanupIntegrated(options);
+            else {
+                kernel::CancelPreparedThread(thread);
+                candidate.reset();
+            }
+            return finish(error.c_str(), false);
+        }
+        if (!PrepareCriticalSectionBridge(secondary, error)) {
+            thread->ctx = nullptr;
+            if (cleanup_case) CleanupIntegrated(options);
+            else {
+                kernel::CancelPreparedThread(thread);
+                candidate.reset();
+            }
+            return finish(error.c_str(), false);
+        }
+        uint32_t enter_return = sec::kCriticalEnterReturn, enter_arg = sec::kCriticalSection;
+        uint32_t leave_return = sec::kCriticalLeaveReturn, leave_arg = sec::kCriticalSection;
+        int32_t leave_delta = 0;
+        bool expect_enter_ok = true, expect_leave_ok = true;
+        if (scenario == "abi-enter-return-mismatch") {
+            enter_return = 0xDEADBEEF;
+        } else if (scenario == "abi-enter-arg-mismatch") {
+            enter_arg = sec::kCriticalListHead;
+            expect_enter_ok = false;
+            expect_leave_ok = false;
+        } else if (scenario == "abi-leave-return-mismatch") {
+            leave_return = 0xDEADBEEF;
+        } else if (scenario == "abi-leave-arg-mismatch") {
+            leave_arg = sec::kCriticalListHead;
+            expect_leave_ok = false;
+        } else if (scenario == "abi-leave-esp-mismatch") {
+            leave_delta = -4;
+        }
+        CriticalSectionAbiDrive drive;
+        std::string drive_error;
+        const bool driven = DriveCriticalSectionHelperAbi(secondary, enter_return, enter_arg, leave_return, leave_arg,
+                                                          leave_delta, drive, drive_error);
+        bool accepted = false;
+        if (driven) accepted = VerifyCriticalSectionFinal(secondary, error);
+        else error = drive_error;
+        bool valid = driven && drive.enter_ok == expect_enter_ok && drive.leave_ok == expect_leave_ok;
+        if (scenario == "abi-correct") {
+            valid = valid && drive.pops_ok && accepted && drive.enter_esp == secondary.entry_esp - 0x54 &&
+                    drive.leave_esp == secondary.entry_esp - 0x54 && drive.enter_esp == drive.leave_esp &&
+                    drive.enter_return == sec::kCriticalEnterReturn &&
+                    drive.leave_return == sec::kCriticalLeaveReturn && drive.enter_arg == sec::kCriticalSection &&
+                    drive.leave_arg == sec::kCriticalSection && drive.final_esp == secondary.stop_esp;
+        } else {
+            valid = valid && !accepted;
+            if (drive.enter_ok && drive.leave_ok && drive.pops_ok)
+                valid = valid && drive.enter_esp == secondary.entry_esp - 0x54 &&
+                        drive.leave_esp == secondary.entry_esp - 0x54 && drive.final_esp == secondary.stop_esp;
+        }
+        ReleaseCriticalSectionBridge();
+        thread->ctx = nullptr;
+        if (cleanup_case) {
+            valid = valid && CleanupIntegrated(options);
+        } else {
+            valid = valid && kernel::CancelPreparedThread(thread) && kernel::Threads().empty();
+            candidate.reset();
+        }
+        if (!valid) {
+            if (error.empty()) error = "critical-section ABI regression mismatch";
+            return finish(error.c_str(), false);
+        }
+        if (scenario == "abi-correct")
+            std::printf("RESULT ok abi-correct enter_esp=%08X leave_esp=%08X enter_return=%08X leave_return=%08X "
+                        "arg=%08X final_esp=%08X owner=%08X\n",
+                        drive.enter_esp, drive.leave_esp, drive.enter_return, drive.leave_return, drive.enter_arg,
+                        drive.final_esp, g_critical_actual_ethread);
+        else
+            std::printf("RESULT ok %s rejected reason=\"%s\"\n", scenario.c_str(), error.c_str());
         return finish(nullptr, false);
     }
     if (scenario == "branch-jz-not-taken" || scenario == "branch-jz-taken" ||
@@ -2802,6 +2983,12 @@ int main(int argc, char** argv) {
         {"branch-flag-mismatch", 0, "secondary branch outcome mismatch"},
         {"branch-jz-flag-mismatch", 0, "secondary branch outcome mismatch"},
         {"branch-failure-cleanup", 0, "RESULT ok branch-failure-cleanup"},
+        {"abi-correct", 0, "RESULT ok abi-correct"},
+        {"abi-enter-return-mismatch", 0, "RESULT ok abi-enter-return-mismatch"},
+        {"abi-enter-arg-mismatch", 0, "RESULT ok abi-enter-arg-mismatch"},
+        {"abi-leave-return-mismatch", 0, "RESULT ok abi-leave-return-mismatch"},
+        {"abi-leave-arg-mismatch", 0, "RESULT ok abi-leave-arg-mismatch"},
+        {"abi-leave-esp-mismatch", 0, "RESULT ok abi-leave-esp-mismatch"},
         {"generated-audit-unsupported", 0, "RESULT ok generated-audit-unsupported"},
         {"generated-audit-missing", 0, "RESULT ok generated-audit-missing"},
         {"forbidden-entry", 0, ""},

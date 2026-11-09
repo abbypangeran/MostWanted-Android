@@ -2571,3 +2571,47 @@ Checked fixture tests pass in Debug and Release, including the five POP EBX chec
 ```
 
 **NO-GO for `002B5C7B` or beyond** until that run passes.
+
+## Phase 2C-40R critical-section leave stack expectation
+
+### Root cause
+
+The Phase 2C-40 run executed all 143 reviewed instructions and stopped before `002B5C7B`, then failed the host-side `VerifyCriticalSectionFinal()` ABI clause. It expected the leave-service ESP at `facts.entry_esp - 0x58`; the authentic helper puts both service frames at `facts.entry_esp - 0x54`.
+
+The helper entry is `entry_esp - 0x40`. The enter call pushes its return address at `entry_esp - 0x54`, and its stdcall cleanup removes both the return address and the one argument, returning ESP to `entry_esp - 0x4C`. The helper's `push ebx` at `002B59A8` re-pushes the argument, so the leave call also enters its service at `entry_esp - 0x54`. The old expectation was four bytes too low.
+
+### Fix
+
+- `VerifyCriticalSectionFinal()` now expects both service ESPs at `facts.entry_esp - 0x54`.
+- A failed ABI check reports actual and expected enter/leave ESP, return addresses and argument pointers in the error text.
+- A successful secondary run prints `ABI critical-section` and `CRITICAL owner` summaries after all postconditions pass. `INTEGRATED_REAL_EXEC ok` still appears only after cancellation, import restoration and teardown.
+
+### ABI regression coverage
+
+Six synthetic scenarios drive the real `ProbeCriticalEnter`/`ProbeCriticalLeave` hooks with the helper's reviewed push/call/stdcall arithmetic and then call the production `VerifyCriticalSectionFinal()`:
+
+| Scenario | Expected |
+|---|---|
+| `abi-correct` | enter and leave ESP both `entry-0x54`; enter return `002B598C`, leave return `002B59AF`, arg `0046C8B0`; EDI/ESI/EBX pops restore; final ESP `entry-0x38`; validator accepts |
+| `abi-enter-return-mismatch` | validator rejects the wrong enter return with the ABI detail |
+| `abi-enter-arg-mismatch` | enter and leave services reject; validator rejects |
+| `abi-leave-return-mismatch` | validator rejects the wrong leave return with the ABI detail |
+| `abi-leave-arg-mismatch` | leave service rejects; validator rejects |
+| `abi-leave-esp-mismatch` | leave at `entry-0x58` is rejected; retained thread and patched critical imports are cleaned up |
+
+The correct case observes enter ESP `D004FEF0`, leave ESP `D004FEF0`, enter return `002B598C`, leave return `002B59AF`, arg `0046C8B0`, final ESP `D004FF0C` and owner `B0000400`. The fault-injected case restores `003C9E44`/`003C9E40`, cancels the thread and reports zero resources.
+
+### Results
+
+Integrated self-test 67 PASS in Debug and Release. Preflight still reports `143/143`, the 72/71 split, 11/0/156 mapping and the empty-list owner contract. Checked fixture tests, root and secondary standalone preflight/self-test and `ctest` 6/6 pass in both configurations. No authentic XBE instruction ran in this phase.
+
+### Decision
+
+**GO for exactly one later supervised 143-instruction Release run**, conditional on explicit authorisation:
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_integrated_real_preflight \
+  --run-once --execute-real
+```
+
+**NO-GO for `002B5C7B` or beyond** until that run passes.
