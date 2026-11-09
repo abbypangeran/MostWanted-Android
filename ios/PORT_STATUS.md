@@ -2186,3 +2186,113 @@ No real guest instruction ran in Phase 2C-33.
 **GO for exactly one later supervised Release run** of the standalone secondary probe, with the command above, provided the evidence is reviewed first and the run is explicitly authorised. **NO-GO for the integrated root-to-secondary experiment** until the standalone run produces the expected 53-instruction trace, SEH/TLS state, cancellation and zero-resource teardown.
 
 The integrated design remains: one supervised process executes the frozen 72-instruction root sequence, keeps the prepared `ThreadRef` alive instead of cancelling it, restores both import slots, then enters `002B5C0F` on that same thread under the secondary mapping. The secondary segment must complete its postconditions before the thread is cancelled; no second thread, worker, callback, handler or start routine may run.
+
+## Phase 2C-35 integrated root-to-secondary thread handoff
+
+### Architecture choice
+
+The integrated probe uses **one combined generated mapping** containing both frozen routes. Two mappings would require two statically linked generated sources that export the same `X86FuncMappings`, `X86EntryPoint`, `X86CodeBase` and related symbols. `dispatch` is also a process-global table: switching it after the root segment would reset the generation and invalidate the root-prepared callback ticket, and would risk stale function pointers while the retained `ThreadRef` is alive. The combined mapping keeps one dispatch generation from image preparation through final teardown.
+
+Combined mapping: **11 functions, 0 continuations, 135 hooks** (78 root + 54 secondary route + 3 secondary trap hooks). The root entry remains the mapped `X86EntryPoint`, so the standard dispatch initialization works.
+
+### ThreadRef ownership handoff
+
+The root sequence is unchanged. Its ordinal-255 service creates the inactive thread in `g_prepared_thread`; ordinal-187 closes only the guest handle through `CloseHandle`. The integrated path does **not** call `CancelRealPreparedThread` between segments. After root completion it:
+
+1. verifies the root postconditions, including `EAX=1`, checked root frame return, 72 instructions, two kernel calls, two import reads, handle closed and `g_prepared_thread` in `kPrepared`;
+2. restores both import slots and verifies the authentic readback and read-only page;
+3. keeps the same `ThreadRef`, stack allocation, KPCR, ETHREAD and TLS;
+4. initializes the retained thread's `X86Context` with `InitializePreparedThreadContextForTest`;
+5. creates a fresh generation-valid `kSystemRoutine` callback ticket;
+6. enters `002B5C0F` synchronously with `CallGuestCallbackForTest` and stops before `002B5C76`;
+7. clears `Thread::ctx`, then calls `CancelRealPreparedThread` exactly once.
+
+No second `PrepareSystemThreadEx` occurs. The probe refuses a second preparation while a retained thread exists; the root hook count and retained-thread identity are checked.
+
+### Preserved routes and postconditions
+
+- Root: the existing 72-instruction route, two direct calls, two kernel calls, two import reads, root RET sentinel and checked frame.
+- Secondary: the existing 53-instruction route, one checked direct call/RET, zero kernel calls, zero import reads, no start routine, handler or next-helper execution.
+- Combined: 125 authentic instructions, three direct calls, two checked kernel calls, two import reads, one prepared thread, one closed handle, one final cancellation.
+
+The secondary memory policy is the Phase 2C-34 policy expressed as exact spans: retained stack, KPCR `fs:[0]`, KPCR+0x28, ETHREAD+0x28, the three TLS globals, and the TLS block. The import page remains forbidden. Snapshots cover the retained stack page, KPCR page, rdata page and image base; the KPCR change must be exactly offset 0 to the computed registration.
+
+### Static real-image preflight
+
+Release preflight passes:
+
+```
+PREFLIGHT identity: base=00010000 image=4F8040 header=1000 sections=15
+PREFLIGHT root route: 78/78 instructions, bytes=217 hash=6FBF924DD2C56F08 stop=002B3987
+PREFLIGHT root import: slot=003C9E68 authentic=800000FF close=003C9D4C authentic=800000BB
+PREFLIGHT integrated: root=72 secondary=53 total=125 direct_calls=3 kernel_calls=2 imports=2
+PREFLIGHT combined mapping: functions=11 continuations=0 hooks=135
+PREFLIGHT handoff: handle_out=D001FFD4 handle=00001000 state=kPrepared routines=002B5C0F/002B38A2/00000000 close_slot=003C9D4C
+PREFLIGHT secondary stack: base=D0040000 top=D0050000 initial_esp=D004FF50 entry_esp=D004FF44 stop_esp=D004FF08 stop_ebp=D004FF40
+PREFLIGHT secondary context: kpcr=B0000000 ethread=B0000400 tls=D004FF6C fs0=FFFFFFFF registration=D004FF30
+PREFLIGHT secondary tls: source=00000000 end=00000000 copy=0 zero=144
+PREFLIGHT PASS
+IMPORT slot=003C9E68 restored=800000FF ok=1
+IMPORT slot=003C9D4C restored=800000BB ok=1
+TEARDOWN system_used=0 contiguous_used=0 virtual_committed=0 workers=0 initialized=0
+```
+
+The preflight prepares a disposable candidate thread only for static context/TLS/SEH validation and cancels it; it does not execute guest instructions. The integrated execute path is separately gated behind `--run-once --execute-real` and the supervised parent token.
+
+### Synthetic and regression results
+
+- Integrated probe self-test: **25 PASS** in Debug and Release, including missing/mismatched XBE, both route mismatches, root/secondary hook removal, root failure before and after preparation, missing/active/stale retained thread, second preparation refusal, bad FS/KPCR/ETHREAD/TLS, corrupted SEH/TLS, duplicate close, duplicate cancellation, restoration failure, forbidden entries, unsupervised-child refusal and supervised-token wiring.
+- Root standalone real probe: preflight and self-test PASS in Debug and Release.
+- Secondary standalone real probe: preflight PASS.
+- `execution_probe_tests` and `execution_probe_secondary_tests`: PASS.
+- `ctest`: 6/6 in Debug and Release.
+
+No authentic XBE instruction was executed in this phase. The integrated synthetic self-test validates handoff and rollback logic but does not perform a synthetic 125-instruction run; the segment-level synthetic suites remain the evidence for the two routes.
+
+### Remaining blockers
+
+- The integrated `--run-once --execute-real` path has not been observed on the real image.
+- `002B597D` and the rest of the system routine after `002B5C76` remain unreviewed.
+- The start routine, SEH handler, exception delivery, `StartThread`, workers and production `Boot()` remain disabled.
+- An end-to-end synthetic combined-route fixture would strengthen future regression coverage but was not required for this bounded phase.
+
+### 002B597D dependency assessment (not implemented)
+
+Static decode from the authentic image:
+
+```
+002B597D push ebx
+002B597E push esi
+002B597F push edi
+002B5980 mov ebx, 0x46C8B0
+002B5985 push ebx
+002B5986 call [0x003C9E44]      ; RtlEnterCriticalSection
+002B598C mov esi, [0x0046C8CC]
+002B5992 mov edi, 0x46C8CC
+002B5997 jmp 0x002B59A4
+002B5999 push [esp+0x10]
+002B599D mov eax, esi
+002B599F mov esi, [esi]
+002B59A1 call [eax+0x08]        ; unreviewed dynamic guest call
+002B59A4 cmp esi, edi
+002B59A6 jnz 0x002B5999
+002B59A8 push ebx
+002B59A9 call [0x003C9E40]      ; RtlLeaveCriticalSection
+002B59AF pop edi
+002B59B0 pop esi
+002B59B1 pop ebx
+002B59B2 ret 0x04
+```
+
+The first unreviewed operation is the kernel import call at `002B5986` through `003C9E44`. The helper then walks the list at `0x46C8CC`, makes an unreviewed virtual call through `[eax+0x08]`, and leaves through `003C9E40`. It does not start, resume, wait for or terminate the prepared thread. A future milestone needs checked test-only critical-section services, a bounded list/node memory policy, and a reviewed dispatch contract for `[eax+0x08]` before this helper can run.
+
+### Decision
+
+**GO for exactly one later supervised Release run** of the integrated probe after independent review and explicit authorisation:
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_integrated_real_preflight \
+  --run-once --execute-real
+```
+
+**NO-GO for extending beyond the reviewed 125-instruction boundary** until that run passes and `002B597D` plus the start-routine path are separately reviewed.

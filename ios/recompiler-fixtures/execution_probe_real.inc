@@ -701,7 +701,14 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
         error = "dispatch init failed: " + error;
         return false;
     }
-    if (X86FuncMappingCount != 6 || X86ContinuationCount != 0) {
+    if (X86ContinuationCount != 0) {
+        error = "generated real mapping has continuations";
+        return false;
+    }
+#if defined(EXECUTION_PROBE_INTEGRATED)
+    if (!integrated_probe::ValidateMapping(error)) return false;
+#else
+    if (X86FuncMappingCount != 6) {
         error = "generated real mapping does not contain the six reviewed functions and boundary stubs";
         return false;
     }
@@ -726,6 +733,7 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
     if (!ValidateHookCoverage(std::string(EXECUTION_PROBE_REAL_GENERATED_DIR) + "/x86_recomp_shared.h",
                               std::string(EXECUTION_PROBE_REAL_GENERATED_DIR) + "/x86_recomp.0.cpp", error))
         return false;
+#endif
 
     // The whole prepared image starts read-only; the reviewed code and data
     // sections then get exactly the permissions the route needs.

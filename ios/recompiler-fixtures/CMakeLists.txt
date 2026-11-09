@@ -217,6 +217,65 @@ target_compile_definitions(execution_probe_secondary_real_preflight PRIVATE
 target_link_libraries(execution_probe_secondary_real_preflight PRIVATE Threads::Threads Zydis)
 set_target_properties(execution_probe_secondary_real_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
+# Phase 2C-35: one combined mapping carries both frozen routes so the retained
+# ThreadRef survives without a dispatch reset or a second generated mapping.
+add_executable(execution_probe_integrated_config execution_probe_integrated_config.cpp)
+set_property(TARGET execution_probe_integrated_config PROPERTY CXX_STANDARD 20)
+target_include_directories(execution_probe_integrated_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set(INTEGRATED_PROBE_DIR ${CMAKE_CURRENT_BINARY_DIR}/probe_integrated)
+set(INTEGRATED_PROBE_CONFIG ${INTEGRATED_PROBE_DIR}/execution_probe_integrated.toml)
+set(INTEGRATED_PROBE_GENERATED_DIR ${INTEGRATED_PROBE_DIR}/generated)
+set(INTEGRATED_PROBE_GENERATED_SOURCE ${INTEGRATED_PROBE_GENERATED_DIR}/x86_recomp.0.cpp)
+set(INTEGRATED_PROBE_GENERATED_MAPPING ${INTEGRATED_PROBE_GENERATED_DIR}/x86_func_mapping.cpp)
+add_custom_command(
+    OUTPUT ${INTEGRATED_PROBE_CONFIG}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${INTEGRATED_PROBE_DIR}
+    COMMAND execution_probe_integrated_config ${INTEGRATED_PROBE_CONFIG} ${EXECUTION_PROBE_REAL_XBE}
+    DEPENDS execution_probe_integrated_config
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${INTEGRATED_PROBE_GENERATED_SOURCE} ${INTEGRATED_PROBE_GENERATED_DIR}/x86_recomp_shared.h ${INTEGRATED_PROBE_GENERATED_MAPPING}
+    COMMAND $<TARGET_FILE:xbe_recomp> ${INTEGRATED_PROBE_CONFIG} ${EXECUTION_PROBE_REAL_XBE} ${INTEGRATED_PROBE_GENERATED_DIR}
+    DEPENDS xbe_recomp ${INTEGRATED_PROBE_CONFIG}
+    VERBATIM
+)
+add_custom_target(generate_execution_probe_integrated DEPENDS ${INTEGRATED_PROBE_GENERATED_SOURCE})
+set_target_properties(generate_execution_probe_integrated PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_executable(execution_probe_integrated_real_preflight
+    execution_probe_integrated_real.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
+    ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/crypto.cpp
+    ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/memory_protection.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
+    ${XBE_SDK}/runtime/xbe/image_loader.cpp
+    ${INTEGRATED_PROBE_GENERATED_SOURCE}
+    ${INTEGRATED_PROBE_GENERATED_MAPPING}
+)
+add_dependencies(execution_probe_integrated_real_preflight generate_execution_probe_integrated)
+target_compile_features(execution_probe_integrated_real_preflight PRIVATE cxx_std_20)
+target_include_directories(execution_probe_integrated_real_preflight PRIVATE ${XBE_SDK}/runtime ${INTEGRATED_PROBE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(execution_probe_integrated_real_preflight PRIVATE
+    MOSTWANTED_EXECUTION_PROBE_TESTS=1
+    MOSTWANTED_CHECKED_KERNEL_ABI_TESTS=1
+    MOSTWANTED_THREAD_PREPARATION_TESTS=1
+    MOSTWANTED_GUEST_CALLBACK_TESTS=1
+    EXECUTION_PROBE_INTEGRATED=1
+    EXECUTION_PROBE_MODE_REAL=1
+    EXECUTION_PROBE_REAL_XBE="${EXECUTION_PROBE_REAL_XBE}"
+    EXECUTION_PROBE_REAL_GENERATED_DIR="${INTEGRATED_PROBE_GENERATED_DIR}"
+    EXECUTION_PROBE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+)
+target_link_libraries(execution_probe_integrated_real_preflight PRIVATE Threads::Threads Zydis)
+set_target_properties(execution_probe_integrated_real_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
 # Phase 2C-31: a separate synthetic fixture for the authentic secondary-thread
 # entry contract.  It deliberately does not share the root route's generated
 # mapping, so the Phase 2C-30 route stays byte-for-byte unchanged.

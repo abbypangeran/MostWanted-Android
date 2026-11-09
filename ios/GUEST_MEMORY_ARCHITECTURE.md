@@ -322,3 +322,22 @@ The real secondary probe uses its own image preparation and mapping; it does not
 - The memory observer records each operation and enforces the 256-operation budget. The snapshot covers the stack page, KPCR page, rdata page, output page and image base page. After the stop, the stack page must show the SEH/TLS writes, the KPCR page must change only at offset 0 to the computed registration, and the rdata/output/header pages must not change.
 - `mem::Write`/`mem::Fill` used by preparation (callback frame, output page clear, negative-test mutation) are host writes and are not counted as guest accesses. The callback frame `[FFFFFFF0, 002B38A2, 00000000]` is written below the prepared `ESP` by the test wrapper.
 - The generated mapping contains only the five reviewed functions. `[xbe] entry_seeds = false` prevents the analysis from walking the root entry (`002B3916`) into 82 unrelated functions; dispatch is initialized with `entry_point = 002B5C0F`. The root entry is therefore not mapped in this probe, and `002B38A2`, `002B58B8` and `002B597D` are trap-only generated stubs.
+
+## Phase 2C-35 integrated root-to-secondary memory and dispatch lifetime
+
+The integrated probe uses one combined checked mapping for both routes. This keeps a single dispatch generation and avoids a mapping switch while the retained `ThreadRef` is alive. The combined mapping has 11 generated functions, 0 continuations and 135 instruction hooks; the root entry remains `X86EntryPoint`, so no custom dispatch metadata is needed.
+
+The root phase uses the Phase 2C-30 policy unchanged: image R, `.text` RX, `.data` RW, import page `003C9000` R with exactly one 4-byte read per authorised slot at `002B5CE0`/`003C9E68` and `002B275D`/`003C9D4C`, and the root stack D0010000-D0020000. The root's ordinal-255 service retains the inactive thread; ordinal-187 removes only the handle-table entry.
+
+Between segments the probe restores both import slots to `800000FF` and `800000BB`, verifies the readback and read-only page, and keeps the same `ThreadRef`, stack, KPCR, ETHREAD and TLS. No image reload, stack reset or second `PrepareSystemThreadEx` occurs.
+
+The secondary phase replaces the root memory policy with exact spans:
+
+- retained stack `[stack_base, stack_top)` read/write;
+- KPCR `fs:[0]` exactly 4 bytes read/write;
+- KPCR+0x28 and ETHREAD+0x28 exactly 4 bytes read;
+- TLS globals `003ED3EC`, `003ED3F0`, `003ED3FC` exactly 4 bytes read;
+- TLS block `[tls, tls+0x94)` write, used by the pointer publication and zero-fill;
+- import page `003C9000` remains forbidden; the secondary route has no import call or operand read.
+
+The memory observer clears the root operation list before the secondary segment, enforces the 256-operation budget independently, and records the secondary operations. The secondary snapshot covers the retained stack page, KPCR page, rdata page and image base. The KPCR page must change only at offset 0 to the computed `S-0x14` registration; rdata and image base must not change. The host-written callback frame `[FFFFFFF0, 002B38A2, 00000000]` is written by `CallGuestCallbackForTest` before guest entry and is not counted as a guest instruction or guest memory operation. `Thread::ctx` points at the local secondary context only for the segment and is cleared before cancellation.
