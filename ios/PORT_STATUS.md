@@ -2615,3 +2615,144 @@ Integrated self-test 67 PASS in Debug and Release. Preflight still reports `143/
 ```
 
 **NO-GO for `002B5C7B` or beyond** until that run passes.
+
+## Phase 2C-41 — frozen 143-instruction closure
+
+**PASS.** The Phase 2C-41 acceptance evidence closes the reviewed 143-instruction milestone. The experiment is frozen; this record uses the existing evidence and does not rerun it.
+
+| Checkpoint | Accepted evidence |
+|---|---|
+| Guest instructions | 143 total: 72 root plus 71 secondary. Secondary stopped before `002B5C7B`. |
+| Calls and imports | Four direct calls, four kernel calls, four import-operand reads. |
+| Critical-section ABI | Enter and leave service ESP both `entry_esp - 0x54`; returns `002B598C` and `002B59AF`; argument `0046C8B0`. |
+| Ownership | Held critical-section owner matched retained ETHREAD `B0000400`; release restored `FFFFFFFF / 0 / 0`. |
+| Cleanup | Prepared thread cancelled; output cleared; imports restored; stack freed; teardown counters zero; active workers zero. |
+| Process result | Exit status 0; stderr empty; no failure record. |
+| Evidence | `.local/ios-port/phase2c41-evidence/` (`acceptance-summary.txt`, `binary-identity.txt`, command, preflight, self-test and execution logs). |
+
+This PASS establishes only the reviewed prefix and its checked ABI. It does not establish worker activation, execution of the dynamic start-routine call, authentic `002B38A2`, or guest-thread concurrency.
+
+## Phase 2D-1 — guest-thread lifecycle architecture review
+
+Review baseline: `f106eb5c598464421fa37cccc26ac575500ac96b`, branch `feature/ios-port`. Scope is static XBE dependency analysis and existing runtime/test contracts. No authentic XBE instruction was run for this review.
+
+### Lifecycle contract audit
+
+| Contract | Existing implementation and evidence | Gap relevant to one guest worker |
+|---|---|---|
+| PrepareSystemThreadEx | `threads.cpp` validates sizes and output spans, allocates stack/TLS/KPCR/ETHREAD, binds ETHREAD, publishes handle/id, and rolls back failures. Fixture tests cover invalid size/output, allocation failpoints, duplicate preparation, and repeat cancellation. | Preparation is inactive; it proves no worker can run. |
+| InitContext | Uses `ESP=(TLS & ~15)-16`, `FS base=KPCR`, x87 `FCW=0x27F`, `MXCSR=0x1F80`, and records `Thread::ctx`. Synthetic readback verifies the KPCR/ETHREAD/TLS layout. | Authentic guest use of FS/TLS after the boundary is unvalidated. |
+| PrepareGuestCallback | Validates nonzero target, callback class, generated-function mapping, executable code page, accepting worker lifecycle, and captures dispatch generation. | Ticket creation is not callback execution or worker authorization. |
+| CallGuestCallback | Checks target identity, generation, mapping, code page, callback arguments, and bounded stack under dispatch/page leases. | On Apple it returns `kExecutionDisabled` after validation. It never calls the guest function. |
+| CallGuestCallbackForTest | Separate `MOSTWANTED_GUEST_CALLBACK_TESTS`-gated path; performs the same ticket/argument/stack checks, writes the synthetic callback frame, and synchronously calls the mapped function. Existing tests cover ticket mismatch, stale generation, invalid arguments and page leases. | It is not wired into StartThread and does not authorize authentic XBE execution. A test-only macro alone does not identify a synthetic image. |
+| StartThread | Prepares start/system tickets, transitions prepared thread to active, registers it, starts a managed worker, sets `t_current`, initializes worker context, waits for resume/stop, and calls production `CallGuestCallback`. Worker launch failure unregisters and returns the thread to prepared. | On Apple the callback returns `kExecutionDisabled`, so no guest function runs. There is no one-worker limit. |
+| Stop/cancel/join | Worker manager supports stop callbacks, activation hold, failed-start injection, shutdown, join, natural-exit reaping and restart. Generic worker tests cover stop-before-activation, shutdown/submit races, join races and memory teardown ordering. | Those tests do not start a guest Thread through StartThread or prove guest callback cleanup. Cancellation is cooperative while callback code is running. |
+| ExitThread / PsTerminateSystemThread | `PsTerminateSystemThread` is registered as ordinal 258 with one argument and calls `ExitThread`. ExitThread marks the thread exited, clears `ctx`, unregisters it and ends the host thread. | No idempotent double-exit contract is tested. Completion does not clear start/system callback tickets or release the thread's guest stack/KPCR/ETHREAD. `CancelPreparedThread` releases blocks only while state is prepared. |
+| Dispatch and page lifetime | `GuestDispatchLease` prevents dispatch reset during an active callback; nested leases are tracked per host thread. `dispatch::CallLease` pins the mapping and generation; scoped page leases protect callback code and bounded arguments. `mem::Shutdown` stops workers and waits on the exclusive dispatch gate before unmapping. | Generic teardown ordering is tested; a completed guest worker's object, ticket and allocation ownership is not closed end-to-end. |
+| TLS/KPCR/ETHREAD/SEH | Worker owns thread-local `t_current`; InitContext points FS at KPCR; prepared guest-memory tests verify `fs:[0]`, stack, ETHREAD and TLS fields. The reviewed prefix enters SEH prolog `00319804`. | Handler `00319858` is stored, not executed; epilogue `002B5BD3` and exception delivery remain unvalidated. |
+
+Source anchors for this audit: `sdk/runtime/kernel/threads.cpp:132-140,317-433,528-541`; `sdk/runtime/cpu/dispatch.cpp:545-650`; `sdk/runtime/kernel/worker_lifecycle.cpp:97-247,321-360`; `sdk/runtime/kernel/kernel.h:220-274`; `sdk/runtime/kernel/memory.cpp:668-705`; `sdk/tools/recomp/codegen.cpp:250-267,314-385`; ticket tests `ios/recompiler-fixtures/fixture_runner.cpp:315-347`; managed worker and teardown tests `ios/memory-tests/worker_lifecycle_tests.cpp:172-245,492-547`; Apple guard assertions `ios/recompiler-fixtures/startup_integration_tests.cpp:243-314`; test macro is also defined by real-image preflight targets in `ios/recompiler-fixtures/CMakeLists.txt:188-217,245-277`.
+
+### Concrete state machine
+
+Thread-object state is distinct from native worker state. StartThread has no single-worker policy.
+
+| Object transition | Trigger and effect |
+|---|---|
+| `Prepared → Active` | Tickets accepted, state compare/exchange succeeds, thread registered, worker launch accepted. |
+| `Active → Exited` | Callback returns normally, or guest termination calls ExitThread. |
+| `Active → Cancelled` | Worker stop is observed before callback dispatch, or callback validation rejects. |
+| `Prepared → Cancelled` | CancelPreparedThread clears published outputs, closes handle, unbinds ETHREAD and frees guest blocks. |
+| `Active → Prepared` | Worker launch fails after registration; StartThread unregisters and rolls state back. |
+
+Worker manager transitions are `Prepared → Running`; shutdown moves `Prepared` or `Running` to `StopRequested`; task exit moves to `Quiescing`. A new registration may reap `Quiescing → Joining → Joined → ResourcesReleased`. Global shutdown joins quiescing workers and marks them joined/released without setting the explicit `Joining` state. `StopKernelWorkers` closes the dispatch gate before join; memory teardown proceeds only after that returns successfully.
+
+### Authentic dependency graph after the frozen stop
+
+```text
+002B5C7B  PUSH [EBP+0x0C]
+002B5C7E  CALL [EBP+8]  -> dynamic callback, expected 002B38A2
+                          -> direct callees 002B58B8, 002B5664, 002B582B,
+                             002B57D3, 001C8C20, 002B55EE
+                          -> nested/helper routes and imports listed below
+002B5C84  PUSH 0 / CALL 002B597D
+002B5C99  OR [EBP-4], -1 / PUSH [EBP-0x1C]
+002B5CA0  CALL [003C9E64]  -> PsTerminateSystemThread (ordinal 258)
+002B5CA6  INT3
+
+002B5C0F -> 00319804 (reviewed SEH prolog) -> system routine continues
+00319858 is the handler stored in the frame; 002B5BD3 is the SEH epilogue.
+```
+
+The start routine `002B38A2` directly calls `002B58B8`, `002B5664`, `002B582B`, `002B57D3`, `001C8C20`, and `002B55EE`. Known nested paths include `002B58B8 → 002B8DC4`; `002B5664 → 002B5E12`; dynamic calls through EAX at `002B5848`, `002B57DC`, `002B57FB`, and `002B581F`; and dynamic `CALL EDI` at `002B5955`. The helper `001C8C20` has further direct-call fan-out; this phase does not expand into full-game startup.
+
+| Import or service | ABI from registered export | Current implementation/status |
+|---|---:|---|
+| RtlEnterCriticalSection, ordinal 277 | one argument, stdcall | Checked fixture bridge; exact object, owner and ABI verified in Phase 2C-41. |
+| RtlLeaveCriticalSection, ordinal 294 | one argument, stdcall | Checked fixture bridge; exact release ABI verified in Phase 2C-41. |
+| MmQueryAddressProtect, ordinal 179 | one argument | HLE deliberately traps because Xbox protection semantics are unverified. |
+| MmSetAddressProtect, ordinal 182 | three arguments | HLE deliberately traps because Xbox protection semantics are unverified. |
+| HalRegisterShutdownNotification, ordinal 47 | two arguments | Stub returns zero; authentic notification semantics are unvalidated. |
+| IoCreateSymbolicLink, ordinal 67 | two arguments | Host filesystem implementation exists; authentic guest path and side effects are unvalidated. |
+| MmFreeContiguousMemory, ordinal 171 | one argument | HLE implementation exists; authentic pointer/lifetime contract is unvalidated. |
+| KeInitializeDpc, ordinal 107 | three arguments | HLE implementation exists; authentic object layout/behavior is unvalidated. |
+| KeInitializeTimerEx, ordinal 113 | two arguments | HLE implementation exists; authentic object layout/behavior is unvalidated. |
+| HalReturnToFirmware, ordinal 49 | one argument | Host leave/relaunch behavior exists; forbidden in this worker slice. |
+| PsTerminateSystemThread, ordinal 258 | one argument | HLE calls ExitThread, but checked kernel dispatch has no ordinal-258 bridge and guest termination is untested. |
+
+### Instruction and dependency support inventory
+
+| Dependency | Classification | Evidence/limit |
+|---|---|---|
+| Reviewed route through pre-instruction stop `002B5C7B` | **Already supported and verified** | Phase 2C-41 ran exactly 143 authentic instructions, 72 root plus 71 secondary; stop instruction itself did not execute. |
+| Checked `PUSH [EBP+0x0C]` at `002B5C7B` | **Implemented, not authentic-execution validated** | Checked PUSH accepts 32-bit flat guest memory with EBP/SS addressing; no execution past the stop is authorized. |
+| Dynamic `CALL [EBP+8]` at `002B5C7E` | **Missing implementation; authentic call intentionally forbidden** | Checked indirect CALL accepts absolute memory slots only. No checked call ties this stack-loaded target to the prepared callback ticket. |
+| `002B5C84` call back into `002B597D` | **Implemented, not validated on post-callback path** | Direct generated CALL and the first empty-list critical-section path were reviewed; this second invocation was not run. |
+| `OR [EBP-4], -1` at `002B5C99` | **Missing checked implementation** | Generic OR emission exists, but this memory form is not admitted by the checked-op whitelist. |
+| `CALL [003C9E64]` at `002B5CA0` | **Instruction form implemented; safe termination dispatch missing** | Absolute indirect CALL decodes, but checked kernel calls allow only test bridges for ordinals 255, 187, 277 and 294. Ordinal 258 is absent. |
+| NOT AL and REP MOVS/STOS forms | **Implemented, synthetic-tested; not authentic-execution validated on the later route** | Current checked codegen admits NOT AL and specified REP MOVS/STOS forms; older Phase 2C-10/14 blocker text predates that support. |
+| Start helper NEG AL, SBB forms, TEST ESI,ESI | **Missing checked instruction forms** | Current checked whitelist excludes these operands/forms; known sites include `002B58F8`, `002B5908`, `002B5918`, `002B5923`, and `002B5933`. |
+| Start/helper register-indirect CALL EAX/EDI | **Missing checked call route** | Known sites include `002B5848`, `002B57DC`, `002B57FB`, `002B581F`, and `002B5955`. |
+| SEH handler `00319858`, epilogue `002B5BD3`, exception delivery | **Intentionally forbidden for this phase; implementation/validation missing** | Handler is not in the reviewed generated mapping and was never entered. |
+| Non-empty list callback `002B59A1`, authentic start routine, Apple Boot/callback execution, multiple workers | **Intentionally forbidden** | Preserve Apple `kExecutionDisabled`, production Boot guard, and stop boundary. |
+
+### Synthetic single-worker decision and blocker
+
+**BLOCKED; no synthetic worker activated.** The existing test-only callback can invoke a validated mapped fixture synchronously, and the managed worker manager has deterministic activation and failed-launch controls. No test-only activation adapter connects that callback to the real StartThread lifecycle. More importantly, normal completion and ExitThread leave callback tickets and guest stack/KPCR/ETHREAD allocation ownership on the Thread object; only prepared-thread cancellation frees those blocks. Manually freeing them in a test wrapper would bypass the lifecycle contract being validated. A macro-gated adapter also needs an explicit synthetic-image authorization boundary, not merely a compile flag.
+
+Existing coverage and gaps for the requested cases:
+
+| Case | Existing evidence | Guest-worker coverage |
+|---|---|---|
+| Invalid/stale callback ticket | Callback tests reject changed targets and generations. | No managed guest worker. |
+| Failed worker launch | Generic manager fail-next-start; prepared-thread publication/rollback. | No StartThread callback lifecycle test. |
+| Cancellation before activation | Generic activation barrier test. | No prepared guest Thread connected to that barrier. |
+| Shutdown during worker preparation | Generic worker shutdown/submit and join-race tests. | No guest Thread preparation/activation race. |
+| Normal callback return | Synchronous test callback and generic worker completion. | No managed guest callback return. |
+| Guest-requested termination | PsTerminateSystemThread export exists. | No checked ordinal-258 dispatch or worker termination test. |
+| Double cancellation | Prepared-thread cancel is tested twice; second cancellation rejects. | Covered for prepared state only. |
+| Double exit | No idempotence test. | ExitThread is noreturn; completion ownership is unresolved. |
+| Worker completion vs host teardown | Generic worker and memory shutdown ordering test. | No guest callback/page access race. |
+| No guest access after deallocation | Generic teardown joins worker before unmap and checks task completion before shutdown returns. | No guest callback worker exists to exercise this. |
+
+Minimum remediation before a synthetic vertical slice: define Thread guest-block and callback-ticket release semantics across normal return, termination, handle close and memory shutdown; make stale object references unable to free a later allocation; add an explicitly synthetic-only test authorization and a test-gated StartThread route that reuses production state transitions; then cover the listed races with barriers and condition variables, including ordinal-258 termination, double exit, and zero retained resources. Do not substitute a host-only worker callback or manual test cleanup for those contracts.
+
+### Phase 2D-1 validation and delivery state
+
+| Check | Result |
+|---|---|
+| Recompiler fixtures, Debug | Build passed; CTest 6/6 passed, including checked instructions, callbacks, startup, VBlank and synthetic execution probes. |
+| Recompiler fixtures, Release | Build passed; CTest 6/6 passed. |
+| macOS memory/worker suite, Debug | Fresh ignored Xcode build passed; CTest 1/1 passed. |
+| macOS memory/worker suite, Release | Build passed; CTest 1/1 passed. |
+| Phase 2C-41 authentic experiment | Not rerun. |
+| Authentic start routine/worker, Apple Boot, iPhone install, main merge | Not performed; prohibited by this phase. |
+
+The first attempt to reuse `.local/ios-port/memory-macos` failed at link with missing test symbols; a fresh ignored build directory `.local/ios-port/phase2d1-memory-tests` built and passed both configurations. No tracked build output was added.
+
+**Development:** Phase 2C-41 closure and Phase 2D-1 architecture/dependency map documented; synthetic worker implementation blocked on ownership and test-authorization contracts.
+**Validation:** Existing applicable Debug/Release CTest suites pass: 6/6 fixture tests and 1/1 memory/worker test per configuration.
+**Integration:** Scoped documentation change stays on `feature/ios-port`; no merge to `main`.
+**Blockers:** Thread-owned guest memory/ticket release semantics, explicit synthetic-only worker authorization, checked start callback and termination path, and unsupported start-routine instructions/imports.
+**Next action:** Implement the guest Thread resource-ownership and teardown contract first; rerun this milestone's worker-test plan before any authentic single-worker proposal.
+**Customer release:** Not performed; no game boot or authentic guest-thread concurrency claim.
