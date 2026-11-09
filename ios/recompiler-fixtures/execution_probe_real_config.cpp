@@ -30,10 +30,10 @@ int main(int argc, char** argv) {
               "checked_memory = true\n\n"
               "[[function]]\n"
               "at = 0x002B3916\n"
-              "end = 0x002B396F\n\n"
+              "end = 0x002B3971\n\n"
               "[[function]]\n"
               "at = 0x002B5CA7\n"
-              "end = 0x002B5D12\n\n"
+              "end = 0x002B5D15\n\n"
               "[[function]]\n"
               "at = 0x002B5CEC\n"
               "end = 0x002B5CF4\n";
@@ -42,9 +42,6 @@ int main(int argc, char** argv) {
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
                << step.pc << "\"\n";
     }
-    config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
-           << execution_probe::kLastInstruction << "\ncall = \"ProbeStop_0x" << std::hex << std::uppercase
-           << std::setw(8) << std::setfill('0') << execution_probe::kLastInstruction << "\"\nafter = true\n";
     std::ofstream file(argv[1]);
     file << config.str();
     return file ? 0 : 1;

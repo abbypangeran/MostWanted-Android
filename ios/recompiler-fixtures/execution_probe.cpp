@@ -126,6 +126,7 @@ struct Options {
     bool import_unpatched = false;
     uint32_t import_target = 0;  // 0 means the reviewed ordinal-255 thunk
     uint32_t helper_value = 0;
+    bool revoke_ret_stack = false;
     bool allow_counter_page = true;
     bool decommit_global = false;
     bool entry_read_only = false;
@@ -162,6 +163,7 @@ struct ProbeState {
     bool have_previous = false;
     StepRecord stop{};
     bool have_stop = false;
+    bool stop_checked_call_clear = false;
     std::vector<StepRecord> trace;
     std::vector<MemoryRecord> memory;
     Clock::time_point deadline{};
@@ -216,6 +218,19 @@ struct InStep {
     InStep() { g_probe.in_step = true; }
     ~InStep() { g_probe.in_step = false; }
 };
+
+// Test-only ordinal-255 service state; the handler prepares an inactive thread
+// with the authentic arguments and never starts it.
+enum class KernelBridgeMode : uint8_t { kPrepare, kFail, kBadCleanup, kBadReturn, kBadDirectReturn, kStartAttempt };
+KernelBridgeMode g_kernel_bridge_mode = KernelBridgeMode::kPrepare;
+uint32_t g_kernel255_calls = 0;
+uint32_t g_kernel255_status = 0;
+uint32_t g_kernel255_esp = 0;
+uint32_t g_kernel255_return = 0;
+std::array<uint32_t, 10> g_kernel255_args{};
+std::array<uint32_t, 10> g_expected_kernel_args{};
+bool g_have_expected_kernel_args = false;
+kernel::ThreadRef g_prepared_thread;
 
 void ProbeStep(uint32_t pc, X86Context& ctx) {
     if (!g_probe.running) Fail("instruction step outside a probe run", pc);
@@ -275,6 +290,42 @@ void ProbeStep(uint32_t pc, X86Context& ctx) {
         ++g_probe.kernel_calls;
     }
 
+    // the reviewed RET reads the caller's return address from the stack
+    if (g_probe.options.revoke_ret_stack && pc == kRetInstruction &&
+        mem::Protect(ctx.esp & ~(mem::kPage - 1), mem::kPage, mem::kNoAccess) != mem::AccessStatus::kOk)
+        Fail("could not revoke the return stack", pc);
+
+    if (step->kind == StepKind::kStop) {
+        if (g_probe.kernel_calls != 1) Fail("boundary without the reviewed kernel call", pc);
+        if (g_kernel255_calls != 1) Fail("ordinal-255 service was not called exactly once", pc);
+        if (g_probe.options.require_kernel_success && g_kernel255_status != kernel::kSuccess)
+            Fail("ordinal-255 thread preparation failed", pc);
+        if (!kernel::Threads().empty()) Fail("a guest thread became active", pc);
+        if (kernel::ThreadWorkerLaunchCountForTest() != g_probe.worker_launch_baseline)
+            Fail("a kernel worker was activated", pc);
+        g_probe.stop.pc = pc;
+        g_probe.stop.eax = ctx.eax;
+        g_probe.stop.ecx = ctx.ecx;
+        g_probe.stop.edx = ctx.edx;
+        g_probe.stop.ebx = ctx.ebx;
+        g_probe.stop.esp = ctx.esp;
+        g_probe.stop.ebp = ctx.ebp;
+        g_probe.stop.esi = ctx.esi;
+        g_probe.stop.edi = ctx.edi;
+        g_probe.stop.cf = ctx.cf;
+        g_probe.stop.zf = ctx.zf;
+        g_probe.stop.sf = ctx.sf;
+        g_probe.stop.of = ctx.of;
+        g_probe.stop.pf = ctx.pf;
+        g_probe.stop.af = ctx.af;
+        g_probe.stop.kind = StepKind::kStop;
+        g_probe.stop.branch_valid = false;
+        g_probe.stop.branch_taken = false;
+        g_probe.stop_checked_call_clear = ctx.checked_call == nullptr;
+        g_probe.have_stop = true;
+        throw ProbeNormalStop{};
+    }
+
     if (g_probe.options.delay.count() && g_probe.options.delay_pc == pc)
         std::this_thread::sleep_for(g_probe.options.delay);
 
@@ -293,17 +344,6 @@ void ProbeStep(uint32_t pc, X86Context& ctx) {
 
 // Test-only ordinal-255 service.  It prepares an inactive guest thread with the
 // authentic arguments and never starts it; the probe cancels it during teardown.
-enum class KernelBridgeMode : uint8_t { kPrepare, kFail, kBadCleanup, kBadReturn, kStartAttempt };
-KernelBridgeMode g_kernel_bridge_mode = KernelBridgeMode::kPrepare;
-uint32_t g_kernel255_calls = 0;
-uint32_t g_kernel255_status = 0;
-uint32_t g_kernel255_esp = 0;
-uint32_t g_kernel255_return = 0;
-std::array<uint32_t, 10> g_kernel255_args{};
-std::array<uint32_t, 10> g_expected_kernel_args{};
-bool g_have_expected_kernel_args = false;
-kernel::ThreadRef g_prepared_thread;
-
 void ProbeKernel255Handler(X86Context& ctx, uint8_t*) {
     ++g_kernel255_calls;
     g_kernel255_esp = ctx.esp;
@@ -350,6 +390,11 @@ void ProbeKernel255Handler(X86Context& ctx, uint8_t*) {
         if (prepared) kernel::CancelPreparedThread(prepared);
     } else {
         g_prepared_thread = std::move(prepared);
+        if (g_kernel_bridge_mode == KernelBridgeMode::kBadDirectReturn) {
+            // corrupt the direct call's return address, 0x30 above the handler frame
+            const uint32_t invalid = 0xDEADBEEF;
+            mem::Write(ctx.esp + 0x30, &invalid, sizeof(invalid));
+        }
     }
     kernel::Return(ctx, g_kernel255_status, 10);
 }
@@ -370,39 +415,6 @@ void ReleaseKernelBridge() {
     dispatch::SetKernel255FixtureBridge(false);
 }
 
-void ProbeStopHook(X86Context& ctx) {
-    if (!g_probe.running) Fail("mandatory stop outside a probe run", kStopBefore);
-    if (!g_probe.have_previous || g_probe.previous_pc != kLastInstruction)
-        Fail("mandatory stop ran before the last reviewed instruction", kStopBefore);
-    if (g_probe.kernel_calls != 1) Fail("mandatory stop without the reviewed kernel call", kStopBefore);
-    if (g_kernel255_calls != 1) Fail("ordinal-255 service was not called exactly once", kStopBefore);
-    if (g_probe.options.require_kernel_success && g_kernel255_status != kernel::kSuccess)
-        Fail("ordinal-255 thread preparation failed", kStopBefore);
-    if (!kernel::Threads().empty()) Fail("a guest thread became active", kStopBefore);
-    if (kernel::ThreadWorkerLaunchCountForTest() != g_probe.worker_launch_baseline)
-        Fail("a kernel worker was activated", kStopBefore);
-    g_probe.stop.pc = g_probe.previous_pc;
-    g_probe.stop.eax = ctx.eax;
-    g_probe.stop.ecx = ctx.ecx;
-    g_probe.stop.edx = ctx.edx;
-    g_probe.stop.ebx = ctx.ebx;
-    g_probe.stop.esp = ctx.esp;
-    g_probe.stop.ebp = ctx.ebp;
-    g_probe.stop.esi = ctx.esi;
-    g_probe.stop.edi = ctx.edi;
-    g_probe.stop.cf = ctx.cf;
-    g_probe.stop.zf = ctx.zf;
-    g_probe.stop.sf = ctx.sf;
-    g_probe.stop.of = ctx.of;
-    g_probe.stop.pf = ctx.pf;
-    g_probe.stop.af = ctx.af;
-    g_probe.stop.kind = StepKind::kKernelCall;
-    g_probe.stop.branch_valid = false;
-    g_probe.stop.branch_taken = false;
-    g_probe.have_stop = true;
-    throw ProbeNormalStop{};
-}
-
 // one hook per route PC; names are emitted by the fixture builder from the same table.
 // These must have external linkage: the generated code calls them by name.
 }  // namespace
@@ -411,8 +423,6 @@ void ProbeStopHook(X86Context& ctx) {
     void ProbeStep_##pc(X86Context& ctx, uint8_t*) { ProbeStep(pc, ctx); }
 EXECUTION_PROBE_ROUTE(DEFINE_PROBE_STEP)
 #undef DEFINE_PROBE_STEP
-
-void ProbeStop_0x002B5D11(X86Context& ctx, uint8_t*) { ProbeStopHook(ctx); }
 
 // Test-only replacements for the production handlers.  The probe target does
 // not link sdk/runtime/cpu/memory_fault.cpp; these turn a fault into a structured
@@ -528,9 +538,10 @@ void PrintStop() {
     if (!g_probe.have_stop) return;
     const StepRecord& stop = g_probe.stop;
     std::printf("STOP %08X eax=%08X ecx=%08X edx=%08X ebx=%08X esp=%08X ebp=%08X esi=%08X edi=%08X "
-                "flags=%u%u%u%u%u%u\n",
+                "flags=%u%u%u%u%u%u frame=%s\n",
                 stop.pc, stop.eax, stop.ecx, stop.edx, stop.ebx, stop.esp, stop.ebp, stop.esi, stop.edi, stop.cf, stop.zf,
-                stop.sf, stop.of, stop.pf, stop.af);
+                stop.sf, stop.of, stop.pf, stop.af,
+                g_probe.stop_checked_call_clear ? "clear" : "active");
 }
 
 uint32_t ImportReads() {
@@ -778,8 +789,26 @@ bool CancelPreparedThreadForProbe() {
 }
 
 bool VerifySyntheticPostconditions(std::string& error) {
-    if (!g_probe.have_stop || g_probe.stop.pc != kLastInstruction) {
-        error = "mandatory stop did not follow the last reviewed instruction";
+    if (!g_probe.have_stop || g_probe.stop.pc != kStopBefore) {
+        error = "mandatory stop is not the return destination";
+        return false;
+    }
+    if (g_probe.stop.esp != g_probe.options.initial_esp - kImportStackBytes + 0x48) {
+        error = "RET cleanup did not restore the caller stack";
+        return false;
+    }
+    if (!g_probe.stop_checked_call_clear) {
+        error = "checked call frame was not completed by the RET";
+        return false;
+    }
+    for (const StepRecord& step : g_probe.trace) {
+        if (step.pc == kStopBefore) {
+            error = "the stop boundary instruction was executed";
+            return false;
+        }
+    }
+    if (g_probe.trace.empty() || g_probe.trace.back().pc != kRetInstruction) {
+        error = "the RET was not the last executed instruction";
         return false;
     }
     if (g_probe.direct_calls != 1) {
@@ -876,13 +905,21 @@ int RunChild(const std::string& scenario) {
         // a failed kernel status must diverge to the unreviewed debug arm and stop there
         options.allow_kernel_call = true;
         g_kernel_bridge_mode = KernelBridgeMode::kFail;
+    } else if (scenario == "ret-bad-address") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        g_kernel_bridge_mode = KernelBridgeMode::kBadDirectReturn;
+    } else if (scenario == "ret-stack-denied") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        options.revoke_ret_stack = true;
     } else if (scenario == "import-read") {
         mode = Mode::kImportProbe;
     } else if (scenario == "import-second-read") {
         options.allow_kernel_call = true;
         mode = Mode::kSecondRead;
     } else if (scenario == "post-import-entry") {
-        options.start_pc = kStopBefore;
+        options.start_pc = 0x002B3971;
     } else if (scenario == "entry-not-executable") {
         options.entry_read_only = true;
     } else if (scenario == "helper-not-executable") {
@@ -1109,8 +1146,10 @@ bool StaticValidateReal(const std::string& path, std::string& report) {
         }
     }
 
-    if (FindStep(kStopBefore)) {
-        report += "\nstop PC is part of the reviewed route";
+    const RouteStep* stop_step = FindStep(kStopBefore);
+    const RouteStep* ret_step = FindStep(kRetInstruction);
+    if (!stop_step || stop_step->kind != StepKind::kStop || !ret_step || ret_step->next != kStopBefore) {
+        report += "\nRET boundary is not the reviewed pre-instruction stop";
         return false;
     }
     uint32_t import = 0;
@@ -1226,8 +1265,8 @@ int main(int argc, char** argv) {
 
     const Case cases[] = {
         {"guards", true, "RESULT ok guards=1", 5000, false},
-        {"taken", true, "RESULT ok instructions=55", 5000, false},
-        {"not-taken", true, "RESULT ok instructions=56", 5000, false},
+        {"taken", true, "RESULT ok instructions=56", 5000, false},
+        {"not-taken", true, "RESULT ok instructions=57", 5000, false},
         {"entry-not-executable", false, "entry page is not executable", 5000, false},
         {"helper-not-executable", false, "direct call target page is not executable", 5000, false},
         {"call-target-not-permitted", false, "direct call target is not permitted", 5000, false},
@@ -1250,6 +1289,8 @@ int main(int argc, char** argv) {
         {"import-prepare-failure", false, "ordinal-255 thread preparation failed", 5000, false},
         {"import-start-attempt", false, "ordinal-255 thread preparation failed", 5000, false},
         {"import-failure-path", false, "unreviewed control flow", 5000, false},
+        {"ret-bad-address", false, "invalid guest return address", 5000, false},
+        {"ret-stack-denied", false, "guest memory fault", 5000, false},
         {"post-import-entry", false, "start PC is not in the reviewed route", 5000, false},
         {"re-entry", false, "re-entry during a step", 5000, false},
         {"parent-timeout", false, "", 800, true},
@@ -1296,9 +1337,10 @@ int main(int argc, char** argv) {
     // the success path prepares and cancels an inactive thread and stops after the import call
     const ChildResult success = SpawnChild(self, "taken", std::chrono::milliseconds(5000));
     Check(success.output.find("CANCEL prepared=1 cancelled=1 output_cleared=1 stack_freed=1") != std::string::npos &&
-              success.output.find("STOP 002B5D11") != std::string::npos &&
-              success.output.find("kernel_calls=1 import_reads=1") != std::string::npos,
-          "successful probe stops before ret 0x18, prepares a thread, and cancels it");
+              success.output.find("STOP 002B396F") != std::string::npos &&
+              success.output.find("kernel_calls=1 import_reads=1") != std::string::npos &&
+              success.output.find("frame=clear") != std::string::npos,
+          "successful probe returns through RET 0x18, stops at the caller boundary, and cancels the thread");
 
     std::printf("execution probe: %s\n", failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;

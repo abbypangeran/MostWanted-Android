@@ -19,8 +19,9 @@ namespace execution_probe {
 // kKernelCall is the reviewed indirect call through the import slot; it is
 // admissible only through the test-only ordinal-255 bridge.  kForbidden marks a
 // PC that must have a hook but must never be reached: the debug arm of the
-// post-import branch is outside this experiment.
-enum class StepKind : uint8_t { kSequential, kConditional, kCall, kKernelCall, kForbidden };
+// post-import branch is outside this experiment.  kStop is a pre-instruction
+// boundary: the hook records the returning state and stops before the PC runs.
+enum class StepKind : uint8_t { kSequential, kConditional, kCall, kKernelCall, kForbidden, kStop };
 
 struct RouteStep {
     uint32_t pc;
@@ -88,7 +89,9 @@ struct RouteStep {
     X(0x002B5CEA, 2, kConditional, 0x002B5CEC, 0x002B5D0E)                                   \
     X(0x002B5CEC, 8, kForbidden, 0, 0)                                                       \
     X(0x002B5D0E, 3, kSequential, 0x002B5D11, 0)                                             \
-    X(0x002B5D11, 1, kSequential, 0x002B5D12, 0)
+    X(0x002B5D11, 1, kSequential, 0x002B5D12, 0)                                             \
+    X(0x002B5D12, 3, kSequential, 0x002B396F, 0)                                             \
+    X(0x002B396F, 2, kStop, 0, 0)
 
 inline constexpr RouteStep kRoute[] = {
 #define EXECUTION_PROBE_ROUTE_STEP(pc, len, kind, next, alt) {pc, len, StepKind::kind, next, alt},
@@ -105,8 +108,8 @@ inline constexpr uint32_t kImportReturn = 0x002B5CE6;
 inline constexpr uint32_t kPostImportBranch = 0x002B5CEA;  // jnl successor of the kernel status
 inline constexpr uint32_t kDebugPath = 0x002B5CEC;         // forbidden arm, a trap-only boundary function
 inline constexpr uint32_t kHandleRead = 0x002B5D0E;        // mov eax, [ebp+0x0C]
-inline constexpr uint32_t kLastInstruction = 0x002B5D11;   // pop ebp
-inline constexpr uint32_t kStopBefore = 0x002B5D12;        // ret 0x18, never executed
+inline constexpr uint32_t kLastInstruction = 0x002B5D12;   // ret 0x18, executed
+inline constexpr uint32_t kStopBefore = 0x002B396F;        // caller continuation, never executed
 inline constexpr uint32_t kImportSlot = 0x003C9E68;
 inline constexpr uint32_t kImportOrdinal = 255;
 inline constexpr uint32_t kImportEncoding = 0x800000FF;
@@ -120,11 +123,12 @@ inline constexpr uint32_t kSystemRoutine = 0x002B5C0F;
 inline constexpr uint32_t kImportStackBytes = 0x50;
 inline constexpr uint32_t kImportArg0Offset = 0x34;  // lea eax, [ebp+0x0C] with ebp = esp + 0x28
 
-// the helper's RET 0x18 contract, reviewed but never executed: it returns to
-// the direct call's continuation and pops the caller's six arguments.
+// the helper's RET 0x18 contract: executed, returning to the direct call's
+// continuation after popping the caller's six arguments.
 inline constexpr uint32_t kRetInstruction = 0x002B5D12;
 inline constexpr uint32_t kRetTarget = 0x002B396F;
 inline constexpr uint32_t kRetPopBytes = 0x18;
+inline constexpr uint32_t kStopInstruction = 0x002B396F;  // mov edi, eax, never executed
 
 inline constexpr uint32_t kMaximumInstructions = 64;
 inline constexpr uint32_t kMaximumDirectCalls = 1;

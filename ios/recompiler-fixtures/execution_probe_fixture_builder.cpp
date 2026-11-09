@@ -86,6 +86,8 @@ constexpr Instruction kInstructions[] = {
     {0x002B5CEC, {0x64, 0x0F, 0xB6, 0x05, 0x24, 0x00, 0x00, 0x00}, 8},  // movzx eax, fs:[0x24] - forbidden
     {0x002B5D0E, {0x8B, 0x45, 0x0C}, 3},                                // mov eax, [ebp+0xC]
     {0x002B5D11, {0x5D}, 1},                                            // pop ebp
+    {0x002B5D12, {0xC2, 0x18, 0x00}, 3},                                // ret 0x18
+    {0x002B396F, {0x8B, 0xF8}, 2},                                      // mov edi, eax - stop boundary
 };
 
 void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
@@ -143,10 +145,10 @@ bool WriteConfig(const char* path) {
               "checked_memory = true\n\n"
               "[[function]]\n"
               "at = 0x002B3916\n"
-              "end = 0x002B396F\n\n"
+              "end = 0x002B3971\n\n"
               "[[function]]\n"
               "at = 0x002B5CA7\n"
-              "end = 0x002B5D12\n\n"
+              "end = 0x002B5D15\n\n"
               "[[function]]\n"
               "at = 0x002B5CEC\n"
               "end = 0x002B5CF4\n";
@@ -155,9 +157,6 @@ bool WriteConfig(const char* path) {
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\"\n";
     }
-    config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
-           << execution_probe::kLastInstruction << "\ncall = \"ProbeStop_0x" << std::hex << std::uppercase
-           << std::setw(8) << std::setfill('0') << execution_probe::kLastInstruction << "\"\nafter = true\n";
     std::ofstream file(path);
     file << config.str();
     return bool(file);
