@@ -140,7 +140,10 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0x5F, 0x5E, 0xC3                            // checked POP EDI, POP ESI; ret
     };
     if (code.size() != 0x1ED) return false;
-    code.insert(code.end(), 0x23, 0);
+    // 0x111ED: checked POP EBX, kept in the first padding bytes so every
+    // existing fixture address stays unchanged.
+    code.insert(code.end(), {0x5B, 0xC3});
+    code.insert(code.end(), 0x21, 0);
     code.insert(code.end(), {
         0xF6, 0xD0, 0xC3,                         // NOT AL; ret
         0xF7, 0xD0, 0xC3,                         // NOT EAX must trap
@@ -476,6 +479,9 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "[[function]]\n"
               "at = 0x111EA\n"
               "end = 0x111ED\n\n"
+              "[[function]]\n"
+              "at = 0x111ED\n"
+              "end = 0x111EF\n\n"
               "[[function]]\n"
               "at = 0x11210\n"
               "end = 0x11213\n\n"

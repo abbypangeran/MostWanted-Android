@@ -1615,6 +1615,52 @@ void CheckPostCallInstructionTests() {
               last_fault.address == 0x7C000 && last_fault.status == mem::AccessStatus::kUncommitted &&
               !last_fault.write && SameCoreState(ctx, before_pop_fault),
           "checked POP EDI read fault preserves EDI, ESI, ESP, and flags");
+
+    constexpr uint32_t pop_ebx_stack = 0xC1000;
+    const uint32_t saved_ebx = 0xA1B2C3D4;
+    Check(mem::Commit(pop_ebx_stack, mem::kPage) &&
+              mem::Write(pop_ebx_stack, &saved_ebx, sizeof(saved_ebx)) == mem::AccessStatus::kOk,
+          "POP EBX fixture stack word initializes");
+    ctx = X86Context{};
+    ctx.esp = pop_ebx_stack;
+    ctx.ebx = 0x12345678;
+    ctx.eax = 0x11223344;
+    ctx.ecx = 0x55667788;
+    ctx.edx = 0x99AABBCC;
+    ctx.esi = 0xAABBCCDD;
+    ctx.edi = 0xEEFF0011;
+    ctx.ebp = 0x22334455;
+    SeedFlags(ctx);
+    const SubFlags pop_ebx_flags{ctx.cf, ctx.pf, ctx.af, ctx.zf, ctx.sf, ctx.of};
+    Check(Runs(sub_000111ED, ctx) && ctx.ebx == saved_ebx && ctx.esp == pop_ebx_stack + 8 &&
+              ctx.eax == 0x11223344 && ctx.ecx == 0x55667788 && ctx.edx == 0x99AABBCC &&
+              ctx.esi == 0xAABBCCDD && ctx.edi == 0xEEFF0011 && ctx.ebp == 0x22334455 &&
+              MatchesFlags(ctx, pop_ebx_flags),
+          "checked POP EBX reads stack, advances ESP, and preserves other registers and flags");
+
+    constexpr uint32_t pop_ebx_guard = 0xC0000;
+    ctx = X86Context{};
+    ctx.esp = pop_ebx_guard;
+    ctx.ebx = 0xCAFEBABE;
+    SeedFlags(ctx);
+    const X86Context before_pop_ebx_fault = ctx;
+    Check(ThrowsMemoryFault(sub_000111ED, ctx) && last_fault.instruction == 0x111ED &&
+              last_fault.address == pop_ebx_guard && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_pop_ebx_fault),
+          "checked POP EBX uncommitted read fault preserves EBX, ESP, and flags");
+
+    constexpr uint32_t pop_ebx_cross = 0xC2000;
+    Check(mem::Commit(pop_ebx_cross, mem::kPage), "POP EBX cross-page fixture commits lower page");
+    ctx = X86Context{};
+    ctx.esp = pop_ebx_cross + mem::kPage - 2;
+    ctx.ebx = 0x13579BDF;
+    SeedFlags(ctx);
+    const X86Context before_pop_ebx_cross = ctx;
+    Check(ThrowsMemoryFault(sub_000111ED, ctx) && last_fault.instruction == 0x111ED &&
+              last_fault.address == pop_ebx_cross + mem::kPage &&
+              last_fault.status == mem::AccessStatus::kUncommitted && !last_fault.write &&
+              SameCoreState(ctx, before_pop_ebx_cross),
+          "POP EBX cross-page read validates the full dword before changing EBX or ESP");
 }
 
 void CheckNotRepAndFsTests() {

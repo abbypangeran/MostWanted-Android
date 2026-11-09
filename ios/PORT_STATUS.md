@@ -2521,3 +2521,53 @@ Integrated self-test 59 PASS in Debug and Release; integrated preflight PASS; ro
 ```
 
 **NO-GO for executing `002B5C7B` or beyond** until that run passes.
+
+## Phase 2C-39R checked POP EBX and reachable-trap audit
+
+### Root cause and recompiler fix
+
+The Phase 2C-39 run reached `002B59B1` after 69 authentic secondary instructions and was stopped by `x86_checked_trap(ctx, 0x2B59B1, "unimplemented: pop ebx")`. The checked recompiler's `checked_pop` whitelist in `sdk/tools/recomp/codegen.cpp` accepted only `ECX`, `EBP`, `EDI` and `ESI`; `EBX` fell through to `CodeGen::Unimpl`.
+
+`ZYDIS_REGISTER_EBX` is now in the whitelist. The existing `codegen_int.cpp` POP path emits the reviewed form:
+
+```cpp
+{ X86_SAVE_FLAGS(); uint32_t v = x86_mem_read<uint32_t>(0x2B59B1u, ctx.esp);
+  ctx.ebx = (uint32_t)(v); ctx.esp += 4; }
+```
+
+The read happens before the register and ESP updates; a fault leaves EBX, ESP and flags unchanged. `POP EAX`, `POP ESP`, memory forms and unsupported operand sizes remain rejected.
+
+### Fixture
+
+The synthetic fixture gains the two bytes `5B C3` (`pop ebx; ret`) at `0x111ED`, inside the former padding before `0x11210`, so every existing function address is unchanged. Its config lists `at = 0x111ED end = 0x111EF`. New tests cover the successful pop (EBX value, ESP, other registers and flags), an uncommitted read fault, a cross-page read fault and atomic context preservation. The existing POP EAX block and POP ECX/EBP/EDI/ESI tests remain. The fixture body ends in `RET`, so the success case expects `ESP + 8` overall: four from the pop and four from the return.
+
+### Reachable generated-code audit
+
+The integrated preflight now walks the reviewed control flow with the authentic branch outcomes and collects exactly the instructions expected to execute:
+
+- Root: 72, including the root `RET 0x002B3987` that returns through the host sentinel frame.
+- Secondary: 71, excluding the pre-instruction stop `002B5C7B`.
+- Forbidden arms are never entered; a walk that reaches one fails closed.
+
+For each collected PC the audit requires the generated body comment, the exact `ProbeStep_`/`SecondaryStep_` hook, no `"unimplemented:"` trap and no bare `x86_trap`, then checks the operation implied by the reviewed text: `x86_checked_call`, `x86_checked_indirect_call`, `x86_checked_ret`, `x86_rep_movs_checked`, `x86_rep_stos_checked`, `x86_mem_write` for `push`, `x86_mem_read` for `pop`, or a checked memory read/write for any other memory operand. Semantic traps such as the IDIV divide-error path are not treated as unsupported instructions. On success the preflight prints:
+
+```
+PREFLIGHT reachable generated instructions: 143/143 supported
+```
+
+Two negative scenarios inject a defect on the same path: `generated-audit-unsupported` inserts an `"unimplemented:"` trap for `002B59B1`, and `generated-audit-missing` removes its body comment. Both are rejected before any candidate thread is prepared.
+
+### Results
+
+Checked fixture tests pass in Debug and Release, including the five POP EBX checks and zero failures. The integrated self-test reports 61 PASS (59 previous plus the two generated-audit negatives). Integrated preflight reports `143/143 supported`, the 72/71 split and the excluded stop. Root and secondary standalone preflight/self-test pass in both configurations; `ctest` is 6/6 in both. No authentic XBE instruction ran in this phase.
+
+### Decision
+
+**GO for exactly one later supervised 143-instruction Release run**, conditional on explicit authorisation:
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_integrated_real_preflight \
+  --run-once --execute-real
+```
+
+**NO-GO for `002B5C7B` or beyond** until that run passes.

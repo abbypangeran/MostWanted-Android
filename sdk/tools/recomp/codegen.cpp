@@ -326,7 +326,8 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                               (in.raw.imm[0].size == 8 || in.raw.imm[0].size == 32)) || checked_push_memory);
         bool checked_pop = m == ZYDIS_MNEMONIC_POP && in.operand_count_visible == 1 && in.operand_width == 32 &&
                            in.stack_width == 32 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                           (ops[0].reg.value == ZYDIS_REGISTER_ECX || ops[0].reg.value == ZYDIS_REGISTER_EBP ||
+                           (ops[0].reg.value == ZYDIS_REGISTER_ECX || ops[0].reg.value == ZYDIS_REGISTER_EBX ||
+                            ops[0].reg.value == ZYDIS_REGISTER_EBP ||
                             ops[0].reg.value == ZYDIS_REGISTER_EDI || ops[0].reg.value == ZYDIS_REGISTER_ESI) &&
                            ops[0].size == 32;
         bool checked_cdq = m == ZYDIS_MNEMONIC_CDQ && in.operand_count_visible == 0 && in.operand_width == 32;

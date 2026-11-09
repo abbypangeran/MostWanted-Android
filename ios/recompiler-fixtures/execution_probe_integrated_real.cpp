@@ -110,6 +110,200 @@ SecondaryBranchCondition BranchConditionFor(uint32_t pc) {
     return SecondaryBranchCondition::kUnreviewed;
 }
 
+struct ReachableInstruction {
+    uint32_t pc;
+    const char* text;
+    bool secondary;
+    char operation;
+};
+
+char GeneratedOperation(const char* text) {
+    const std::string t(text);
+    if (t.rfind("call [", 0) == 0) return 'i';
+    if (t.rfind("call ", 0) == 0) return 'c';
+    if (t.rfind("ret", 0) == 0) return 'r';
+    if (t.rfind("rep movs", 0) == 0) return 's';
+    if (t.rfind("rep stos", 0) == 0) return 'z';
+    if (t.rfind("lea ", 0) == 0) return 0;
+    if (t.rfind("push", 0) == 0) return 'w';
+    if (t.rfind("pop", 0) == 0) return 'p';
+    if (t.find('[') != std::string::npos) return 'm';
+    return 0;
+}
+
+const execution_probe::RouteStep* FindRootStep(uint32_t pc) {
+    for (const execution_probe::RouteStep& step : execution_probe::kRoute)
+        if (step.pc == pc) return &step;
+    return nullptr;
+}
+
+bool RootBranchTaken(uint32_t pc, bool& taken) {
+    switch (pc) {
+        case 0x002B392A: taken = true; return true;
+        case 0x002B5CAF: taken = false; return true;
+        case 0x002B5CEA: taken = true; return true;
+        case 0x002B3973: taken = true; return true;
+        case 0x002B2765: taken = false; return true;
+        default: return false;
+    }
+}
+
+bool SecondaryBranchTaken(uint32_t pc, bool& taken) {
+    if (pc == sec::kTlsFillBranch || pc == kCriticalListBranch) {
+        taken = false;
+        return true;
+    }
+    return false;
+}
+
+bool CollectReachable(std::vector<ReachableInstruction>& out, std::string& error) {
+    uint32_t pc = execution_probe::kEntry;
+    size_t walked = 0;
+    while (true) {
+        const execution_probe::RouteStep* step = FindRootStep(pc);
+        if (!step) { error = "root route has no reviewed step for a reachable PC"; return false; }
+        if (step->kind == execution_probe::StepKind::kStop) {
+            // the root RET executes and returns through the host sentinel frame
+            const size_t index = size_t(step - execution_probe::kRoute);
+            out.push_back({pc, execution_probe::kExpectedRouteText[index], false,
+                           GeneratedOperation(execution_probe::kExpectedRouteText[index])});
+            break;
+        }
+        if (step->kind == execution_probe::StepKind::kForbidden) {
+            error = "reachable root walk entered a forbidden instruction";
+            return false;
+        }
+        const size_t index = size_t(step - execution_probe::kRoute);
+        out.push_back({pc, execution_probe::kExpectedRouteText[index], false,
+                       GeneratedOperation(execution_probe::kExpectedRouteText[index])});
+        if (step->kind == execution_probe::StepKind::kConditional) {
+            bool taken = false;
+            if (!RootBranchTaken(pc, taken)) { error = "root conditional outcome is not reviewed"; return false; }
+            pc = taken ? step->alternate : step->next;
+        } else {
+            pc = step->next;
+        }
+        if (++walked > 4 * execution_probe::kRouteCount) { error = "root route walk did not terminate"; return false; }
+    }
+    if (out.size() != kIntegratedRootInstructions) {
+        error = "reachable root instruction count is not the reviewed 72";
+        return false;
+    }
+    const size_t root_count = out.size();
+    pc = sec::kEntry;
+    walked = 0;
+    while (true) {
+        const sec::RouteStep* step = FindSecondaryStep(pc);
+        if (!step) { error = "secondary route has no reviewed step for a reachable PC"; return false; }
+        if (step->kind == sec::StepKind::kStop) break;  // pre-instruction stop, never executed
+        if (step->kind == sec::StepKind::kForbidden) {
+            error = "reachable secondary walk entered a forbidden instruction";
+            return false;
+        }
+        const size_t index = size_t(step - sec::kRoute);
+        out.push_back(
+            {pc, sec::kExpectedRouteText[index], true, GeneratedOperation(sec::kExpectedRouteText[index])});
+        if (step->kind == sec::StepKind::kConditional) {
+            bool taken = false;
+            if (!SecondaryBranchTaken(pc, taken)) {
+                error = "secondary conditional outcome is not reviewed";
+                return false;
+            }
+            pc = taken ? step->alternate : step->next;
+        } else {
+            pc = step->next;
+        }
+        if (++walked > 4 * sec::kRouteCount) {
+            error = "secondary route walk did not terminate";
+            return false;
+        }
+    }
+    if (out.size() - root_count != kIntegratedSecondaryInstructions) {
+        error = "reachable secondary instruction count is not the reviewed 71";
+        return false;
+    }
+    return true;
+}
+
+bool AuditReachableGenerated(const std::string& source, size_t& supported, std::string& error) {
+    struct ExactBodyCheck {
+        uint32_t pc;
+        const char* needle;
+        const char* name;
+    };
+    static constexpr ExactBodyCheck kExactBodyChecks[] = {
+        {0x002B59AF, "ctx.edi = (uint32_t)(v)", "POP EDI"},
+        {0x002B59B0, "ctx.esi = (uint32_t)(v)", "POP ESI"},
+        {0x002B59B1, "ctx.ebx = (uint32_t)(v)", "POP EBX"},
+        {0x002B59B2, "x86_checked_ret(ctx, 0x2B59B2u, 4)", "RET 0x04"},
+    };
+    std::vector<ReachableInstruction> reachable;
+    if (!CollectReachable(reachable, error)) return false;
+    auto has = [](const std::string& text, const char* needle) {
+        return text.find(needle) != std::string::npos;
+    };
+    for (const ReachableInstruction& insn : reachable) {
+        char marker[32], hook[64], detail[160];
+        std::snprintf(marker, sizeof(marker), "// %08X ", insn.pc);
+        std::snprintf(hook, sizeof(hook), "%sStep_0x%08X(ctx, base);", insn.secondary ? "Secondary" : "Probe",
+                      insn.pc);
+        const size_t at = source.find(marker);
+        if (at == std::string::npos) {
+            std::snprintf(detail, sizeof(detail), "reachable instruction %08X has no generated body", insn.pc);
+            error = detail;
+            return false;
+        }
+        if (!has(source, hook)) {
+            std::snprintf(detail, sizeof(detail), "reachable instruction %08X has no generated hook", insn.pc);
+            error = detail;
+            return false;
+        }
+        const char* next_hook = insn.secondary ? "\n\tSecondaryStep_" : "\n\tProbeStep_";
+        const size_t body_at = at + std::string(marker).size();
+        size_t end = source.find(next_hook, body_at);
+        const size_t function_end = source.find("\n\t} catch", body_at);
+        if (function_end < end) end = function_end;
+        const std::string body = source.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        // semantic traps (idiv #DE, decoded-code ends) are not unsupported-instruction fallbacks;
+        // CodeGen::Unimpl always emits an "unimplemented:" message
+        if (has(body, "unimplemented:") || has(body, "x86_trap(")) {
+            std::snprintf(detail, sizeof(detail), "reachable instruction %08X is emitted as an unsupported trap",
+                          insn.pc);
+            error = detail;
+            return false;
+        }
+        bool operation_ok = true;
+        switch (insn.operation) {
+            case 'c': operation_ok = has(body, "x86_checked_call"); break;
+            case 'i': operation_ok = has(body, "x86_checked_indirect_call"); break;
+            case 'r': operation_ok = has(body, "x86_checked_ret"); break;
+            case 's': operation_ok = has(body, "x86_rep_movs_checked"); break;
+            case 'z': operation_ok = has(body, "x86_rep_stos_checked"); break;
+            case 'w': operation_ok = has(body, "x86_mem_write"); break;
+            case 'p': operation_ok = has(body, "x86_mem_read"); break;
+            case 'm': operation_ok = has(body, "x86_mem_read") || has(body, "x86_mem_write"); break;
+            default: break;
+        }
+        if (!operation_ok) {
+            std::snprintf(detail, sizeof(detail), "reachable instruction %08X is missing its checked operation",
+                          insn.pc);
+            error = detail;
+            return false;
+        }
+        for (const ExactBodyCheck& check : kExactBodyChecks) {
+            if (insn.pc != check.pc) continue;
+            if (!has(body, check.needle)) {
+                std::snprintf(detail, sizeof(detail), "reachable instruction %08X is not the reviewed %s",
+                              insn.pc, check.name);
+                error = detail;
+                return false;
+            }
+        }
+    }
+    supported = reachable.size();
+    return true;
+}
+
 struct SecondaryInStep {
     SecondaryInStep() { g_secondary.in_step = true; }
     ~SecondaryInStep() { g_secondary.in_step = false; }
@@ -1483,6 +1677,14 @@ int RunIntegratedPreflight(const std::string& scenario) {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (!ok) return finish(error.c_str(), false);
         if (!ValidateSecondaryRouteText(image, error)) return finish(error.c_str(), false);
+        std::string generated;
+        size_t supported = 0;
+        if (!ReadGenerated("x86_recomp.0.cpp", generated, error) ||
+            !AuditReachableGenerated(generated, supported, error))
+            return finish(error.c_str(), false);
+        std::printf("PREFLIGHT reachable generated instructions: %zu/%zu supported\n", supported, supported);
+        std::printf("PREFLIGHT reachable coverage: root=%u secondary=%u stop=%08X forbidden_arms=excluded\n",
+                    kIntegratedRootInstructions, kIntegratedSecondaryInstructions, sec::kStopBefore);
         kernel::ThreadRef candidate;
         if (!PrepareCandidateThread(facts, candidate, error)) return finish(error.c_str(), false);
         X86Context context{};
@@ -1688,6 +1890,24 @@ int RunIntegratedPreflight(const std::string& scenario) {
                     "thread=released workers=0\n",
                     failing_pc, failure.c_str());
         return 0;
+    }
+    if (scenario == "generated-audit-unsupported" || scenario == "generated-audit-missing") {
+        std::string source;
+        if (!ReadGenerated("x86_recomp.0.cpp", source, error)) return finish(error.c_str(), false);
+        const std::string marker = "// 002B59B1 pop ebx";
+        const size_t at = source.find(marker);
+        if (at == std::string::npos) return finish("reviewed POP EBX body was not found", false);
+        if (scenario == "generated-audit-unsupported") {
+            source.insert(at + marker.size(),
+                          "\n\tx86_checked_trap(ctx, 0x2B59B1, \"unimplemented: injected\");");
+        } else {
+            source.erase(at, marker.size());
+        }
+        size_t supported = 0;
+        if (AuditReachableGenerated(source, supported, error))
+            return finish("injected generated-code defect was accepted", false);
+        std::printf("RESULT ok %s %s\n", scenario.c_str(), error.c_str());
+        return finish(nullptr, false);
     }
     if (scenario == "identity-missing") {
         if (ValidateRealIdentity("/tmp/mostwanted-integrated-does-not-exist.xbe", image, error))
@@ -2582,6 +2802,8 @@ int main(int argc, char** argv) {
         {"branch-flag-mismatch", 0, "secondary branch outcome mismatch"},
         {"branch-jz-flag-mismatch", 0, "secondary branch outcome mismatch"},
         {"branch-failure-cleanup", 0, "RESULT ok branch-failure-cleanup"},
+        {"generated-audit-unsupported", 0, "RESULT ok generated-audit-unsupported"},
+        {"generated-audit-missing", 0, "RESULT ok generated-audit-missing"},
         {"forbidden-entry", 0, ""},
         {"cancel-twice", 0, ""},
         {"close-twice", 0, ""},
