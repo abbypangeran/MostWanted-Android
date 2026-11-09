@@ -480,7 +480,7 @@ void Analysis::GapFill() {
 
 void Analysis::Run() {
     std::deque<uint32_t> q;
-    q.push_back(img.entry);
+    if (cfg.entry_seed) q.push_back(img.entry);
     for (auto& f : cfg.functions) q.push_back(f.first);
     auto drain = [&] {
         while (!q.empty()) {

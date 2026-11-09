@@ -160,6 +160,63 @@ target_compile_definitions(execution_probe_real_preflight PRIVATE
 target_link_libraries(execution_probe_real_preflight PRIVATE Threads::Threads Zydis)
 set_target_properties(execution_probe_real_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
+# Phase 2C-33: a separate real-image mapping for the secondary-thread SEH/TLS
+# route.  It is deliberately independent of the root probe's generated mapping.
+add_executable(execution_probe_secondary_real_config execution_probe_secondary_real_config.cpp)
+set_property(TARGET execution_probe_secondary_real_config PROPERTY CXX_STANDARD 20)
+target_include_directories(execution_probe_secondary_real_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set(SECONDARY_REAL_PROBE_DIR ${CMAKE_CURRENT_BINARY_DIR}/probe_secondary_real)
+set(SECONDARY_REAL_PROBE_CONFIG ${SECONDARY_REAL_PROBE_DIR}/execution_probe_secondary_real.toml)
+set(SECONDARY_REAL_PROBE_GENERATED_DIR ${SECONDARY_REAL_PROBE_DIR}/generated)
+set(SECONDARY_REAL_PROBE_GENERATED_SOURCE ${SECONDARY_REAL_PROBE_GENERATED_DIR}/x86_recomp.0.cpp)
+set(SECONDARY_REAL_PROBE_GENERATED_MAPPING ${SECONDARY_REAL_PROBE_GENERATED_DIR}/x86_func_mapping.cpp)
+add_custom_command(
+    OUTPUT ${SECONDARY_REAL_PROBE_CONFIG}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SECONDARY_REAL_PROBE_DIR}
+    COMMAND execution_probe_secondary_real_config ${SECONDARY_REAL_PROBE_CONFIG} ${EXECUTION_PROBE_REAL_XBE}
+    DEPENDS execution_probe_secondary_real_config
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${SECONDARY_REAL_PROBE_GENERATED_SOURCE} ${SECONDARY_REAL_PROBE_GENERATED_DIR}/x86_recomp_shared.h ${SECONDARY_REAL_PROBE_GENERATED_MAPPING}
+    COMMAND $<TARGET_FILE:xbe_recomp> ${SECONDARY_REAL_PROBE_CONFIG} ${EXECUTION_PROBE_REAL_XBE} ${SECONDARY_REAL_PROBE_GENERATED_DIR}
+    DEPENDS xbe_recomp ${SECONDARY_REAL_PROBE_CONFIG}
+    VERBATIM
+)
+add_custom_target(generate_execution_probe_secondary_real DEPENDS ${SECONDARY_REAL_PROBE_GENERATED_SOURCE})
+set_target_properties(generate_execution_probe_secondary_real PROPERTIES EXCLUDE_FROM_ALL TRUE)
+add_executable(execution_probe_secondary_real_preflight
+    execution_probe_secondary_real.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
+    ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/crypto.cpp
+    ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/memory_protection.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
+    ${XBE_SDK}/runtime/xbe/image_loader.cpp
+    ${SECONDARY_REAL_PROBE_GENERATED_SOURCE}
+    ${SECONDARY_REAL_PROBE_GENERATED_MAPPING}
+)
+add_dependencies(execution_probe_secondary_real_preflight generate_execution_probe_secondary_real)
+target_compile_features(execution_probe_secondary_real_preflight PRIVATE cxx_std_20)
+target_include_directories(execution_probe_secondary_real_preflight PRIVATE ${XBE_SDK}/runtime ${SECONDARY_REAL_PROBE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(execution_probe_secondary_real_preflight PRIVATE
+    MOSTWANTED_EXECUTION_PROBE_TESTS=1
+    MOSTWANTED_CHECKED_KERNEL_ABI_TESTS=1
+    MOSTWANTED_THREAD_PREPARATION_TESTS=1
+    MOSTWANTED_GUEST_CALLBACK_TESTS=1
+    EXECUTION_PROBE_SECONDARY_REAL_XBE="${EXECUTION_PROBE_REAL_XBE}"
+    EXECUTION_PROBE_SECONDARY_REAL_GENERATED_DIR="${SECONDARY_REAL_PROBE_GENERATED_DIR}"
+    EXECUTION_PROBE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+)
+target_link_libraries(execution_probe_secondary_real_preflight PRIVATE Threads::Threads Zydis)
+set_target_properties(execution_probe_secondary_real_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
 # Phase 2C-31: a separate synthetic fixture for the authentic secondary-thread
 # entry contract.  It deliberately does not share the root route's generated
 # mapping, so the Phase 2C-30 route stays byte-for-byte unchanged.

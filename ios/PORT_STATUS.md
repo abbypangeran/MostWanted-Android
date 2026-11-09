@@ -2119,3 +2119,70 @@ Proposed first command, not run and not implemented:
 **NO-GO for one authentic secondary-thread run now.** The synthetic SEH/TLS segment is complete, but the real secondary-entry mode and its preflight do not exist yet. **GO for the scoped Phase 2C-33 implementation** of the standalone real secondary-entry mode (fresh thread, 54-PC route, stop `002B5C76`), followed by the integrated root-retained-thread mode. Execution still requires separate approval.
 
 The shortest path to controlled single-worker activation is: validate `002B597D` and the system routine's remaining body; turn the dynamic start call into a checked `kThreadStart` callback; then activate one `StartThread` worker with the prepared FS/KPCR/ETHREAD/TLS context and a complete join/cancel path.
+
+## Phase 2C-33 real secondary-thread SEH/TLS integration
+
+This phase adds a **separate** real-image executable, `execution_probe_secondary_real_preflight`, and a dedicated checked mapping. The root probe, its 78-entry route, generated mapping and 72-instruction contract are unchanged.
+
+### Probe and commands
+
+| Item | Value |
+| --- | --- |
+| Binary | `.local/ios-port/phase2c16-fixtures/Release/execution_probe_secondary_real_preflight` |
+| Preflight | `execution_probe_secondary_real_preflight --preflight` |
+| Self-test | `execution_probe_secondary_real_preflight --self-test` |
+| Proposed run (not executed) | `execution_probe_secondary_real_preflight --run-once --execute-real` |
+| Generated mapping | `.local/ios-port/phase2c16-fixtures/probe_secondary_real/generated` |
+
+The real config declares the reviewed five functions (`002B5C0F`, `00319804`, `002B38A2`, `002B58B8`, `002B597D`) and one hook per route PC plus the three trap PCs. Because the XBE entry is `002B3916`, the analysis normally walks the root call graph and generated 82 unrelated functions. A new default-preserving recompiler option, `[xbe] entry_seeds = false`, stops that seed for this mapping only; every existing config keeps the previous default (`true`). The probe then initializes dispatch with `entry_point = 002B5C0F` instead of the image entry, so the five-function table is accepted without mapping the frozen root route.
+
+### Static preflight evidence
+
+Observed on the Phase 2C-33 image:
+
+```
+PREFLIGHT identity: base=00010000 image=4F8040 header=1000 sections=15
+PREFLIGHT route: 54/54 matched, bytes=167 hash=EF9505E0CE8AE719 stop=002B5C76
+PREFLIGHT mapping: functions=5 continuations=0 hooks=57 checked_calls=3 checked_rets=1
+PREFLIGHT targets: system=002B5C0F seh=00319804 ret=002B5C1B handler=00319858 start=002B38A2 next=002B597D
+PREFLIGHT stack: base=D0020000 top=D0030000 initial_esp=D002FF50 entry_esp=D002FF44 stop_esp=D002FF08 stop_ebp=D002FF40
+PREFLIGHT context: kpcr=B0000000 ethread=B0000400 tls=D002FF6C fs0=FFFFFFFF registration=D002FF30
+PREFLIGHT callback: system=002B5C0F start=002B38A2 context=00000000 handle=00001000 id=00000010
+PREFLIGHT tls: source=00000000 end=00000000 copy=0 zero=144 tls_bytes=148
+PREFLIGHT pages: output=60000000+1000:RW text=RX rdata=R data=R header=R import=R
+PREFLIGHT PASS
+```
+
+Identity is SHA-1 `f636a16af04171089f879a4bed646e185c734233`, title `4541007B`, entry `002B3916`, base `00010000`. Every route instruction is decoded from the real file and compared by text, length, control-flow target and the 167-byte FNV hash. The generated mapping is also checked textually: exactly five functions, zero continuations, one hook per route/trap PC, exactly three checked calls, one checked RET, two checked REP forms and no `x86_icall`, `x86_kernel` or `ProbeStep_` path.
+
+### Route and stop contract
+
+The route is the Phase 2C-32 54-PC sequence: system entry `002B5C0F`, SEH helper call `002B5C16` to `00319804`, helper `ret` to `002B5C1B`, TLS pointer publication, zero copy, `0x90` zero-fill, and stop before `002B5C76` (`call 002B597D`). The zero-fill branch at `002B5C5F` is authentic not-taken; the fallthrough executes 53 instructions and ends at `002B5C74`. The trap-only targets are `002B38A2`, `002B58B8` and `002B597D`; `00319858` is only a stored handler address and resolves as non-executable. There are zero kernel calls, zero import reads and zero callbacks in the secondary segment.
+
+### Allocation-derived thread context
+
+The probe does not reuse the synthetic fixture's addresses. `PrepareSystemThreadEx` allocates a fresh `0x10000`-byte committed stack; `InitializePreparedThreadContextForTest` derives `ESP = (TLS & ~15) - 16` and `FS base = KPCR`. Preflight then reads back the allocated stack bounds, KPCR, ETHREAD, TLS, handle and id, and verifies `fs:[0] = FFFFFFFF`, the KPCR stack/ETHREAD fields, the ETHREAD stack/TLS/id fields, `FCW=0x27F`, `MXCSR=0x1F80`, the callback ticket argument pair `(002B38A2, 0)` and the authentic TLS globals. The expected stop ESP/EBP/registration are computed from the actual callback-entry ESP, not hardcoded.
+
+### Tests
+
+- Real secondary probe, Debug and Release: preflight PASS; 22 scenario children plus the unsupervised-child refusal and supervised-token check all PASS.
+- Synthetic secondary route, Debug and Release: 27 scenarios PASS, including SEH registration, TLS copy/zero-fill, trap entries, timeout, cancellation and zero-resource teardown.
+- Synthetic root probe, Debug and Release: PASS, including the 72-instruction root-return contract.
+- Root real preflight and self-test, Debug and Release: PASS; both import slots restored and zero resources retained.
+- `ctest`, Debug and Release: 6/6 PASS.
+
+No real guest instruction ran in Phase 2C-33.
+
+### Remaining blockers
+
+- `002B597D` and the rest of the system routine are unreviewed; the start routine `002B38A2` is trap-only.
+- The SEH epilog, exception delivery and handler `00319858` are not executed.
+- The execute path has not been run on the real image; preflight validates all of its inputs, but its runtime postconditions remain unobserved.
+- The standalone secondary probe synthesizes the callback thread; it does not yet consume the thread produced by the real root sequence.
+- `StartThread`, worker activation, guest callbacks and production `Boot()` remain disabled.
+
+### Decision
+
+**GO for exactly one later supervised Release run** of the standalone secondary probe, with the command above, provided the evidence is reviewed first and the run is explicitly authorised. **NO-GO for the integrated root-to-secondary experiment** until the standalone run produces the expected 53-instruction trace, SEH/TLS state, cancellation and zero-resource teardown.
+
+The integrated design remains: one supervised process executes the frozen 72-instruction root sequence, keeps the prepared `ThreadRef` alive instead of cancelling it, restores both import slots, then enters `002B5C0F` on that same thread under the secondary mapping. The secondary segment must complete its postconditions before the thread is cancelled; no second thread, worker, callback, handler or start routine may run.

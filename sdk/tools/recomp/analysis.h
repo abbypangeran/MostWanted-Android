@@ -40,6 +40,7 @@ struct Config {
     bool gap_fill = true;
     bool pointer_seeds = true;
     bool callback_seeds = true;  // immediate push/mov targets that look like entries become functions
+    bool entry_seed = true;      // the image entry is decoded as a function
     bool checked_memory = false;
     std::multimap<uint32_t, Hook> hooks;
     std::map<uint32_t, uint32_t> function_ends;          // declared entries, exclusive decode limit or 0

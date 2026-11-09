@@ -87,6 +87,7 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
     if (auto v = t["xbe"]["gap_fill"].value<bool>()) cfg.gap_fill = *v;
     if (auto v = t["xbe"]["pointer_seeds"].value<bool>()) cfg.pointer_seeds = *v;
     if (auto v = t["xbe"]["callback_seeds"].value<bool>()) cfg.callback_seeds = *v;
+    if (auto v = t["xbe"]["entry_seeds"].value<bool>()) cfg.entry_seed = *v;
     if (auto v = t["xbe"]["checked_memory"].value<bool>()) cfg.checked_memory = *v;
     if (auto a = t["xbe"]["code_sections"].as_array())
         for (auto& i : *a)
