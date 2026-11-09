@@ -2421,3 +2421,55 @@ Replacing the synchronous test-only secondary execution with a real worker requi
 3. **Termination and join.** The current path cancels a prepared thread. Worker execution needs `PsTerminateSystemThread`/exit semantics, worker stop and join, cancellation while active, SEH/TLS teardown and a parent-side timeout. The existing image preparation, checked ABI, memory observer, route hooks and callback tickets are reusable; the synchronous callback and prepared-thread cancellation are not.
 
 First three blockers: start routine mapping/callback contract; real worker context/scheduling; active-thread termination and join.
+
+## Phase 2C-37R critical-section owner initialisation
+
+### Root cause
+
+`RunSecondarySegment()` called `PrepareCriticalSectionBridge(facts)` before `InitializeSecondaryContext(thread, context, facts)`. The bridge copied `facts.ethread` into the expected owner, but `facts` was still default-constructed at that point, so the owner was `0`. The enter service therefore wrote `OwningThread=0` instead of the retained thread's ETHREAD, and the leave service accepted that invalid state.
+
+### Fix
+
+1. `RunSecondarySegment()` now initialises and validates the retained context first, then configures the bridge. `facts.ethread`, `facts.kpcr` and `facts.tls` are the validated thread fields before the bridge exists.
+2. `PrepareCriticalSectionBridge()` fails closed unless `facts.ethread` is nonzero, `facts.kpcr` is nonzero and `R32(kpcr + 0x28) == facts.ethread`. It also resets the expected/actual owner, held and released records, counters and fail mode.
+3. Enter requires expected and actual owners to be nonzero and equal, writes `OwningThread = actual ETHREAD`, then re-reads `LockCount/RecursionCount/OwningThread` and records `0 / 1 / ETHREAD`. A readback mismatch returns `kAccessViolation`; the leave service rejects a missing held record.
+4. Leave requires the recorded held state and the exact actual owner. After restoring `FFFFFFFF / 0 / 0` it re-reads and records the released state, and `VerifyCriticalSectionFinal()` requires the owner to equal the retained thread's ETHREAD and `R32(kpcr + 0x28)`.
+5. Preflight prints `PREFLIGHT critical owner` with the retained ETHREAD and the KPCR field, and fails if they differ.
+
+### Observed owner
+
+Fresh prepared thread in Debug and Release preflight (allocation-derived, not hardcoded):
+
+| Item | Value |
+|---|---|
+| KPCR | `B0000000` |
+| ETHREAD | `B0000400` |
+| TLS | `D004FF6C` |
+| Callback entry ESP | `D004FF44` |
+| Held state | `LockCount=00000000`, `Recursion=1`, `Owner=B0000400` |
+| Released state | `LockCount=FFFFFFFF`, `Recursion=0`, `Owner=00000000` |
+
+The low-level service tests still use the `0xDEADBEEF` mock, but now set both the expected and actual owner globals and reset the held record between cycles; they remain low-level checks only.
+
+### Tests
+
+New child scenarios, Debug and Release:
+
+- `owner-prepared-thread`: real prepared context, bridge accepted, enter/leave driven through the helper ABI, held and released state recorded.
+- `owner-zero-rejected`, `owner-other-thread-rejected`, `owner-bad-kpcr`: rejected with `zero or does not match the retained KPCR`; the KPCR field is restored before cancellation.
+- `owner-bridge-failure-cleanup`: bridge prepared with the retained ETHREAD, injected secondary failure, all four import slots restored, retained thread released and zero resources.
+- `owner-context-failure-cleanup`: critical imports patched, context rejected before the bridge exists, `g_critical_actual_ethread == 0`, then cleanup restores all four slots and releases the thread.
+- `secondary-context-failure` now asserts the bridge was never prepared; `secondary-execution-failure` asserts the bridge owner equals the retained ETHREAD.
+
+Results: integrated self-test 51 PASS in Debug and Release; integrated preflight PASS; root and secondary standalone preflight/self-test PASS; `ctest` 6/6 in both configurations. The 143-instruction route, mapping, four ordinals, mandatory stop `002B5C7B` and production guards are unchanged. No authentic XBE instruction ran.
+
+### Decision
+
+**GO for exactly one later supervised 143-instruction Release run**, conditional on review and explicit authorisation:
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_integrated_real_preflight \
+  --run-once --execute-real
+```
+
+**NO-GO for extending beyond the reviewed `002B5C7B` boundary** until that run passes.

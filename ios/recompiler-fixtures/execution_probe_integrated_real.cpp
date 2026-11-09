@@ -132,6 +132,14 @@ void RecordSecondaryStep(uint32_t pc, X86Context& ctx, const sec::RouteStep& ste
 enum class CriticalFailMode : uint8_t { kNone, kEnterFail, kLeaveFail, kBadCleanup, kBadReturn, kWrongOwner };
 
 uint32_t g_critical_owner_ethread = 0;
+uint32_t g_critical_actual_ethread = 0;
+uint32_t g_critical_held_lock = 0;
+uint32_t g_critical_held_recursion = 0;
+uint32_t g_critical_held_owner = 0;
+uint32_t g_critical_after_lock = 0;
+uint32_t g_critical_after_recursion = 0;
+uint32_t g_critical_after_owner = 0;
+bool g_critical_held_seen = false;
 uint32_t g_critical_enter_calls = 0;
 uint32_t g_critical_leave_calls = 0;
 uint32_t g_critical_enter_esp = 0;
@@ -199,6 +207,8 @@ void ProbeCriticalEnter(X86Context& ctx, uint8_t*) {
         mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion)) == mem::AccessStatus::kOk &&
         mem::Read(sec::kCriticalOwner, &owner, sizeof(owner)) == mem::AccessStatus::kOk;
     if (!state_ok || lock != 0xFFFFFFFF || recursion != 0 || owner != 0 ||
+        g_critical_owner_ethread == 0 || g_critical_actual_ethread == 0 ||
+        g_critical_owner_ethread != g_critical_actual_ethread ||
         g_critical_fail_mode == CriticalFailMode::kEnterFail) {
         kernel::Return(ctx, kernel::kInvalidParameter, 1);
         return;
@@ -208,12 +218,27 @@ void ProbeCriticalEnter(X86Context& ctx, uint8_t*) {
         ctx.esp += 4;
         return;
     }
+    g_critical_held_seen = false;
     lock = 0;
     recursion = 1;
-    owner = g_critical_owner_ethread;
+    owner = g_critical_actual_ethread;
     if (mem::Write(sec::kCriticalLockCount, &lock, sizeof(lock)) != mem::AccessStatus::kOk ||
         mem::Write(sec::kCriticalRecursion, &recursion, sizeof(recursion)) != mem::AccessStatus::kOk ||
         mem::Write(sec::kCriticalOwner, &owner, sizeof(owner)) != mem::AccessStatus::kOk) {
+        kernel::Return(ctx, kernel::kAccessViolation, 1);
+        return;
+    }
+    uint32_t held_lock = 1, held_recursion = 0, held_owner = 1;
+    const bool held_ok =
+        mem::Read(sec::kCriticalLockCount, &held_lock, sizeof(held_lock)) == mem::AccessStatus::kOk &&
+        mem::Read(sec::kCriticalRecursion, &held_recursion, sizeof(held_recursion)) == mem::AccessStatus::kOk &&
+        mem::Read(sec::kCriticalOwner, &held_owner, sizeof(held_owner)) == mem::AccessStatus::kOk;
+    g_critical_held_lock = held_lock;
+    g_critical_held_recursion = held_recursion;
+    g_critical_held_owner = held_owner;
+    g_critical_held_seen = held_ok && held_lock == 0 && held_recursion == 1 &&
+                           held_owner == g_critical_actual_ethread;
+    if (!g_critical_held_seen) {
         kernel::Return(ctx, kernel::kAccessViolation, 1);
         return;
     }
@@ -239,8 +264,11 @@ void ProbeCriticalLeave(X86Context& ctx, uint8_t*) {
         mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock)) == mem::AccessStatus::kOk &&
         mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion)) == mem::AccessStatus::kOk &&
         mem::Read(sec::kCriticalOwner, &owner, sizeof(owner)) == mem::AccessStatus::kOk;
-    if (!state_ok || g_critical_enter_calls != 1 || lock != 0 || recursion != 1 ||
-        owner != g_critical_owner_ethread || g_critical_fail_mode == CriticalFailMode::kLeaveFail ||
+    if (!state_ok || g_critical_actual_ethread == 0 || g_critical_enter_calls != 1 || lock != 0 ||
+        recursion != 1 || owner != g_critical_actual_ethread || !g_critical_held_seen ||
+        g_critical_held_lock != 0 || g_critical_held_recursion != 1 ||
+        g_critical_held_owner != g_critical_actual_ethread ||
+        g_critical_fail_mode == CriticalFailMode::kLeaveFail ||
         g_critical_fail_mode == CriticalFailMode::kWrongOwner) {
         kernel::Return(ctx, kernel::kInvalidParameter, 1);
         return;
@@ -256,6 +284,18 @@ void ProbeCriticalLeave(X86Context& ctx, uint8_t*) {
     if (mem::Write(sec::kCriticalLockCount, &lock, sizeof(lock)) != mem::AccessStatus::kOk ||
         mem::Write(sec::kCriticalRecursion, &recursion, sizeof(recursion)) != mem::AccessStatus::kOk ||
         mem::Write(sec::kCriticalOwner, &owner, sizeof(owner)) != mem::AccessStatus::kOk) {
+        kernel::Return(ctx, kernel::kAccessViolation, 1);
+        return;
+    }
+    uint32_t after_lock = 1, after_recursion = 1, after_owner = 1;
+    const bool after_ok =
+        mem::Read(sec::kCriticalLockCount, &after_lock, sizeof(after_lock)) == mem::AccessStatus::kOk &&
+        mem::Read(sec::kCriticalRecursion, &after_recursion, sizeof(after_recursion)) == mem::AccessStatus::kOk &&
+        mem::Read(sec::kCriticalOwner, &after_owner, sizeof(after_owner)) == mem::AccessStatus::kOk;
+    g_critical_after_lock = after_lock;
+    g_critical_after_recursion = after_recursion;
+    g_critical_after_owner = after_owner;
+    if (!after_ok || after_lock != 0xFFFFFFFF || after_recursion != 0 || after_owner != 0) {
         kernel::Return(ctx, kernel::kAccessViolation, 1);
         return;
     }
@@ -1011,9 +1051,9 @@ void PrintSecondaryFailure(const ProbeFailure& failure) {
 }
 
 bool RunSecondarySegment(const kernel::ThreadRef& thread, SecondaryFacts& facts, std::string& error) {
-    if (!PrepareCriticalSectionBridge(facts, error)) return false;
     X86Context context{};
     if (!InitializeSecondaryContext(thread, context, facts, error)) return false;
+    if (!PrepareCriticalSectionBridge(facts, error)) return false;
     ConfigureSecondaryMemoryPolicy(facts);
     const std::vector<SnapshotPage> snapshot = Snapshot();
     kernel::GuestCallbackTicket ticket;
@@ -1182,13 +1222,27 @@ bool RestoreCriticalSectionImports() {
 }
 
 bool PrepareCriticalSectionBridge(const SecondaryFacts& facts, std::string& error) {
+    if (!facts.ethread || !facts.kpcr || kernel::R32(facts.kpcr + 0x28) != facts.ethread) {
+        error = "critical-section owner ETHREAD is zero or does not match the retained KPCR";
+        return false;
+    }
     kernel::RegisterExport(sec::kCriticalEnterOrdinal, "RtlEnterCriticalSection", ProbeCriticalEnter);
     kernel::RegisterExport(sec::kCriticalLeaveOrdinal, "RtlLeaveCriticalSection", ProbeCriticalLeave);
     if (!dispatch::SetKernel277FixtureBridge(true) || !dispatch::SetKernel294FixtureBridge(true)) {
+        dispatch::SetKernel277FixtureBridge(false);
+        dispatch::SetKernel294FixtureBridge(false);
         error = "critical-section test bridges were not authorized";
         return false;
     }
     g_critical_owner_ethread = facts.ethread;
+    g_critical_actual_ethread = facts.ethread;
+    g_critical_held_lock = 0;
+    g_critical_held_recursion = 0;
+    g_critical_held_owner = 0;
+    g_critical_after_lock = 0;
+    g_critical_after_recursion = 0;
+    g_critical_after_owner = 0;
+    g_critical_held_seen = false;
     g_critical_enter_calls = 0;
     g_critical_leave_calls = 0;
     g_critical_enter_esp = 0;
@@ -1254,6 +1308,18 @@ bool VerifyCriticalSectionFinal(const SecondaryFacts& facts, std::string& error)
     }
     if (g_critical_enter_calls != 1 || g_critical_leave_calls != 1) {
         error = "critical-section enter/leave counts are not one each";
+        return false;
+    }
+    if (g_critical_actual_ethread == 0 || g_critical_actual_ethread != facts.ethread ||
+        g_critical_owner_ethread != g_critical_actual_ethread ||
+        kernel::R32(facts.kpcr + 0x28) != g_critical_actual_ethread) {
+        error = "critical-section owner does not match the retained thread ETHREAD";
+        return false;
+    }
+    if (!g_critical_held_seen || g_critical_held_lock != 0 || g_critical_held_recursion != 1 ||
+        g_critical_held_owner != g_critical_actual_ethread || g_critical_after_lock != 0xFFFFFFFF ||
+        g_critical_after_recursion != 0 || g_critical_after_owner != 0) {
+        error = "critical-section held/released owner state is not the reviewed transition";
         return false;
     }
     if (g_critical_enter_esp != facts.entry_esp - 0x54 || g_critical_enter_return != sec::kCriticalEnterReturn ||
@@ -1332,6 +1398,8 @@ void PrintIntegratedFacts(const RealFacts& root_facts, const SecondaryFacts& sec
                 secondary.stop_esp, secondary.stop_ebp);
     std::printf("PREFLIGHT secondary context: kpcr=%08X ethread=%08X tls=%08X fs0=%08X registration=%08X\n",
                 secondary.kpcr, secondary.ethread, secondary.tls, secondary.fs0, secondary.registration);
+    std::printf("PREFLIGHT critical owner: ethread=%08X kpcr_ethread=%08X held=0/1/ethread released=FFFFFFFF/0/0\n",
+                secondary.ethread, kernel::R32(secondary.kpcr + 0x28));
     std::printf("PREFLIGHT secondary tls: source=%08X end=%08X copy=%u zero=%u\n", secondary.tls_source,
                 secondary.tls_end, secondary.tls_copy, secondary.tls_zero);
     std::printf("PREFLIGHT critical: object=%08X list=%08X lock=%08X recursion=%u owner=%08X "
@@ -1387,6 +1455,12 @@ int RunIntegratedPreflight(const std::string& scenario) {
             kernel::CancelPreparedThread(candidate);
             return finish(error.c_str(), false);
         }
+        if (!secondary.ethread || candidate->ethread != secondary.ethread || !secondary.kpcr ||
+            kernel::R32(secondary.kpcr + 0x28) != secondary.ethread) {
+            candidate->ctx = nullptr;
+            kernel::CancelPreparedThread(candidate);
+            return finish("critical-section owner ETHREAD does not match the retained KPCR", false);
+        }
         if (!PatchCriticalSectionImports(error)) {
             candidate->ctx = nullptr;
             kernel::CancelPreparedThread(candidate);
@@ -1401,6 +1475,92 @@ int RunIntegratedPreflight(const std::string& scenario) {
         candidate->ctx = nullptr;
         if (!CancelCandidateAtOutputs(candidate, facts.import_args[0], facts.import_args[4], error))
             return finish(error.c_str(), false);
+        return finish(nullptr, false);
+    }
+    if (scenario == "owner-prepared-thread" || scenario == "owner-zero-rejected" ||
+        scenario == "owner-other-thread-rejected" || scenario == "owner-bad-kpcr") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        kernel::ThreadRef candidate;
+        if (!PrepareCandidateThread(facts, candidate, error)) return finish(error.c_str(), false);
+        X86Context context{};
+        SecondaryFacts secondary;
+        if (!InitializeSecondaryContext(candidate, context, secondary, error)) {
+            candidate->ctx = nullptr;
+            kernel::CancelPreparedThread(candidate);
+            return finish(error.c_str(), false);
+        }
+        const uint32_t ethread = candidate->ethread;
+        bool valid = ethread != 0 && secondary.ethread == ethread && secondary.kpcr != 0 &&
+                     kernel::R32(secondary.kpcr + 0x28) == ethread;
+        std::string reason;
+        if (scenario == "owner-prepared-thread") {
+            const uint32_t page = 0x60010000;
+            const uint32_t return_address = 0x11111111, arg = sec::kCriticalSection;
+            bool drove = mem::Commit(page, mem::kPage);
+            if (!drove) reason = "could not commit the critical-section owner test page";
+            if (drove) {
+                mem::Write(page, &return_address, sizeof(return_address));
+                mem::Write(page + 4, &arg, sizeof(arg));
+                mem::Write(page + 0x10, &return_address, sizeof(return_address));
+                mem::Write(page + 0x14, &arg, sizeof(arg));
+                drove = PrepareCriticalSectionBridge(secondary, reason);
+                if (drove) {
+                    uint32_t lock = 1, recursion = 0, owner = 1;
+                    X86Context ctx{};
+                    ctx.esp = page;
+                    ProbeCriticalEnter(ctx, nullptr);
+                    mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock));
+                    mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion));
+                    mem::Read(sec::kCriticalOwner, &owner, sizeof(owner));
+                    drove = ctx.eax == kernel::kSuccess && ctx.esp == page + 8 && lock == 0 && recursion == 1 &&
+                            owner == ethread && g_critical_held_seen && g_critical_held_lock == 0 &&
+                            g_critical_held_recursion == 1 && g_critical_held_owner == ethread;
+                    ctx.esp = page + 0x10;
+                    ProbeCriticalLeave(ctx, nullptr);
+                    mem::Read(sec::kCriticalLockCount, &lock, sizeof(lock));
+                    mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion));
+                    mem::Read(sec::kCriticalOwner, &owner, sizeof(owner));
+                    drove = drove && ctx.eax == kernel::kSuccess && ctx.esp == page + 0x18 &&
+                            lock == 0xFFFFFFFF && recursion == 0 && owner == 0 &&
+                            g_critical_after_lock == 0xFFFFFFFF && g_critical_after_recursion == 0 &&
+                            g_critical_after_owner == 0;
+                }
+                ReleaseCriticalSectionBridge();
+                mem::Decommit(page, mem::kPage);
+            }
+            valid = valid && drove;
+        } else if (scenario == "owner-zero-rejected") {
+            SecondaryFacts zero = secondary;
+            zero.ethread = 0;
+            valid = !PrepareCriticalSectionBridge(zero, error) &&
+                    error.find("zero or does not match") != std::string::npos;
+        } else if (scenario == "owner-other-thread-rejected") {
+            SecondaryFacts other = secondary;
+            other.ethread = ethread ^ 0x400;
+            error.clear();
+            valid = !PrepareCriticalSectionBridge(other, error) &&
+                    error.find("zero or does not match") != std::string::npos;
+        } else {
+            const uint32_t mismatch = ethread ^ 0x400;
+            mem::Write(secondary.kpcr + 0x28, &mismatch, sizeof(mismatch));
+            error.clear();
+            valid = !PrepareCriticalSectionBridge(secondary, error) &&
+                    error.find("zero or does not match") != std::string::npos;
+            mem::Write(secondary.kpcr + 0x28, &ethread, sizeof(ethread));
+        }
+        candidate->ctx = nullptr;
+        valid = kernel::CancelPreparedThread(candidate) && valid && kernel::Threads().empty();
+        candidate.reset();
+        if (!valid) {
+            if (!reason.empty()) error = reason;
+            else if (error.empty()) error = "critical-section owner contract mismatch";
+            return finish(error.c_str(), false);
+        }
+        std::printf("RESULT ok %s ethread=%08X kpcr=%08X held=%08X/%u/%08X after=%08X/%u/%08X\n",
+                    scenario.c_str(), ethread, secondary.kpcr, g_critical_held_lock, g_critical_held_recursion,
+                    g_critical_held_owner, g_critical_after_lock, g_critical_after_recursion,
+                    g_critical_after_owner);
         return finish(nullptr, false);
     }
     if (scenario == "identity-missing") {
@@ -1591,6 +1751,8 @@ int RunIntegratedPreflight(const std::string& scenario) {
         mem::Write(page + 0x10, &return_address, sizeof(return_address));
         mem::Write(page + 0x14, &arg, sizeof(arg));
         g_critical_owner_ethread = 0xDEADBEEF;
+        g_critical_actual_ethread = 0xDEADBEEF;
+        g_critical_held_seen = false;
         g_critical_enter_calls = 0;
         g_critical_leave_calls = 0;
         g_critical_fail_mode = CriticalFailMode::kNone;
@@ -1605,6 +1767,8 @@ int RunIntegratedPreflight(const std::string& scenario) {
             mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion));
             mem::Read(sec::kCriticalOwner, &owner, sizeof(owner));
             valid = valid && lock == 0 && recursion == 1 && owner == g_critical_owner_ethread;
+            valid = valid && g_critical_held_seen && g_critical_held_lock == 0 &&
+                    g_critical_held_recursion == 1 && g_critical_held_owner == g_critical_actual_ethread;
             ctx.esp = page + 0x10;
             ProbeCriticalLeave(ctx, nullptr);
             valid = valid && ctx.eax == kernel::kSuccess && ctx.esp == page + 0x18;
@@ -1612,6 +1776,8 @@ int RunIntegratedPreflight(const std::string& scenario) {
             mem::Read(sec::kCriticalRecursion, &recursion, sizeof(recursion));
             mem::Read(sec::kCriticalOwner, &owner, sizeof(owner));
             valid = valid && lock == 0xFFFFFFFF && recursion == 0 && owner == 0;
+            valid = valid && g_critical_after_lock == 0xFFFFFFFF && g_critical_after_recursion == 0 &&
+                    g_critical_after_owner == 0;
             arg = 0x0046C8B8;
             mem::Write(page + 4, &arg, sizeof(arg));
             ctx.esp = page;
@@ -1671,6 +1837,8 @@ int RunIntegratedPreflight(const std::string& scenario) {
         mem::Write(page, &return_address, sizeof(return_address));
         mem::Write(page + 4, &arg, sizeof(arg));
         g_critical_owner_ethread = 0xDEADBEEF;
+        g_critical_actual_ethread = 0xDEADBEEF;
+        g_critical_held_seen = false;
         g_critical_enter_calls = 0;
         X86Context ctx{};
         ctx.esp = page;
@@ -1830,12 +1998,62 @@ int RunIntegratedPreflight(const std::string& scenario) {
         SecondaryFacts secondary;
         const bool ran = RunSecondarySegment(g_prepared_thread, secondary, error);
         g_integrated_fail_secondary_step = false;
+        const bool owner_ok =
+            scenario == "secondary-context-failure"
+                ? g_critical_actual_ethread == 0
+                : (g_critical_actual_ethread != 0 && g_prepared_thread &&
+                   g_critical_actual_ethread == g_prepared_thread->ethread);
         if (g_prepared_thread) g_prepared_thread->ctx = nullptr;
         const bool cleanup_ok = CleanupIntegrated(options);
-        if (ran) return 3;
+        if (ran || !owner_ok) return finish("secondary owner/bridge state is unexpected", false);
         if (scenario == "secondary-context-failure")
             std::printf("RESULT ok secondary context rejected: %s\n", error.c_str());
         return cleanup_ok ? 0 : 5;
+    }
+    if (scenario == "owner-bridge-failure-cleanup") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (!PrepareCandidateThread(facts, g_prepared_thread, error)) return finish(error.c_str(), false);
+        if (!PatchCriticalSectionImports(error)) return finish(error.c_str(), false);
+        g_integrated_fail_secondary_step = true;
+        SecondaryFacts secondary;
+        const bool ran = RunSecondarySegment(g_prepared_thread, secondary, error);
+        g_integrated_fail_secondary_step = false;
+        const kernel::ThreadRef thread = g_prepared_thread;
+        const bool bridge_owned = !ran && thread && g_critical_actual_ethread != 0 &&
+                                  g_critical_actual_ethread == thread->ethread &&
+                                  g_critical_enter_calls == 0 && g_critical_leave_calls == 0;
+        const uint32_t ethread = thread ? thread->ethread : 0;
+        if (thread) thread->ctx = nullptr;
+        const bool cleanup_ok = CleanupIntegrated(options);
+        if (!bridge_owned || !cleanup_ok) {
+            std::printf("RESULT fail owner-bridge-failure-cleanup bridge=%d cleanup=%d\n", int(bridge_owned),
+                        int(cleanup_ok));
+            return 5;
+        }
+        std::printf("RESULT ok owner-bridge-failure-cleanup ethread=%08X imports=restored thread=released\n",
+                    ethread);
+        return 0;
+    }
+    if (scenario == "owner-context-failure-cleanup") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (!PrepareCandidateThread(facts, g_prepared_thread, error)) return finish(error.c_str(), false);
+        if (!PatchCriticalSectionImports(error)) return finish(error.c_str(), false);
+        const uint32_t bad = 0x12345678;
+        mem::Write(g_prepared_thread->kpcr, &bad, sizeof(bad));
+        SecondaryFacts secondary;
+        const bool ran = RunSecondarySegment(g_prepared_thread, secondary, error);
+        const bool bridge_never_prepared = !ran && g_critical_actual_ethread == 0;
+        if (g_prepared_thread) g_prepared_thread->ctx = nullptr;
+        const bool cleanup_ok = CleanupIntegrated(options);
+        if (!bridge_never_prepared || !cleanup_ok) {
+            std::printf("RESULT fail owner-context-failure-cleanup bridge=%d cleanup=%d\n",
+                        int(bridge_never_prepared), int(cleanup_ok));
+            return 5;
+        }
+        std::printf("RESULT ok owner-context-failure-cleanup bridge=unprepared imports=restored thread=released\n");
+        return 0;
     }
     if (scenario == "forbidden-entry") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
@@ -2224,6 +2442,12 @@ int main(int argc, char** argv) {
         {"cleanup-restore-failure", 5, "integrated cleanup did not complete"},
         {"secondary-context-failure", 0, "secondary context rejected"},
         {"secondary-execution-failure", 0, "injected secondary execution failure"},
+        {"owner-prepared-thread", 0, "RESULT ok owner-prepared-thread"},
+        {"owner-zero-rejected", 0, "RESULT ok owner-zero-rejected"},
+        {"owner-other-thread-rejected", 0, "RESULT ok owner-other-thread-rejected"},
+        {"owner-bad-kpcr", 0, "RESULT ok owner-bad-kpcr"},
+        {"owner-bridge-failure-cleanup", 0, "RESULT ok owner-bridge-failure-cleanup"},
+        {"owner-context-failure-cleanup", 0, "RESULT ok owner-context-failure-cleanup"},
         {"forbidden-entry", 0, ""},
         {"cancel-twice", 0, ""},
         {"close-twice", 0, ""},
