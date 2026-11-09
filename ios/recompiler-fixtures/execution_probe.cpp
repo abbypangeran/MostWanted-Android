@@ -138,6 +138,7 @@ struct Options {
     bool reenter = false;
     uint32_t reenter_pc = 0;
     bool allow_root_return = false;  // reviewed sentinel frame for the XBE entrypoint RET
+    bool root_sentinel_at_entry = false;  // sentinel at entry ESP, not pushed below it
     bool corrupt_root_sentinel = false;
     bool skip_root_frame = false;
     bool root_stack_read_only = false;
@@ -173,6 +174,10 @@ struct ProbeState {
     bool have_stop = false;
     bool stop_checked_call_clear = false;
     bool stop_root_frame = false;
+    bool root_completed = false;
+    uint32_t root_esp = 0;
+    uint32_t root_eax = 0;
+    uint32_t root_pre_esp = 0;
     std::vector<StepRecord> trace;
     std::vector<MemoryRecord> memory;
     Clock::time_point deadline{};
@@ -788,6 +793,7 @@ struct Report {
     bool root_completed = false;
     uint32_t root_esp = 0;
     uint32_t root_eax = 0;
+    uint32_t root_pre_esp = 0;
     bool failure = false;
     ProbeFailure error;
 };
@@ -833,7 +839,7 @@ Report RunProbe(const Options& options) {
             if (options.allow_root_return) {
                 // the same non-executable sentinel CallGuest pushes: the checked
                 // RET validates it, then returns through the host, not to a guest PC
-                const uint32_t slot = ctx.esp - 4;
+                const uint32_t slot = options.root_sentinel_at_entry ? ctx.esp : ctx.esp - 4;
                 uint32_t sentinel = kRootReturnSentinel;
                 root_ready = mem::CheckAccess(slot, 4, mem::kReadWrite) == mem::AccessStatus::kOk &&
                              mem::Write(slot, &sentinel, sizeof(sentinel)) == mem::AccessStatus::kOk;
@@ -843,6 +849,7 @@ Report RunProbe(const Options& options) {
                 }
                 if (root_ready) ctx.esp = slot;
                 if (root_ready && !options.skip_root_frame) ctx.checked_call = &root_frame;
+                report.root_pre_esp = slot + 4;
             }
             if (!root_ready) {
                 report.failure = true;
@@ -864,7 +871,7 @@ Report RunProbe(const Options& options) {
                         report.failure = true;
                         report.error.reason = "root RET left the checked call frame active";
                         report.error.pc = kStopBefore;
-                    } else if (ctx.esp != options.initial_esp) {
+                    } else if (ctx.esp != report.root_pre_esp) {
                         report.failure = true;
                         report.error.reason = "root RET stack adjustment is not exact";
                         report.error.pc = kStopBefore;
@@ -872,6 +879,10 @@ Report RunProbe(const Options& options) {
                         report.root_completed = true;
                         report.root_esp = ctx.esp;
                         report.root_eax = ctx.eax;
+                        g_probe.root_completed = true;
+                        g_probe.root_esp = ctx.esp;
+                        g_probe.root_eax = ctx.eax;
+                        g_probe.root_pre_esp = report.root_pre_esp;
                     }
                 } else {
                     report.failure = true;
@@ -901,7 +912,8 @@ Report RunProbe(const Options& options) {
     else PrintTrace(false);
     PrintStop();
     if (report.root_completed)
-        std::printf("ROOT completed esp=%08X eax=%08X frame=returned\n", report.root_esp, report.root_eax);
+        std::printf("ROOT completed esp=%08X eax=%08X frame=returned pre_esp=%08X\n", report.root_esp,
+                    report.root_eax, report.root_pre_esp);
     PrintMemoryDiff(snapshot);
     return report;
 }
@@ -973,7 +985,9 @@ bool VerifySyntheticPostconditions(const Report& report, std::string& error) {
         error = "expected " + std::to_string(expected) + " instructions, got " + std::to_string(g_probe.executed);
         return false;
     }
-    if (g_probe.stop.esp != g_probe.options.initial_esp - (g_probe.options.allow_root_return ? 4 : 0)) {
+    if (g_probe.stop.esp !=
+        g_probe.options.initial_esp -
+            ((g_probe.options.allow_root_return && !g_probe.options.root_sentinel_at_entry) ? 4 : 0)) {
         error = "caller pops did not restore the reviewed stack";
         return false;
     }
@@ -982,7 +996,10 @@ bool VerifySyntheticPostconditions(const Report& report, std::string& error) {
             error = "root RET had no checked call frame";
             return false;
         }
-        if (!report.root_completed || report.root_esp != g_probe.options.initial_esp || report.root_eax != 1) {
+        const uint32_t expected_pre = g_probe.options.initial_esp +
+                                      (g_probe.options.root_sentinel_at_entry ? 4 : 0);
+        if (!report.root_completed || report.root_pre_esp != expected_pre ||
+            report.root_esp != expected_pre || report.root_eax != 1) {
             error = "root completion did not restore the host contract";
             return false;
         }
@@ -1152,6 +1169,11 @@ int RunChild(const std::string& scenario) {
         options.allow_kernel_call = true;
         options.require_kernel_success = true;
         options.allow_root_return = true;
+    } else if (scenario == "root-return-at-entry") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        options.allow_root_return = true;
+        options.root_sentinel_at_entry = true;
     } else if (scenario == "root-return-invalid-sentinel") {
         options.allow_kernel_call = true;
         options.require_kernel_success = true;
@@ -1271,6 +1293,7 @@ int RunChild(const std::string& scenario) {
         mem::Shutdown();
         return 4;
     }
+    if (options.root_sentinel_at_entry) options.initial_esp = kStackTop - 16;
     if (options.use_resume) {
         // Mark the helper entry as a generated continuation, then enter it through
         // x86_resume.  The probe must still count or reject that entry.
@@ -1584,6 +1607,7 @@ int main(int argc, char** argv) {
         {"not-taken", true, "RESULT ok instructions=72", 5000, false},
         {"caller-not-taken", false, "unreviewed control flow", 5000, false},
         {"root-return", true, "RESULT ok instructions=72", 5000, false},
+        {"root-return-at-entry", true, "RESULT ok instructions=72", 5000, false},
         {"root-return-invalid-sentinel", false, "invalid guest return address", 5000, false},
         {"root-return-missing-frame", false, "root RET has no checked call frame", 5000, false},
         {"root-return-stack-denied", false, "root return stack is not writable", 5000, false},
@@ -1680,6 +1704,13 @@ int main(int argc, char** argv) {
               root.output.find("CANCEL handle_closed=1 prepared=1 cancelled=1 output_cleared=1 stack_freed=1") !=
                   std::string::npos,
           "root-return contract consumes the sentinel, completes the checked frame, and cancels the thread");
+
+    const ChildResult root_entry = SpawnChild(self, "root-return-at-entry", std::chrono::milliseconds(5000));
+    Check(root_entry.output.find("ROOT completed esp=0050FFF4 eax=00000001 frame=returned pre_esp=0050FFF4") !=
+                  std::string::npos &&
+              root_entry.output.find("STOP 002B3987") != std::string::npos &&
+              root_entry.output.find("frame=active") != std::string::npos,
+          "entry-slot root contract keeps guest ESP and returns one word above it");
 
     std::printf("execution probe: %s\n", failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;

@@ -1851,3 +1851,42 @@ The default real path is unchanged: it still stops before `002B3987` at 71 instr
 Tests (Debug and Release) pass: `root-return` executes 72 instructions, first `002B3916`, last `002B3987`, `ROOT completed esp=... eax=00000001`, both imports, handle close, prepared-thread cancellation and zero resources. Invalid sentinel traps with `invalid guest return address`; a missing frame is rejected before the RET; a denied return-stack page fails setup. The full synthetic suite is 45 scenarios; ctest is 5/5 per configuration; real preflight/self-test are unchanged and pass.
 
 Next milestone: one test-only thread-activation integration into the authentic system routine `002B5C0F`, with callback tickets for `002B5C0F`/`002B38A2`, a reviewed instruction/import route and a bounded stop, without production `Boot()`, the Apple callback guard or unrestricted worker execution.
+
+## Phase 2C-29 authentic root-return integration
+
+Baseline `47b2c8d3f0f509d31fdefe6d51cf24d67dc46eb8` on `feature/ios-port`. **No real XBE instruction ran in this phase.**
+
+The Phase 2C-28 sentinel/frame contract is now available in the real probe behind an explicit `--root-return` gate. The gate requires `--run-once --execute-real`; the default `--run-once --execute-real` behaviour is unchanged at the 71-instruction stop.
+
+Real stack contract for the root-return mode:
+
+| Item | Address |
+| --- | --- |
+| Guest entry ESP | `facts.esp` = `D001FFF0` |
+| Sentinel slot | `D001FFF0`, value `FFFFFFF0` |
+| Host pre-call ESP | `D001FFF4` |
+| Expected pre-RET ESP | `D001FFF0` |
+| Expected post-RET ESP | `D001FFF4` |
+
+The sentinel is written before `Snapshot()` and is not a guest-memory change. The first 71 instructions never access `D001FFF0`; the runtime postcondition rejects any prefix access to that slot. The root RET is the only read, at `002B3987`, and `x86_checked_ret` validates the sentinel and pops exactly one word. The host requires the root frame returned, `EAX=1`, `ESP=D001FFF4`, and no guest PC after `002B3987`.
+
+The real probe now has two supervised modes:
+
+```text
+--run-once --execute-real                    # existing 71-instruction stop
+--run-once --execute-real --root-return      # 72-instruction root completion, not run
+```
+
+`--root-return` without both other flags is refused; direct `--child execute-root-return` is refused without the supervision token, and the child keeps the 12-second alarm. Production `Boot()`, the Apple callback guard and kernel-worker restrictions are unchanged.
+
+Validation (Debug and Release): synthetic root-return and entry-slot root-return both complete 72 instructions with `ROOT completed esp=... eax=00000001 frame=returned`; wrong sentinel, missing frame and denied return stack fail closed; 46 synthetic scenarios pass; real preflight reports `PREFLIGHT root: sentinel=FFFFFFF0 slot=D001FFF0 host_esp=D001FFF4 pre_ret=D001FFF0 post_ret=D001FFF4 stop=002B3987` and passes; real self-test includes root postcondition negatives and both root gating refusals; ctest 5/5 per configuration.
+
+The 71-instruction prefix is unchanged: route 78/78 and hash `0x6FBF924DD2C56F08`, same two imports, branches and handle lifecycle as Phase 2C-27.
+
+Decision: **GO for one later supervised 72-instruction root-return run** using the gated command below, after separate authorisation. **NO-GO** for guest-thread activation, `002B5C0F`, `002B38A2`, callbacks or workers.
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_real_preflight --preflight
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_real_preflight \
+  --run-once --execute-real --root-return
+```

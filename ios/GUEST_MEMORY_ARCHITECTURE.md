@@ -288,3 +288,7 @@ The caller tail consumes the pushed handle and restores `ESP` to the initial `D0
 ## Phase 2C-28 root-return stack contract
 
 The XBE entrypoint RET is a host/thread completion boundary, not a guest transfer. The synthetic `root-return` contract writes the non-executable sentinel `0xFFFFFFF0` at `initial_esp - 4` and installs an outer `X86CheckedCallFrame`, matching the production `CallGuest` host-return path. The checked RET validates that sentinel, pops exactly one 4-byte slot and clears the frame; the host requires the final ESP to equal the pre-call ESP and rejects a missing frame before the RET. No new pages or spans are added, and the stack slot is included in the pre-run snapshot. The real probe remains stopped at `002B3987` with no sentinel.
+
+## Phase 2C-29 real root-return stack layout
+
+The real root-return mode places the `FFFFFFF0` sentinel at `facts.esp` (`D001FFF0`), enters the guest at the same ESP, and treats `facts.esp + 4` as the host pre-call and post-RET ESP. This keeps the authentic 71-instruction prefix's stack addresses identical to Phase 2C-27. The sentinel slot is written before the memory snapshot, is not a guest write, and is verified to be untouched by the prefix; the root RET at `002B3987` is the only access to it. `x86_checked_ret` validates the sentinel against the outer frame, pops one word, and returns through the host; no guest PC is dispatched. The default real probe does not write the slot and still stops at `002B3987`.

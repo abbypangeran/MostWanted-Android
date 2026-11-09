@@ -833,6 +833,7 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
     facts.stack_base = stack_top - kRealStackCommitted;
     facts.esp = stack_top - 16;
     if (!ValidateStack(facts.stack_base, facts.stack_top, facts.esp, error)) return false;
+    if (!ValidateStackSpan(facts, facts.esp, 4, "root sentinel slot", error)) return false;
 
     // The reviewed route pushes the ten authentic arguments; the only slots it
     // does not write itself must still be the zero-filled stack.
@@ -850,6 +851,10 @@ bool PrepareRealImage(const std::string& path, xbe::Image& image, Options& optio
                          0,
                          kSystemRoutine};
     if (!ValidateImportArguments(facts, facts.import_esp, error)) return false;
+    if (facts.esp < facts.import_esp + kImportArgumentBytes) {
+        error = "root sentinel slot overlaps the reviewed import block";
+        return false;
+    }
     facts.close_esp = facts.import_esp + 0x38;
     facts.close_arg_slot = facts.close_esp + 4;
     facts.close_return = kCloseImportReturn;
@@ -952,6 +957,9 @@ void PrintRealFacts(const RealFacts& facts) {
                 "continue=%08X forbidden=%08X\n",
                 kCloseTarget, kCloseImportCall, kCloseStatusTest, kCloseBranch, kCloseSuccess, kCloseRet,
                 kCloseContinue, kCloseErrorPath);
+    std::printf("PREFLIGHT root: sentinel=%08X slot=%08X host_esp=%08X pre_ret=%08X post_ret=%08X stop=%08X "
+                "optional-ret\n",
+                kRootReturnSentinel, facts.esp, facts.esp + 4, facts.esp, facts.esp + 4, kStopBefore);
     std::printf("PREFLIGHT limits: instructions=80 direct_calls=2 kernel_calls=2 memory=256 imports=2 callbacks=0 "
                 "workers=0\n");
     std::printf("PREFLIGHT spans:");
@@ -997,8 +1005,9 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
         if (step.pc == kCloseStatusTest) close_status = &step;
         if (step.pc == kCloseBranch) close_branch = &step;
     }
-    if (g_probe.executed != 71) {
-        error = "expected 71 instructions, got " + std::to_string(g_probe.executed);
+    if (g_probe.executed != (g_probe.options.allow_root_return ? 72u : 71u)) {
+        error = "expected " + std::to_string(g_probe.options.allow_root_return ? 72 : 71) + " instructions, got " +
+                std::to_string(g_probe.executed);
         return false;
     }
     if (g_probe.direct_calls != 2) {
@@ -1085,19 +1094,47 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
         error = "post-close register state mismatch";
         return false;
     }
-    if (!g_probe.stop_checked_call_clear) {
+    if (g_probe.options.allow_root_return) {
+        if (!g_probe.stop_root_frame) {
+            error = "the root RET had no checked call frame";
+            return false;
+        }
+        if (!g_probe.root_completed || g_probe.root_eax != 1) {
+            error = "root completion did not return EAX=1";
+            return false;
+        }
+        if (g_probe.root_pre_esp != facts.esp + 4 || g_probe.root_esp != facts.esp + 4) {
+            error = "root return did not restore the reviewed host ESP";
+            return false;
+        }
+    } else if (!g_probe.stop_checked_call_clear) {
         error = "the checked call frames were not completed by the RETs";
         return false;
     }
-    if (g_probe.trace.empty() || g_probe.trace.back().pc != kLastInstruction) {
-        error = "the caller pops were not the last executed instructions";
+    const uint32_t last = g_probe.options.allow_root_return ? kStopBefore : kLastInstruction;
+    if (g_probe.trace.empty() || g_probe.trace.back().pc != last) {
+        error = g_probe.options.allow_root_return ? "the root RET was not the last executed instruction"
+                                                  : "the caller pops were not the last executed instructions";
         return false;
     }
     for (const StepRecord& step : g_probe.trace) {
-        if (step.pc == kStopBefore) {
+        if (!g_probe.options.allow_root_return && step.pc == kStopBefore) {
             error = "the caller RET was executed";
             return false;
         }
+    }
+    bool sentinel_read = false;
+    for (const MemoryRecord& record : g_probe.memory) {
+        if (record.address != facts.esp) continue;
+        if (!g_probe.options.allow_root_return || record.pc != kStopBefore || record.write || record.size != 4) {
+            error = "the unreviewed root sentinel slot was accessed by the prefix";
+            return false;
+        }
+        sentinel_read = true;
+    }
+    if (g_probe.options.allow_root_return && !sentinel_read) {
+        error = "the root RET did not read the sentinel slot";
+        return false;
     }
     uint32_t counter = 0, result = 0;
     if (mem::Read(kCounterAddress, &counter, sizeof(counter)) != mem::AccessStatus::kOk ||
@@ -1149,9 +1186,11 @@ bool VerifyRealPostconditions(const RealFacts& facts, std::string& error) {
     return true;
 }
 
-void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) {
+void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken, bool root = false) {
     g_probe = ProbeState{};
-    g_probe.executed = 71;
+    g_probe.options.allow_root_return = root;
+    g_probe.options.root_sentinel_at_entry = root;
+    g_probe.executed = root ? 72 : 71;
     g_probe.direct_calls = 2;
     g_probe.kernel_calls = 2;
     g_probe.import_reads = 2;
@@ -1208,9 +1247,16 @@ void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) 
     close_branch.branch_valid = true;
     close_branch.branch_taken = false;
     g_probe.trace.push_back(close_branch);
-    StepRecord last{};
-    last.pc = kLastInstruction;
-    g_probe.trace.push_back(last);
+    if (root) {
+        StepRecord ret_root{};
+        ret_root.pc = kStopBefore;
+        g_probe.trace.push_back(ret_root);
+        g_probe.memory.push_back({kStopBefore, facts.esp, 4, false});
+    } else {
+        StepRecord last{};
+        last.pc = kLastInstruction;
+        g_probe.trace.push_back(last);
+    }
     StepRecord stop{};
     stop.pc = kStopBefore;
     g_probe.stop = stop;
@@ -1220,7 +1266,12 @@ void FakeRealTrace(const RealFacts& facts, bool entry_taken, bool helper_taken) 
     g_probe.stop.esi = 0;
     g_probe.stop.edi = 0;
     g_probe.stop.esp = facts.esp;
-    g_probe.stop_checked_call_clear = true;
+    g_probe.stop_checked_call_clear = !root;
+    g_probe.stop_root_frame = root;
+    g_probe.root_completed = root;
+    g_probe.root_pre_esp = facts.esp + 4;
+    g_probe.root_esp = facts.esp + 4;
+    g_probe.root_eax = 1;
     g_probe.have_stop = true;
 }
 
@@ -1280,12 +1331,16 @@ int RealChild(const std::string& scenario) {
     int exit_code = 5;
     uint32_t execute_counter = 0, execute_result = 0;
 
-    if (scenario == "execute") {
+    if (scenario == "execute" || scenario == "execute-root-return") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (!ok) {
             std::printf("SETUP fail %s\n", error.c_str());
             exit_code = 4;
         } else {
+            if (scenario == "execute-root-return") {
+                options.allow_root_return = true;
+                options.root_sentinel_at_entry = true;
+            }
             const Report report = RunProbe(options);
             if (report.failure) {
                 PrintFailure(report.error);
@@ -1379,7 +1434,13 @@ int RealChild(const std::string& scenario) {
                scenario == "postcondition-caller-branch" || scenario == "postcondition-close-branch" ||
                scenario == "postcondition-close-status" || scenario == "postcondition-post-branch" ||
                scenario == "postcondition-import" || scenario == "postcondition-counter" ||
-               scenario == "postcondition-result" || scenario == "postcondition-ret-cleanup") {
+               scenario == "postcondition-result" || scenario == "postcondition-ret-cleanup" ||
+               scenario == "postcondition-root-completed" || scenario == "postcondition-root-esp" ||
+               scenario == "postcondition-root-frame" || scenario == "postcondition-root-ret" ||
+               scenario == "postcondition-root-sentinel") {
+        const bool root_case = scenario == "postcondition-root-completed" || scenario == "postcondition-root-esp" ||
+                               scenario == "postcondition-root-frame" || scenario == "postcondition-root-ret" ||
+                               scenario == "postcondition-root-sentinel";
         const bool needs_image = scenario == "postcondition-counter" || scenario == "postcondition-result";
         if (needs_image) ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         else {
@@ -1389,7 +1450,7 @@ int RealChild(const std::string& scenario) {
         }
         if (ok) {
             facts.entry_taken = true;
-            FakeRealTrace(facts, true, false);
+            FakeRealTrace(facts, true, false, root_case);
             if (scenario == "postcondition-count") g_probe.executed = 70;
             else if (scenario == "postcondition-branch") g_probe.trace[0].branch_taken = false;
             else if (scenario == "postcondition-caller-branch") {
@@ -1409,6 +1470,18 @@ int RealChild(const std::string& scenario) {
                     if (step.pc == kPostImportBranch) step.branch_taken = false;
             }
             else if (scenario == "postcondition-ret-cleanup") g_probe.stop.esp += 4;
+            else if (scenario == "postcondition-root-completed") g_probe.root_completed = false;
+            else if (scenario == "postcondition-root-esp") g_probe.root_esp += 4;
+            else if (scenario == "postcondition-root-frame") g_probe.stop_root_frame = false;
+            else if (scenario == "postcondition-root-ret") g_probe.trace.back().pc = kLastInstruction;
+            else if (scenario == "postcondition-root-sentinel") {
+                for (auto it = g_probe.memory.begin(); it != g_probe.memory.end();) {
+                    if (it->address == facts.esp)
+                        it = g_probe.memory.erase(it);
+                    else
+                        ++it;
+                }
+            }
             else if (scenario == "postcondition-import")
                 g_probe.memory.push_back({kImportCall, kImportSlot, 4, false});
             else if (scenario == "postcondition-result") Write32(kCounterAddress, facts.counter_after);
@@ -1504,12 +1577,13 @@ int RealChild(const std::string& scenario) {
         return 4;
     }
 
-    const bool execute_success = scenario == "execute" && exit_code == 0;
+    const bool root_execution = scenario == "execute-root-return";
+    const bool execute_success = (scenario == "execute" || root_execution) && exit_code == 0;
     bool teardown_ok = false;
     if (scenario == "preflight" || scenario == "execute-permission" || scenario == "execute" ||
-        scenario == "postcondition-counter" || scenario == "postcondition-result" ||
-        scenario == "import-page-writable" || scenario == "argument-span" || scenario == "restore-failure" ||
-        scenario == "restore-close-failure") {
+        scenario == "execute-root-return" || scenario == "postcondition-counter" ||
+        scenario == "postcondition-result" || scenario == "import-page-writable" || scenario == "argument-span" ||
+        scenario == "restore-failure" || scenario == "restore-close-failure") {
         teardown_ok = TeardownReal(options);
     } else {
         teardown_ok = TeardownReal(Options{});
@@ -1519,10 +1593,10 @@ int RealChild(const std::string& scenario) {
         exit_code = 5;
     } else if (execute_success) {
         std::printf("REAL_EXEC ok instructions=%u direct_calls=%u kernel_calls=%u import_reads=%u workers=%zu "
-                    "last=%08X stop=%08X counter=%08X result=%08X\n",
+                    "last=%08X stop=%08X counter=%08X result=%08X root=%d root_esp=%08X\n",
                     g_probe.executed, g_probe.direct_calls, g_probe.kernel_calls, ImportReads(),
-                    kernel::KernelWorkerCountForTest(), kLastInstruction, kStopBefore, execute_counter,
-                    execute_result);
+                    kernel::KernelWorkerCountForTest(), root_execution ? kStopBefore : kLastInstruction, kStopBefore,
+                    execute_counter, execute_result, int(root_execution), root_execution ? g_probe.root_esp : 0);
     }
     alarm(0);
     return exit_code;
@@ -1609,7 +1683,7 @@ ChildResult SpawnSupervisedChild(const std::string& self, const std::string& sce
     return result;
 }
 
-int RealParent(const std::string& mode, bool execute_real) {
+int RealParent(const std::string& mode, bool execute_real, bool root_return) {
     const std::string self = SelfPath();
     if (self.empty()) {
         std::printf("FAIL: cannot locate the real probe executable\n");
@@ -1629,7 +1703,8 @@ int RealParent(const std::string& mode, bool execute_real) {
             std::printf("REFUSED: pass --execute-real only after explicit approval\n");
             return 2;
         }
-        const ChildResult result = SpawnSupervisedChild(self, "execute", std::chrono::seconds(15));
+        const ChildResult result = SpawnSupervisedChild(self, root_return ? "execute-root-return" : "execute",
+                                                       std::chrono::seconds(15));
         std::printf("%s", result.output.c_str());
         if (result.timed_out) {
             std::printf("REAL EXECUTION FAIL: timeout\n");
@@ -1670,6 +1745,11 @@ int RealParent(const std::string& mode, bool execute_real) {
         {"postcondition-import", false, "import slot"},
         {"postcondition-counter", false, "counter postcondition"},
         {"postcondition-result", false, "result postcondition"},
+        {"postcondition-root-completed", false, "root completion did not return EAX=1"},
+        {"postcondition-root-esp", false, "root return did not restore the reviewed host ESP"},
+        {"postcondition-root-frame", false, "the root RET had no checked call frame"},
+        {"postcondition-root-ret", false, "the root RET was not the last executed instruction"},
+        {"postcondition-root-sentinel", false, "the root RET did not read the sentinel slot"},
     };
     int failed = 0;
     for (const RealCase& test : cases) {
@@ -1694,6 +1774,15 @@ int RealParent(const std::string& mode, bool execute_real) {
                 unauthorised_ok ? "PASS" : "FAIL");
     if (!unauthorised_ok) ++failed;
 
+    const ChildResult unauthorised_root = SpawnChild(self, "execute-root-return", std::chrono::seconds(5));
+    const int unauthorised_root_exit =
+        WIFEXITED(unauthorised_root.status) ? WEXITSTATUS(unauthorised_root.status) : -1;
+    const bool unauthorised_root_ok = !unauthorised_root.timed_out && unauthorised_root_exit == 2 &&
+                                      unauthorised_root.output.find("REFUSED") != std::string::npos;
+    std::printf("%s: direct --child execute-root-return is refused without the supervised parent\n",
+                unauthorised_root_ok ? "PASS" : "FAIL");
+    if (!unauthorised_root_ok) ++failed;
+
     const ChildResult supervised = SpawnSupervisedChild(self, "supervised-check", std::chrono::seconds(5));
     const int supervised_exit = WIFEXITED(supervised.status) ? WEXITSTATUS(supervised.status) : -1;
     const bool supervised_ok = !supervised.timed_out && supervised_exit == 0 &&
@@ -1716,9 +1805,14 @@ int RealParent(const std::string& mode, bool execute_real) {
         if (!restore_ok) ++failed;
     }
 
-    const int missing_flag = RealParent("run-once", false);
+    const int missing_flag = RealParent("run-once", false, false);
     std::printf("%s: --run-once without --execute-real is refused\n", missing_flag == 2 ? "PASS" : "FAIL");
     if (missing_flag != 2) ++failed;
+
+    const int root_missing_flag = RealParent("run-once", false, true);
+    std::printf("%s: --run-once --root-return without --execute-real is refused\n",
+                root_missing_flag == 2 ? "PASS" : "FAIL");
+    if (root_missing_flag != 2) ++failed;
 
     std::printf("real probe preflight: %s\n", failed ? "FAILED" : "PASSED");
     return failed ? 1 : 0;
@@ -1729,12 +1823,12 @@ int RealParent(const std::string& mode, bool execute_real) {
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--child") == 0) {
         const std::string scenario = argv[2];
-        if (scenario == "execute" || scenario == "supervised-check") {
+        if (scenario == "execute" || scenario == "execute-root-return" || scenario == "supervised-check") {
             if (!SupervisionTokenValid()) {
                 std::printf("REFUSED: real execution requires the supervised parent\n");
                 return 2;
             }
-            if (scenario == "execute") {
+            if (scenario == "execute" || scenario == "execute-root-return") {
                 alarm(12);
             } else {
                 std::printf("RESULT ok supervision=1\n");
@@ -1744,16 +1838,22 @@ int main(int argc, char** argv) {
         return RealChild(scenario);
     }
     bool execute_real = false;
+    bool root_return = false;
     const char* mode = "self-test";
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--execute-real") == 0) execute_real = true;
+        else if (std::strcmp(argv[i], "--root-return") == 0) root_return = true;
         else if (std::strcmp(argv[i], "--preflight") == 0) mode = "preflight";
         else if (std::strcmp(argv[i], "--self-test") == 0) mode = "self-test";
         else if (std::strcmp(argv[i], "--run-once") == 0) mode = "run-once";
         else {
-            std::printf("usage: %s [--preflight|--self-test|--run-once --execute-real]\n", argv[0]);
+            std::printf("usage: %s [--preflight|--self-test|--run-once --execute-real [--root-return]]\n", argv[0]);
             return 2;
         }
     }
-    return RealParent(mode, execute_real);
+    if (root_return && (std::strcmp(mode, "run-once") != 0 || !execute_real)) {
+        std::printf("REFUSED: --root-return requires --run-once --execute-real\n");
+        return 2;
+    }
+    return RealParent(mode, execute_real, root_return);
 }
