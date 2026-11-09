@@ -2737,6 +2737,15 @@ Existing coverage and gaps for the requested cases:
 
 Minimum remediation before a synthetic vertical slice: define Thread guest-block and callback-ticket release semantics across normal return, termination, handle close and memory shutdown; make stale object references unable to free a later allocation; add an explicitly synthetic-only test authorization and a test-gated StartThread route that reuses production state transitions; then cover the listed races with barriers and condition variables, including ordinal-258 termination, double exit, and zero retained resources. Do not substitute a host-only worker callback or manual test cleanup for those contracts.
 
+### Ranked next implementation packages
+
+1. **Thread resource and ticket ownership — prerequisite, critical risk.** Define release across normal return, cancellation, guest termination, handle close and memory shutdown. Prevent stale Thread references from freeing reused guest allocations; clear callback targets/tickets only when their owners are quiescent. Prove zero retained worker, callback and guest-memory resources.
+2. **Synthetic-only single-worker authorization — depends on package 1, high risk.** Add a test-only route that reuses StartThread transitions and managed join/cancellation, accepts only an explicitly synthetic dispatch identity, and enforces one worker. Keep it out of production and authentic-image execution targets. Use barriers for failed launch, pre-activation cancellation and host teardown races.
+3. **Termination and exit semantics — depends on packages 1-2, high risk.** Add reviewed checked ABI handling for ordinal 258, define noreturn worker cleanup, and test guest-requested termination, double exit and join behavior. Preserve the Apple execution guard.
+4. **Checked system-routine continuation — depends on packages 2-3, high risk.** Implement ticket-bound dynamic `CALL [EBP+8]` and required post-callback instructions such as `OR [EBP-4], -1`; test only against the synthetic worker fixture before proposing any authentic call.
+5. **Start-routine dependency packages — depends on package 4, very high risk.** Review and validate `002B58B8` and each direct callee in isolation; add required checked instruction forms and establish import ABI/side-effect semantics. Keep `HalReturnToFirmware`, filesystem mutation and protection changes outside execution until separately reviewed.
+6. **SEH epilogue, handler and exception delivery — depends on prior lifecycle contracts, highest semantic risk.** Review `002B5BD3`, handler `00319858`, registration lifetime, nested exceptions and teardown before any route can rely on exception handling.
+
 ### Phase 2D-1 validation and delivery state
 
 | Check | Result |
