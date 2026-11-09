@@ -2473,3 +2473,51 @@ Results: integrated self-test 51 PASS in Debug and Release; integrated preflight
 ```
 
 **NO-GO for extending beyond the reviewed `002B5C7B` boundary** until that run passes.
+
+## Phase 2C-38R integrated branch observation fix
+
+### Root cause
+
+The Phase 2C-38 real run executed the root segment exactly (72 instructions, identical to Phase 2C-36) and then reached the helper's list branch. The guest executed `jnz 0x002B5999` at `002B59A6` with ZF=1 and correctly fell through to `002B59A8`, but the host observer aborted with `secondary branch outcome mismatch` at the `002B59A8` hook after 65 secondary instructions.
+
+`RecordSecondaryStep()` recorded `branch_taken = ctx.zf != 0` for every conditional. That is only correct for `jz`; `002B59A6` is `jnz`, which is taken when ZF=0. The standalone secondary probe has the same shortcut but its route contains only a `jz`, documented as such. The integrated route gained its first `jnz` in Phase 2C-37, so Phase 2C-38 was the first run to execute it.
+
+### Fix
+
+1. `RecordSecondaryStep()` no longer predicts a conditional outcome. It records the pre-instruction flags and leaves `branch_valid`/`branch_taken` false.
+2. The successor hook validates that the successor is exactly the reviewed fallthrough or alternate edge, so an unexpected transfer still fails before the successor executes.
+3. The conditional is mapped to its reviewed x86 condition: `jz` at `002B5C5F` (taken iff ZF=1) and `jnz` at `002B59A6` (taken iff ZF=0). An unmapped conditional fails closed.
+4. The recorded ZF is checked against the observed edge, then the preceding trace record gets `branch_valid=true` and the observed `branch_taken` value. A legal route successor with the wrong flag outcome still fails.
+5. A conditional with no matching trace record fails closed. Conditions whose successor is never observed remain `branch_valid=false`, which the existing postcondition check rejects.
+
+### Tests
+
+Eight new synthetic scenarios drive the real integrated observer and successor validator (no generated guest body executes, no dynamic list callback):
+
+| Scenario | Expected |
+|---|---|
+| `branch-jz-not-taken` | ZF=0, `002B5C5F -> 002B5C61`, accepted, `branch_taken=0` |
+| `branch-jz-taken` | ZF=1, `002B5C5F -> 002B5C74`, accepted, `branch_taken=1` |
+| `branch-jnz-not-taken` | ZF=1, `002B59A6 -> 002B59A8`, accepted, `branch_taken=0` |
+| `branch-jnz-taken` | ZF=0, `002B59A6 -> 002B5999`, accepted, `branch_taken=1` |
+| `branch-bad-successor` | route PC that is neither edge, rejected as `unexpected secondary control transfer` |
+| `branch-flag-mismatch` | JNZ ZF=1 with the taken edge, rejected as `secondary branch outcome mismatch` |
+| `branch-jz-flag-mismatch` | JZ ZF=0 with the taken edge, rejected as `secondary branch outcome mismatch` |
+| `branch-failure-cleanup` | rejected branch with a retained thread and four patched imports; cleanup restores all slots, cancels the thread, zero workers/resources |
+
+Each accepted case asserts two trace records with `branch_valid=true` and the observed `branch_taken`; each rejected case asserts exactly one record and `executed=1`, proving the successor never executed. The harness still requires the absence of `INTEGRATED_REAL_EXEC ok` for every child.
+
+### Results
+
+Integrated self-test 59 PASS in Debug and Release; integrated preflight PASS; root and secondary standalone preflight/self-test PASS; `ctest` 6/6 in both configurations. The root 72-instruction path, the 71-instruction secondary path, the 143-instruction target, route hashes, generated mapping, critical-section services, import ordinals and the `002B5C7B` stop are unchanged. No authentic XBE instruction ran in this phase.
+
+### Decision
+
+**GO for exactly one later supervised 143-instruction Release run**, conditional on review and explicit authorisation:
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_integrated_real_preflight \
+  --run-once --execute-real
+```
+
+**NO-GO for executing `002B5C7B` or beyond** until that run passes.

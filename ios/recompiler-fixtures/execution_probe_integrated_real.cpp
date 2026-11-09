@@ -100,12 +100,22 @@ const sec::RouteStep* FindSecondaryStep(uint32_t pc) {
     return nullptr;
 }
 
+constexpr uint32_t kCriticalListBranch = 0x002B59A6;
+
+enum class SecondaryBranchCondition : uint8_t { kUnreviewed, kZero, kNotZero };
+
+SecondaryBranchCondition BranchConditionFor(uint32_t pc) {
+    if (pc == sec::kTlsFillBranch) return SecondaryBranchCondition::kZero;
+    if (pc == kCriticalListBranch) return SecondaryBranchCondition::kNotZero;
+    return SecondaryBranchCondition::kUnreviewed;
+}
+
 struct SecondaryInStep {
     SecondaryInStep() { g_secondary.in_step = true; }
     ~SecondaryInStep() { g_secondary.in_step = false; }
 };
 
-void RecordSecondaryStep(uint32_t pc, X86Context& ctx, const sec::RouteStep& step) {
+void RecordSecondaryStep(uint32_t pc, X86Context& ctx) {
     StepRecord record{};
     record.pc = pc;
     record.eax = ctx.eax;
@@ -122,10 +132,8 @@ void RecordSecondaryStep(uint32_t pc, X86Context& ctx, const sec::RouteStep& ste
     record.of = ctx.of;
     record.pf = ctx.pf;
     record.af = ctx.af;
-    if (step.kind == sec::StepKind::kConditional) {
-        record.branch_valid = true;
-        record.branch_taken = ctx.zf != 0;
-    }
+    // the successor hook records the edge actually taken; a conditional's
+    // outcome is not its zf alone (jz and jnz read the same flag)
     g_secondary.trace.push_back(record);
 }
 
@@ -332,9 +340,19 @@ void SecondaryStep(uint32_t pc, X86Context& ctx) {
         const bool alternate_edge = previous && previous->kind == sec::StepKind::kConditional &&
                                     pc == previous->alternate;
         if (!next_edge && !alternate_edge) Fail("unexpected secondary control transfer", pc);
-        if (previous && previous->kind == sec::StepKind::kConditional && !g_secondary.trace.empty()) {
+        if (previous && previous->kind == sec::StepKind::kConditional) {
+            if (g_secondary.trace.empty() || g_secondary.trace.back().pc != previous->pc)
+                Fail("secondary conditional has no trace record", pc);
+            const SecondaryBranchCondition condition = BranchConditionFor(previous->pc);
+            if (condition == SecondaryBranchCondition::kUnreviewed)
+                Fail("secondary conditional instruction is not reviewed", pc);
             const bool taken = alternate_edge;
-            if (g_secondary.trace.back().branch_taken != taken) Fail("secondary branch outcome mismatch", pc);
+            const bool flag_taken = condition == SecondaryBranchCondition::kZero
+                                        ? g_secondary.trace.back().zf != 0
+                                        : g_secondary.trace.back().zf == 0;
+            if (flag_taken != taken) Fail("secondary branch outcome mismatch", pc);
+            g_secondary.trace.back().branch_valid = true;
+            g_secondary.trace.back().branch_taken = taken;
         }
     }
 
@@ -405,7 +423,7 @@ void SecondaryStep(uint32_t pc, X86Context& ctx) {
 
     if (g_secondary.executed >= g_secondary.instruction_budget)
         Fail("secondary instruction budget exhausted", pc);
-    RecordSecondaryStep(pc, ctx, *step);
+    RecordSecondaryStep(pc, ctx);
     ++g_secondary.executed;
     g_secondary.previous_pc = pc;
     g_secondary.have_previous = true;
@@ -1411,6 +1429,30 @@ void PrintIntegratedFacts(const RealFacts& root_facts, const SecondaryFacts& sec
     std::printf("PREFLIGHT PASS\n");
 }
 
+bool DriveSecondaryBranch(uint32_t predecessor, uint32_t conditional, uint32_t successor, bool zf,
+                          uint32_t& failing_pc, std::string& failure) {
+    g_secondary = SecondaryState{};
+    g_secondary.running = true;
+    g_secondary.first_step = false;
+    g_secondary.have_previous = true;
+    g_secondary.previous_pc = predecessor;
+    X86Context conditional_ctx{};
+    conditional_ctx.zf = zf ? 1u : 0u;
+    X86Context successor_ctx{};
+    successor_ctx.zf = conditional_ctx.zf;
+    bool accepted = true;
+    try {
+        SecondaryStep(conditional, conditional_ctx);
+        SecondaryStep(successor, successor_ctx);
+    } catch (const ProbeFailure& thrown) {
+        failing_pc = thrown.pc;
+        failure = thrown.reason;
+        accepted = false;
+    }
+    g_secondary.running = false;
+    return accepted;
+}
+
 int RunIntegratedPreflight(const std::string& scenario) {
     alarm(12);
     if (!mem::Init()) {
@@ -1562,6 +1604,90 @@ int RunIntegratedPreflight(const std::string& scenario) {
                     g_critical_held_owner, g_critical_after_lock, g_critical_after_recursion,
                     g_critical_after_owner);
         return finish(nullptr, false);
+    }
+    if (scenario == "branch-jz-not-taken" || scenario == "branch-jz-taken" ||
+        scenario == "branch-jnz-not-taken" || scenario == "branch-jnz-taken" ||
+        scenario == "branch-bad-successor" || scenario == "branch-flag-mismatch" ||
+        scenario == "branch-jz-flag-mismatch") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        uint32_t predecessor = 0x002B59A4, conditional = kCriticalListBranch, successor = 0x002B59A8;
+        bool zf = true, expect_accept = true, expect_taken = false;
+        const char* expect_reason = nullptr;
+        if (scenario == "branch-jz-not-taken") {
+            predecessor = 0x002B5C5D;
+            conditional = sec::kTlsFillBranch;
+            successor = 0x002B5C61;
+            zf = false;
+        } else if (scenario == "branch-jz-taken") {
+            predecessor = 0x002B5C5D;
+            conditional = sec::kTlsFillBranch;
+            successor = 0x002B5C74;
+            zf = true;
+            expect_taken = true;
+        } else if (scenario == "branch-jnz-taken") {
+            successor = 0x002B5999;
+            zf = false;
+            expect_taken = true;
+        } else if (scenario == "branch-bad-successor") {
+            successor = 0x002B5986;
+            expect_accept = false;
+            expect_reason = "unexpected secondary control transfer";
+        } else if (scenario == "branch-flag-mismatch") {
+            successor = 0x002B5999;
+            expect_accept = false;
+            expect_reason = "secondary branch outcome mismatch";
+        } else if (scenario == "branch-jz-flag-mismatch") {
+            predecessor = 0x002B5C5D;
+            conditional = sec::kTlsFillBranch;
+            successor = 0x002B5C74;
+            zf = false;
+            expect_accept = false;
+            expect_reason = "secondary branch outcome mismatch";
+        }
+        uint32_t failing_pc = 0;
+        std::string failure;
+        const bool accepted = DriveSecondaryBranch(predecessor, conditional, successor, zf, failing_pc, failure);
+        const size_t expected_records = expect_accept ? 2u : 1u;
+        const bool trace_ok = g_secondary.trace.size() == expected_records &&
+                              g_secondary.executed == expected_records &&
+                              g_secondary.trace.front().pc == conditional &&
+                              g_secondary.trace.front().branch_valid == expect_accept &&
+                              g_secondary.trace.front().branch_taken == (expect_accept && expect_taken);
+        const bool rejection_ok =
+            expect_accept || (failing_pc == successor && expect_reason &&
+                              failure.find(expect_reason) != std::string::npos);
+        if (accepted != expect_accept || !trace_ok || !rejection_ok) {
+            std::printf("RESULT fail %s accepted=%d trace_ok=%d failing_pc=%08X reason=\"%s\"\n",
+                        scenario.c_str(), int(accepted), int(trace_ok), failing_pc, failure.c_str());
+            return finish("conditional branch observation contract mismatch", false);
+        }
+        if (expect_accept)
+            std::printf("RESULT ok %s branch_valid=1 branch_taken=%d\n", scenario.c_str(), int(expect_taken));
+        else
+            std::printf("RESULT ok %s rejected pc=%08X reason=\"%s\"\n", scenario.c_str(), failing_pc,
+                        failure.c_str());
+        return finish(nullptr, false);
+    }
+    if (scenario == "branch-failure-cleanup") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (!PrepareCandidateThread(facts, g_prepared_thread, error)) return finish(error.c_str(), false);
+        if (!PatchCriticalSectionImports(error)) return finish(error.c_str(), false);
+        uint32_t failing_pc = 0;
+        std::string failure;
+        const bool accepted = DriveSecondaryBranch(0x002B59A4, kCriticalListBranch, 0x002B5999, true,
+                                                   failing_pc, failure);
+        const bool branch_rejected = !accepted && failing_pc == 0x002B5999 &&
+                                     failure.find("secondary branch outcome mismatch") != std::string::npos &&
+                                     g_secondary.trace.size() == 1 && g_secondary.executed == 1;
+        if (g_prepared_thread) g_prepared_thread->ctx = nullptr;
+        const bool cleanup_ok = CleanupIntegrated(options);
+        if (!branch_rejected || !cleanup_ok) return finish("branch failure containment mismatch", false);
+        std::printf("RESULT ok branch-failure-cleanup rejected pc=%08X reason=\"%s\" imports=restored "
+                    "thread=released workers=0\n",
+                    failing_pc, failure.c_str());
+        return 0;
     }
     if (scenario == "identity-missing") {
         if (ValidateRealIdentity("/tmp/mostwanted-integrated-does-not-exist.xbe", image, error))
@@ -2448,6 +2574,14 @@ int main(int argc, char** argv) {
         {"owner-bad-kpcr", 0, "RESULT ok owner-bad-kpcr"},
         {"owner-bridge-failure-cleanup", 0, "RESULT ok owner-bridge-failure-cleanup"},
         {"owner-context-failure-cleanup", 0, "RESULT ok owner-context-failure-cleanup"},
+        {"branch-jz-not-taken", 0, "RESULT ok branch-jz-not-taken"},
+        {"branch-jz-taken", 0, "RESULT ok branch-jz-taken"},
+        {"branch-jnz-not-taken", 0, "RESULT ok branch-jnz-not-taken"},
+        {"branch-jnz-taken", 0, "RESULT ok branch-jnz-taken"},
+        {"branch-bad-successor", 0, "unexpected secondary control transfer"},
+        {"branch-flag-mismatch", 0, "secondary branch outcome mismatch"},
+        {"branch-jz-flag-mismatch", 0, "secondary branch outcome mismatch"},
+        {"branch-failure-cleanup", 0, "RESULT ok branch-failure-cleanup"},
         {"forbidden-entry", 0, ""},
         {"cancel-twice", 0, ""},
         {"close-twice", 0, ""},
