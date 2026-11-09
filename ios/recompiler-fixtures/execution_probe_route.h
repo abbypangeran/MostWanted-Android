@@ -177,6 +177,11 @@ inline constexpr uint32_t kRetTarget = 0x002B396F;
 inline constexpr uint32_t kRetPopBytes = 0x18;
 inline constexpr uint32_t kStopInstruction = 0x002B3987;  // caller ret, never executed
 
+// Root completion uses the same non-executable host-return sentinel as
+// CallGuest: it is pushed only to give the checked RET a reviewed address to
+// validate, and it is never used as a guest target.
+inline constexpr uint32_t kRootReturnSentinel = 0xFFFFFFF0;
+
 // one reviewed import call; the observer counts each slot separately.
 struct ImportStep {
     uint32_t pc, slot, return_pc, ordinal, encoding;

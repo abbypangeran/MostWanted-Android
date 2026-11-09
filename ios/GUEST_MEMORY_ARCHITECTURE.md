@@ -284,3 +284,7 @@ The reviewed route now reads two import slots in the same read-only page `003C90
 The ordinal-187 test handler touches no raw guest pointer: it reads the single handle argument with `mem::Read` and uses the existing handle table through `kernel::CloseHandle`. Closing removes only the handle-table entry. The `ThreadRef` keeps the thread object and its guest stack alive in `kPrepared`; only `CancelPreparedThread` frees them during teardown. The probe asserts `FromHandle(handle) == nullptr`, state `kPrepared`, then successful cancellation and zero retained resources, so handle closure is never conflated with thread cancellation.
 
 The caller tail consumes the pushed handle and restores `ESP` to the initial `D001FFF0` before the pre-instruction stop at `002B3987`; the caller's RET and its return address are never executed or trusted. No new pages, spans or permissions were added.
+
+## Phase 2C-28 root-return stack contract
+
+The XBE entrypoint RET is a host/thread completion boundary, not a guest transfer. The synthetic `root-return` contract writes the non-executable sentinel `0xFFFFFFF0` at `initial_esp - 4` and installs an outer `X86CheckedCallFrame`, matching the production `CallGuest` host-return path. The checked RET validates that sentinel, pops exactly one 4-byte slot and clears the frame; the host requires the final ESP to equal the pre-call ESP and rejects a missing frame before the RET. No new pages or spans are added, and the stack slot is included in the pre-run snapshot. The real probe remains stopped at `002B3987` with no sentinel.

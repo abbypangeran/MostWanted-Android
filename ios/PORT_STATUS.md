@@ -1830,3 +1830,24 @@ Import page `003C9000`: authentic `003C9E68 = 800000FF` and `003C9D4C = 800000BB
 Focused validation passed in Debug and Release: synthetic probe (both import calls, close/duplicate/invalid/bad-cleanup/bad-return/cancel-on-close, second read, argument span, budget and teardown), real preflight and self-test (78/78, 6 functions, 78 hooks, both authentic encodings and restorations, zero resources), and ctest 5/5 per configuration. Android shared-code change is limited to the test-only dispatch branch and a constant move; a targeted NDK compile is included in the report.
 
 Decision: **GO for one supervised real run through the wrapper**, stopping before `002B3987`. **NO-GO** for the caller RET and anything beyond it, `StartThread`, callbacks, workers or production `Boot()`.
+
+## Phase 2C-28 XBE entrypoint RET contract
+
+Baseline `8c29398c440f9efe0b62bc181b93194135d3b2c6` on `feature/ios-port`. **No real XBE instruction ran in this phase.**
+
+The probe invoked `sub_002B3916` directly with `ESP=D001FFF0`, no pushed return address and no `X86CheckedCallFrame`; `[D001FFF0]` was the zero-filled stack top. `x86_checked_ret` skips return-address validation when `ctx.checked_call == nullptr` and only adds `4 + pop_bytes`. The authentic RET therefore cannot transfer to a valid guest PC, and the current unframed path could silently accept a wrong stack slot. Production `Boot()` instead creates a thread whose start routine is the XBE entry, and `StartThread()`/`CallGuest()` invoke it with the non-executable host-return sentinel `0xFFFFFFF0` and an outer checked-call frame.
+
+The selected contract mirrors that production callback path. In the synthetic-only `root-return` mode the host:
+
+1. checks and writes `kRootReturnSentinel = 0xFFFFFFF0` at `initial_esp - 4`;
+2. installs an `X86CheckedCallFrame` with that sentinel;
+3. runs the reviewed route; the stop hook at `002B3987` records the pre-RET state and refuses an unframed RET;
+4. lets the authentic `RET` execute only when the root frame is active;
+5. requires `x86_checked_ret` to validate the sentinel, return through the host and restore `ESP` exactly to `initial_esp`;
+6. records completion only if the frame returned and no guest PC executed after `002B3987`.
+
+The default real path is unchanged: it still stops before `002B3987` at 71 instructions. The contract is opt-in and synthetic-only in this phase.
+
+Tests (Debug and Release) pass: `root-return` executes 72 instructions, first `002B3916`, last `002B3987`, `ROOT completed esp=... eax=00000001`, both imports, handle close, prepared-thread cancellation and zero resources. Invalid sentinel traps with `invalid guest return address`; a missing frame is rejected before the RET; a denied return-stack page fails setup. The full synthetic suite is 45 scenarios; ctest is 5/5 per configuration; real preflight/self-test are unchanged and pass.
+
+Next milestone: one test-only thread-activation integration into the authentic system routine `002B5C0F`, with callback tickets for `002B5C0F`/`002B38A2`, a reviewed instruction/import route and a bounded stop, without production `Boot()`, the Apple callback guard or unrestricted worker execution.

@@ -137,6 +137,10 @@ struct Options {
     bool use_resume = false;
     bool reenter = false;
     uint32_t reenter_pc = 0;
+    bool allow_root_return = false;  // reviewed sentinel frame for the XBE entrypoint RET
+    bool corrupt_root_sentinel = false;
+    bool skip_root_frame = false;
+    bool root_stack_read_only = false;
     std::chrono::milliseconds delay{0};
     uint32_t delay_pc = 0;
     std::chrono::milliseconds deadline{0};
@@ -168,6 +172,7 @@ struct ProbeState {
     StepRecord stop{};
     bool have_stop = false;
     bool stop_checked_call_clear = false;
+    bool stop_root_frame = false;
     std::vector<StepRecord> trace;
     std::vector<MemoryRecord> memory;
     Clock::time_point deadline{};
@@ -350,8 +355,11 @@ void ProbeStep(uint32_t pc, X86Context& ctx) {
         g_probe.stop.branch_valid = false;
         g_probe.stop.branch_taken = false;
         g_probe.stop_checked_call_clear = ctx.checked_call == nullptr;
+        g_probe.stop_root_frame = false;
         g_probe.have_stop = true;
-        throw ProbeNormalStop{};
+        if (!g_probe.options.allow_root_return) throw ProbeNormalStop{};
+        if (ctx.checked_call == nullptr) Fail("root RET has no checked call frame", pc);
+        g_probe.stop_root_frame = true;
     }
 
     if (g_probe.options.delay.count() && g_probe.options.delay_pc == pc)
@@ -748,6 +756,7 @@ bool PrepareData(Options& options) {
     // the checked import call must read this page once; nothing may write it or
     // execute from it during the probe.
     if (!ProtectRange(kImportPage, mem::kPage, mem::kRead)) return false;
+    if (options.root_stack_read_only && !ProtectRange(kStackPage, mem::kPage, mem::kRead)) return false;
     if (options.decommit_global && !mem::Decommit(kGlobalPage, mem::kPage)) return false;
 
     options.allowed_spans = {{kDataPage, kDataPage + mem::kPage, true},
@@ -776,6 +785,9 @@ bool PrepareData(Options& options) {
 
 struct Report {
     bool normal_stop = false;
+    bool root_completed = false;
+    uint32_t root_esp = 0;
+    uint32_t root_eax = 0;
     bool failure = false;
     ProbeFailure error;
 };
@@ -792,7 +804,7 @@ Report RunProbe(const Options& options) {
         g_probe.deadline = Clock::now() + options.deadline;
         g_probe.deadline_set = true;
     }
-    const std::vector<SnapshotPage> snapshot = Snapshot();
+    std::vector<SnapshotPage> snapshot;
 
     const RouteStep* first = FindStep(options.start_pc);
     if (!first) {
@@ -816,14 +828,56 @@ Report RunProbe(const Options& options) {
         } else {
             X86Context ctx{};
             ctx.esp = options.initial_esp;
-            try {
+            X86CheckedCallFrame root_frame{nullptr, kRootReturnSentinel, false};
+            bool root_ready = true;
+            if (options.allow_root_return) {
+                // the same non-executable sentinel CallGuest pushes: the checked
+                // RET validates it, then returns through the host, not to a guest PC
+                const uint32_t slot = ctx.esp - 4;
+                uint32_t sentinel = kRootReturnSentinel;
+                root_ready = mem::CheckAccess(slot, 4, mem::kReadWrite) == mem::AccessStatus::kOk &&
+                             mem::Write(slot, &sentinel, sizeof(sentinel)) == mem::AccessStatus::kOk;
+                if (root_ready && options.corrupt_root_sentinel) {
+                    sentinel ^= 4;
+                    mem::Write(slot, &sentinel, sizeof(sentinel));
+                }
+                if (root_ready) ctx.esp = slot;
+                if (root_ready && !options.skip_root_frame) ctx.checked_call = &root_frame;
+            }
+            if (!root_ready) {
+                report.failure = true;
+                report.error.reason = "root return stack is not writable";
+                report.error.pc = kStopBefore;
+            } else {
+                snapshot = Snapshot();
+                try {
                 if (options.use_resume)
                     x86_resume(ctx, nullptr, {options.start_pc, options.initial_esp});
                 else
                     target.function(ctx, nullptr);
-                report.failure = true;
-                report.error.reason = "generated function returned before the mandatory stop";
-                report.error.pc = kStopBefore;
+                if (options.allow_root_return) {
+                    if (!root_frame.returned) {
+                        report.failure = true;
+                        report.error.reason = "root RET did not complete the checked call frame";
+                        report.error.pc = kStopBefore;
+                    } else if (ctx.checked_call != nullptr) {
+                        report.failure = true;
+                        report.error.reason = "root RET left the checked call frame active";
+                        report.error.pc = kStopBefore;
+                    } else if (ctx.esp != options.initial_esp) {
+                        report.failure = true;
+                        report.error.reason = "root RET stack adjustment is not exact";
+                        report.error.pc = kStopBefore;
+                    } else {
+                        report.root_completed = true;
+                        report.root_esp = ctx.esp;
+                        report.root_eax = ctx.eax;
+                    }
+                } else {
+                    report.failure = true;
+                    report.error.reason = "generated function returned before the mandatory stop";
+                    report.error.pc = kStopBefore;
+                }
             } catch (const ProbeNormalStop&) {
                 report.normal_stop = true;
             } catch (const ProbeFailure& failure) {
@@ -836,15 +890,18 @@ Report RunProbe(const Options& options) {
                 report.error.address = fault.address;
                 report.error.has_address = true;
             }
+            }
         }
     }
     g_probe.running = false;
     // the step hook runs before the instruction, so every STEP line is the
     // guest state the instruction is about to consume, not its result.
     std::printf("TRACE registers are read before each instruction\n");
-    if (report.normal_stop) PrintTrace(true);
+    if (report.normal_stop || report.root_completed) PrintTrace(true);
     else PrintTrace(false);
     PrintStop();
+    if (report.root_completed)
+        std::printf("ROOT completed esp=%08X eax=%08X frame=returned\n", report.root_esp, report.root_eax);
     PrintMemoryDiff(snapshot);
     return report;
 }
@@ -905,36 +962,48 @@ bool CancelPreparedThreadForProbe() {
     return ok;
 }
 
-bool VerifySyntheticPostconditions(std::string& error) {
+bool VerifySyntheticPostconditions(const Report& report, std::string& error) {
     if (!g_probe.have_stop || g_probe.stop.pc != kStopBefore) {
         error = "mandatory stop is not the caller RET boundary";
         return false;
     }
-    const uint32_t expected = 71 + (g_probe.options.not_taken ? 1 : 0);
+    const uint32_t expected = 71 + (g_probe.options.not_taken ? 1 : 0) +
+                              (g_probe.options.allow_root_return ? 1 : 0);
     if (g_probe.executed != expected) {
         error = "expected " + std::to_string(expected) + " instructions, got " + std::to_string(g_probe.executed);
         return false;
     }
-    if (g_probe.stop.esp != g_probe.options.initial_esp) {
-        error = "caller pops did not restore the initial stack";
+    if (g_probe.stop.esp != g_probe.options.initial_esp - (g_probe.options.allow_root_return ? 4 : 0)) {
+        error = "caller pops did not restore the reviewed stack";
         return false;
     }
-    if (!g_probe.stop_checked_call_clear) {
+    if (g_probe.options.allow_root_return) {
+        if (!g_probe.stop_root_frame) {
+            error = "root RET had no checked call frame";
+            return false;
+        }
+        if (!report.root_completed || report.root_esp != g_probe.options.initial_esp || report.root_eax != 1) {
+            error = "root completion did not restore the host contract";
+            return false;
+        }
+    } else if (!g_probe.stop_checked_call_clear) {
         error = "checked call frames were not completed by the RETs";
         return false;
     }
     const StepRecord* caller_branch = nullptr;
     const StepRecord* close_branch = nullptr;
     for (const StepRecord& step : g_probe.trace) {
-        if (step.pc == kStopBefore) {
+        if (!g_probe.options.allow_root_return && step.pc == kStopBefore) {
             error = "the stop boundary instruction was executed";
             return false;
         }
         if (step.pc == kCallerBranch) caller_branch = &step;
         if (step.pc == kCloseBranch) close_branch = &step;
     }
-    if (g_probe.trace.empty() || g_probe.trace.back().pc != kLastInstruction) {
-        error = "the caller pops were not the last executed instructions";
+    const uint32_t last = g_probe.options.allow_root_return ? kStopBefore : kLastInstruction;
+    if (g_probe.trace.empty() || g_probe.trace.back().pc != last) {
+        error = g_probe.options.allow_root_return ? "the root RET was not the last executed instruction"
+                                                  : "the caller pops were not the last executed instructions";
         return false;
     }
     if (!caller_branch || !caller_branch->branch_valid || !caller_branch->branch_taken) {
@@ -1079,6 +1148,25 @@ int RunChild(const std::string& scenario) {
         options.allow_kernel_call = true;
         options.require_kernel_success = true;
         g_kernel_bridge_mode = KernelBridgeMode::kZeroHandle;
+    } else if (scenario == "root-return") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        options.allow_root_return = true;
+    } else if (scenario == "root-return-invalid-sentinel") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        options.allow_root_return = true;
+        options.corrupt_root_sentinel = true;
+    } else if (scenario == "root-return-missing-frame") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        options.allow_root_return = true;
+        options.skip_root_frame = true;
+    } else if (scenario == "root-return-stack-denied") {
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        options.allow_root_return = true;
+        options.root_stack_read_only = true;
     } else if (scenario == "close-fail") {
         options.allow_kernel_call = true;
         options.require_kernel_success = true;
@@ -1275,7 +1363,7 @@ int RunChild(const std::string& scenario) {
         return teardown_ok ? 3 : 5;
     }
     std::string post_error;
-    if (!VerifySyntheticPostconditions(post_error)) {
+    if (!VerifySyntheticPostconditions(report, post_error)) {
         ProbeFailure failure;
         failure.reason = post_error;
         failure.pc = kImportCall;
@@ -1495,6 +1583,10 @@ int main(int argc, char** argv) {
         {"taken", true, "RESULT ok instructions=71", 5000, false},
         {"not-taken", true, "RESULT ok instructions=72", 5000, false},
         {"caller-not-taken", false, "unreviewed control flow", 5000, false},
+        {"root-return", true, "RESULT ok instructions=72", 5000, false},
+        {"root-return-invalid-sentinel", false, "invalid guest return address", 5000, false},
+        {"root-return-missing-frame", false, "root RET has no checked call frame", 5000, false},
+        {"root-return-stack-denied", false, "root return stack is not writable", 5000, false},
         {"close-fail", false, "unreviewed control flow", 5000, false},
         {"close-double", true, "RESULT ok instructions=71", 5000, false},
         {"close-bad-cleanup", false, "stdcall", 5000, false},
@@ -1580,6 +1672,14 @@ int main(int argc, char** argv) {
               success.output.find("kernel_calls=2 import_reads=2") != std::string::npos &&
               success.output.find("frame=clear") != std::string::npos,
           "successful probe closes the handle, returns through both RETs, stops at the caller RET, and cancels the thread");
+
+    const ChildResult root = SpawnChild(self, "root-return", std::chrono::milliseconds(5000));
+    Check(root.output.find("ROOT completed esp=00510000 eax=00000001 frame=returned") != std::string::npos &&
+              root.output.find("STOP 002B3987") != std::string::npos &&
+              root.output.find("frame=active") != std::string::npos &&
+              root.output.find("CANCEL handle_closed=1 prepared=1 cancelled=1 output_cleared=1 stack_freed=1") !=
+                  std::string::npos,
+          "root-return contract consumes the sentinel, completes the checked frame, and cancels the thread");
 
     std::printf("execution probe: %s\n", failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;
