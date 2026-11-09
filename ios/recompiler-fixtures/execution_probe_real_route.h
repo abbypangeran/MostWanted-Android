@@ -66,17 +66,24 @@ inline constexpr const char* kExpectedRouteText[] = {
     "mov eax, [ebp+0x0C]",         // 002B5D0E
     "pop ebp",                     // 002B5D11
     "ret 0x18",                    // 002B5D12
-    "mov edi, eax",                // 002B396F, pre-instruction stop boundary
+    "mov edi, eax",                // 002B396F, caller handle check
+    "cmp edi, esi",                // 002B3971
+    "jnz 0x002B397F",              // 002B3973
+    "push esi",                    // 002B3975, zero-handle arm, forbidden
+    "push edi",                    // 002B397F, last executed
+    "call 0x002B2759",             // 002B3980, NtClose wrapper, pre-instruction stop
+    "push ebp",                    // 002B55EE, off-path callee boundary
+    "push [esp+0x04]",             // 002B2759, NtClose wrapper boundary
 };
 
 inline constexpr size_t kExpectedRouteTextCount =
     sizeof(kExpectedRouteText) / sizeof(kExpectedRouteText[0]);
 
-// FNV-1a over the 175 reviewed instruction bytes in route order.  A hash keeps
+// FNV-1a over the 191 reviewed instruction bytes in route order.  A hash keeps
 // the proprietary bytes out of tracked source while still pinning the exact
 // encoding that the text table decodes.
-inline constexpr uint32_t kExpectedRouteBytes = 175;
-inline constexpr uint64_t kExpectedRouteHash = 0xb990e1a4e299ef7eULL;
+inline constexpr uint32_t kExpectedRouteBytes = 191;
+inline constexpr uint64_t kExpectedRouteHash = 0x543CADDFE334635CULL;
 
 // the debug arm's first instruction, reviewed as a forbidden boundary; it is a
 // one-instruction function so the recompiler does not follow its call at all.

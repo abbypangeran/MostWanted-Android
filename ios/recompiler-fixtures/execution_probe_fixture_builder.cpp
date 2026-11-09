@@ -87,7 +87,17 @@ constexpr Instruction kInstructions[] = {
     {0x002B5D0E, {0x8B, 0x45, 0x0C}, 3},                                // mov eax, [ebp+0xC]
     {0x002B5D11, {0x5D}, 1},                                            // pop ebp
     {0x002B5D12, {0xC2, 0x18, 0x00}, 3},                                // ret 0x18
-    {0x002B396F, {0x8B, 0xF8}, 2},                                      // mov edi, eax - stop boundary
+    {0x002B396F, {0x8B, 0xF8}, 2},                                      // mov edi, eax
+    {0x002B3971, {0x3B, 0xFE}, 2},                                      // cmp edi, esi
+    {0x002B3973, {0x75, 0x0A}, 2},                                      // jnz 0x2B397F
+    {0x002B3975, {0x56}, 1},                                            // push esi - forbidden arm
+    {0x002B3976, {0x6A, 0x01}, 2},                                      // push 1
+    {0x002B3978, {0x6A, 0x01}, 2},                                      // push 1
+    {0x002B397A, {0xE8, 0x6F, 0x1C, 0x00, 0x00}, 5},                    // call 0x2B55EE
+    {0x002B397F, {0x57}, 1},                                            // push edi
+    {0x002B3980, {0xE8, 0xD4, 0xED, 0xFF, 0xFF}, 5},                    // call 0x2B2759 - stop boundary
+    {0x002B55EE, {0x55}, 1},                                            // push ebp - boundary
+    {0x002B2759, {0xFF, 0x74, 0x24, 0x04}, 4},                          // push [esp+4] - boundary
 };
 
 void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
@@ -145,13 +155,19 @@ bool WriteConfig(const char* path) {
               "checked_memory = true\n\n"
               "[[function]]\n"
               "at = 0x002B3916\n"
-              "end = 0x002B3971\n\n"
+              "end = 0x002B3985\n\n"
               "[[function]]\n"
               "at = 0x002B5CA7\n"
               "end = 0x002B5D15\n\n"
               "[[function]]\n"
               "at = 0x002B5CEC\n"
-              "end = 0x002B5CF4\n";
+              "end = 0x002B5CF4\n\n"
+              "[[function]]\n"
+              "at = 0x002B55EE\n"
+              "end = 0x002B55EF\n\n"
+              "[[function]]\n"
+              "at = 0x002B2759\n"
+              "end = 0x002B275D\n";
     for (const auto& step : execution_probe::kRoute) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc

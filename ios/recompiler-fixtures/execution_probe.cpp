@@ -221,7 +221,7 @@ struct InStep {
 
 // Test-only ordinal-255 service state; the handler prepares an inactive thread
 // with the authentic arguments and never starts it.
-enum class KernelBridgeMode : uint8_t { kPrepare, kFail, kBadCleanup, kBadReturn, kBadDirectReturn, kStartAttempt };
+enum class KernelBridgeMode : uint8_t { kPrepare, kFail, kBadCleanup, kBadReturn, kBadDirectReturn, kStartAttempt, kZeroHandle };
 KernelBridgeMode g_kernel_bridge_mode = KernelBridgeMode::kPrepare;
 uint32_t g_kernel255_calls = 0;
 uint32_t g_kernel255_status = 0;
@@ -394,6 +394,11 @@ void ProbeKernel255Handler(X86Context& ctx, uint8_t*) {
             // corrupt the direct call's return address, 0x30 above the handler frame
             const uint32_t invalid = 0xDEADBEEF;
             mem::Write(ctx.esp + 0x30, &invalid, sizeof(invalid));
+        } else if (g_kernel_bridge_mode == KernelBridgeMode::kZeroHandle) {
+            // publish no handle so the caller's JNZ is not taken and the
+            // forbidden zero-handle arm at 0x002B3975 is reached
+            const uint32_t zero = 0;
+            mem::Write(args[0], &zero, sizeof(zero));
         }
     }
     kernel::Return(ctx, g_kernel255_status, 10);
@@ -790,25 +795,36 @@ bool CancelPreparedThreadForProbe() {
 
 bool VerifySyntheticPostconditions(std::string& error) {
     if (!g_probe.have_stop || g_probe.stop.pc != kStopBefore) {
-        error = "mandatory stop is not the return destination";
+        error = "mandatory stop is not the close-call boundary";
         return false;
     }
-    if (g_probe.stop.esp != g_probe.options.initial_esp - kImportStackBytes + 0x48) {
-        error = "RET cleanup did not restore the caller stack";
+    const uint32_t expected = 60 + (g_probe.options.not_taken ? 1 : 0);
+    if (g_probe.executed != expected) {
+        error = "expected " + std::to_string(expected) + " instructions, got " + std::to_string(g_probe.executed);
+        return false;
+    }
+    if (g_probe.stop.esp != g_probe.options.initial_esp - kImportStackBytes + 0x44) {
+        error = "caller push did not leave the reviewed stack";
         return false;
     }
     if (!g_probe.stop_checked_call_clear) {
         error = "checked call frame was not completed by the RET";
         return false;
     }
+    const StepRecord* caller_branch = nullptr;
     for (const StepRecord& step : g_probe.trace) {
         if (step.pc == kStopBefore) {
             error = "the stop boundary instruction was executed";
             return false;
         }
+        if (step.pc == kCallerBranch) caller_branch = &step;
     }
-    if (g_probe.trace.empty() || g_probe.trace.back().pc != kRetInstruction) {
-        error = "the RET was not the last executed instruction";
+    if (g_probe.trace.empty() || g_probe.trace.back().pc != kLastInstruction) {
+        error = "the caller continuation was not the last executed instruction";
+        return false;
+    }
+    if (!caller_branch || !caller_branch->branch_valid || !caller_branch->branch_taken) {
+        error = "caller JNZ was not taken";
         return false;
     }
     if (g_probe.direct_calls != 1) {
@@ -843,8 +859,13 @@ bool VerifySyntheticPostconditions(std::string& error) {
     }
     uint32_t handle = 0;
     if (mem::Read(g_kernel255_args[0], &handle, sizeof(handle)) != mem::AccessStatus::kOk || !handle ||
-        g_probe.stop.eax != handle) {
-        error = "the helper did not return the published thread handle";
+        g_probe.stop.eax != handle || g_probe.stop.edi != handle || g_probe.stop.esi != 0) {
+        error = "the caller did not carry the published thread handle";
+        return false;
+    }
+    uint32_t pushed = 0;
+    if (mem::Read(g_probe.stop.esp, &pushed, sizeof(pushed)) != mem::AccessStatus::kOk || pushed != handle) {
+        error = "the caller did not push the published thread handle";
         return false;
     }
     unsigned handle_reads = 0;
@@ -913,6 +934,11 @@ int RunChild(const std::string& scenario) {
         options.allow_kernel_call = true;
         options.require_kernel_success = true;
         options.revoke_ret_stack = true;
+    } else if (scenario == "caller-not-taken") {
+        // a zero published handle sends the reviewed JNZ down its forbidden arm
+        options.allow_kernel_call = true;
+        options.require_kernel_success = true;
+        g_kernel_bridge_mode = KernelBridgeMode::kZeroHandle;
     } else if (scenario == "import-read") {
         mode = Mode::kImportProbe;
     } else if (scenario == "import-second-read") {
@@ -1148,8 +1174,12 @@ bool StaticValidateReal(const std::string& path, std::string& report) {
 
     const RouteStep* stop_step = FindStep(kStopBefore);
     const RouteStep* ret_step = FindStep(kRetInstruction);
-    if (!stop_step || stop_step->kind != StepKind::kStop || !ret_step || ret_step->next != kStopBefore) {
-        report += "\nRET boundary is not the reviewed pre-instruction stop";
+    const RouteStep* caller_step = FindStep(kCallerBranch);
+    const RouteStep* close_step = FindStep(kCloseCall);
+    if (!stop_step || stop_step->kind != StepKind::kStop || !ret_step || ret_step->next != kRetTarget ||
+        !caller_step || caller_step->kind != StepKind::kConditional || caller_step->next != kCallerOffPath ||
+        caller_step->alternate != kCallerContinuation || !close_step || close_step->pc != kStopBefore) {
+        report += "\nthe caller boundary is not the reviewed pre-instruction stop";
         return false;
     }
     uint32_t import = 0;
@@ -1265,8 +1295,9 @@ int main(int argc, char** argv) {
 
     const Case cases[] = {
         {"guards", true, "RESULT ok guards=1", 5000, false},
-        {"taken", true, "RESULT ok instructions=56", 5000, false},
-        {"not-taken", true, "RESULT ok instructions=57", 5000, false},
+        {"taken", true, "RESULT ok instructions=60", 5000, false},
+        {"not-taken", true, "RESULT ok instructions=61", 5000, false},
+        {"caller-not-taken", false, "unreviewed control flow", 5000, false},
         {"entry-not-executable", false, "entry page is not executable", 5000, false},
         {"helper-not-executable", false, "direct call target page is not executable", 5000, false},
         {"call-target-not-permitted", false, "direct call target is not permitted", 5000, false},
@@ -1291,7 +1322,7 @@ int main(int argc, char** argv) {
         {"import-failure-path", false, "unreviewed control flow", 5000, false},
         {"ret-bad-address", false, "invalid guest return address", 5000, false},
         {"ret-stack-denied", false, "guest memory fault", 5000, false},
-        {"post-import-entry", false, "start PC is not in the reviewed route", 5000, false},
+        {"post-import-entry", false, "start PC is not a generated function entry", 5000, false},
         {"re-entry", false, "re-entry during a step", 5000, false},
         {"parent-timeout", false, "", 800, true},
     };
@@ -1337,10 +1368,10 @@ int main(int argc, char** argv) {
     // the success path prepares and cancels an inactive thread and stops after the import call
     const ChildResult success = SpawnChild(self, "taken", std::chrono::milliseconds(5000));
     Check(success.output.find("CANCEL prepared=1 cancelled=1 output_cleared=1 stack_freed=1") != std::string::npos &&
-              success.output.find("STOP 002B396F") != std::string::npos &&
+              success.output.find("STOP 002B3980") != std::string::npos &&
               success.output.find("kernel_calls=1 import_reads=1") != std::string::npos &&
               success.output.find("frame=clear") != std::string::npos,
-          "successful probe returns through RET 0x18, stops at the caller boundary, and cancels the thread");
+          "successful probe returns through RET 0x18, checks the handle, stops before NtClose, and cancels the thread");
 
     std::printf("execution probe: %s\n", failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;

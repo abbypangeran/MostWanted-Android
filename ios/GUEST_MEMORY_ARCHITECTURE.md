@@ -270,3 +270,9 @@ Memory policy changes are deliberately narrow:
 - The ordinal-255 bridge prepares an inactive guest thread through `PrepareSystemThreadEx`; it never starts a worker. Cancellation must return `mem::Query()` to the pre-run baseline and free the prepared stack/system blocks.
 
 Synthetic fixtures additionally exercise the denied cases: unpatched ordinal encoding, wrong ordinal, wrong export name, uncommitted argument span, return PC outside generated code, wrong cleanup, modified return address, injected preparation failure, a start-thread attempt, a second import read, and entry at `002B5CE6`. All fail closed and tear down at zero resources. No real instruction beyond `002B5CE0` has run.
+
+## Phase 2C-19..2C-24 ordinal-255 and caller continuation
+
+The real-image route now runs through the authentic `RET 0x18` and stops at the caller's `call 0x002B2759` (`002B3980`) before any `NtClose` service. Memory policy is unchanged from Phase 2C-18: the image is R, `.text` RX, `.data` RW, the import page `003C9000` is read-only, and the only runtime import-page access remains the single 4-byte operand read at `002B5CE0/003C9E68`. The caller segment adds one 4-byte stack write (`push edi` at `002B397F`) inside the owned 64 KB guest stack; no page, span or permission is added, and the `NtClose` slot `003C9D4C = 800000BB` is only decoded during static preflight. The mandatory stop is a pre-instruction hook, so the `002B2759` call and its import slot are never read at runtime.
+
+The generated real mapping contains five functions: the reviewed entry and helper, the forbidden debug arm, and one-instruction trap-only stubs at `002B55EE` (zero-handle arm) and `002B2759` (`NtClose` wrapper). Their bodies end in `x86_checked_trap`, so an unexpected entry fails closed before any unreviewed instruction runs. Synthetic Debug/Release and real preflight/self-test pass with zero retained resources; no real instruction beyond `002B5D12` has run.

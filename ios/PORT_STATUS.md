@@ -1744,3 +1744,48 @@ Expected: 50 instructions, one direct call, one import operand read, entry `JNB`
 
 - `ORDINAL_255_BOUNDARY`: **READY** — route, mapping, arguments and bridge are validated without game execution.
 - `REAL_EXECUTION`: **GO only for one additional bounded run** with the command above, after explicit approval. **NO-GO** for `002B5CE6`, `002B38A2`, `002B5C0F`, `StartThread`, any other import, callbacks, workers or boot.
+
+## Phase 2C-19..2C-23 real-XBE ordinal-255 and helper return
+
+Baseline `395fed69484087e50aa0f1bc08629735b490d1a7` (Phase 2C-19). Each run below was one supervised Release probe against the authentic image, with evidence under `.local/ios-port/phase2c19-evidence/`, `phase2c21-evidence/` and `phase2c23-evidence/`. These are real Xbox guest instructions on macOS, not an iOS game boot.
+
+| Phase | Guest instructions | First / last executed | Branches | Result |
+| --- | --- | --- | --- | --- |
+| 2C-19 | 50 | `002B3916` / `002B5CE0` | entry `JNB` taken, helper `JNZ` not taken, post-import `JNL` taken | ordinal-255 `PsCreateSystemThreadEx` call; one import read; inactive thread prepared, never started; import restored; exit 0 |
+| 2C-21 | 55 | `002B3916` / `002B5D11` | same, plus post-import `JNL` taken | helper success arm; `ESP=D001FFCC`, `[ESP]=002B396F`; thread cancelled; exit 0 |
+| 2C-23 | 56 | `002B3916` / `002B5D12` | same | `RET 0x18` executed to `002B396F`; boundary stop unexecuted; `EAX=00001000`, `EDI=0`, `ESP=D001FFE8`, `EBP=0`, checked frame clear; import restored; exit 0 |
+
+The Phase 2C-17 trace-label note stands: `STEP` lines are pre-instruction state, so the value produced by an instruction first appears on the next line.
+
+## Phase 2C-24 caller continuation extension
+
+Baseline `e80d99d3a3df8e936b40e5a653ebad7ba064739d` on `feature/ios-port`. **No real XBE instruction ran in this phase.**
+
+The reviewed route grows from 59 to 66 entries. After the helper's `RET 0x18` returns to `002B396F`, the caller moves the published handle to `EDI`, compares it with zero, and, when it is non-zero, pushes it and calls `002B2759`:
+
+```
+002B396F  mov edi, eax
+002B3971  cmp edi, esi
+002B3973  jnz 002B397F
+002B3975  push esi / push 1 / push 1 / call 002B55EE   zero-handle arm, forbidden
+002B397F  push edi
+002B3980  call 002B2759                                mandatory pre-instruction stop
+```
+
+`002B2759` is the `NtClose` wrapper: `002B275D call [003C9D4C]`, and the authentic slot is `800000BB` (ordinal 187, `NtClose`). That is the first unreviewed kernel service, so it is the new boundary and is never read or executed. The zero-handle arm and the off-path callee `002B55EE` are forbidden, trap-only boundary functions.
+
+| Check | Result |
+| --- | --- |
+| Reviewed route | **66/66** instructions; 191 bytes; FNV-1a `0x543CADDFE334635C` |
+| Identity | SHA-1 `f636a16af04171089f879a4bed646e185c734233`, title `4541007B`, entry `002B3916`, base `00010000` |
+| Generated mapping | 5 functions (entry, helper, debug boundary, `NtClose` stub, off-path stub), 0 continuations, 66 `ProbeStep` hooks |
+| Direct calls in generated source | exactly `002B5CA7`, `002B55EE` (off-path stub) and `002B2759` (trap-only stub) |
+| Import call | still exactly one, `x86_checked_indirect_call(..., 0x3C9E68u, 0x2B5CE6u, 0x2B5CE0u)` |
+| Stop ordering | `ProbeStep_0x002B3980` precedes the `002B2759` call; the following PC has only a trap |
+| Expected run | 60 guest instructions, 1 direct call, 1 ordinal-255 call, stop before `002B3980` |
+
+Expected authentic post-stop state: `EAX=EDI=00001000`, `ESI=EBP=ECX=0`, `ESP=D001FFE4`, `[ESP]=00001000`; counter `[004EDC74]=00000094`, result `[004DF78C]=FFFFFFDB`; inactive prepared thread cancelled, handle cleared, import restored to `800000FF` read-only, zero retained resources.
+
+Focused validation passed: synthetic Debug/Release suites (including the new `caller-not-taken` zero-handle rejection), real preflight and self-test in Debug and Release (66/66 route, 5 functions, 66 hooks, ordinal-187 slot, import restore, zero teardown). No shared runtime, Apple guard or generated game source changed; iOS and Android were not rebuilt.
+
+Decision: **GO for one bounded real run of the extended caller segment**, **NO-GO** for `002B3980`, `NtClose`, `002B55EE`, `StartThread`, callbacks, workers or production `Boot()`.
