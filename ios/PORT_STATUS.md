@@ -2007,3 +2007,115 @@ That mode does not exist yet and must stop before `002B5C16`; it must not run `0
 4. Only then consider one kernel worker: `StartThread` on a single prepared thread, `InitContext`, callback tickets, exception handling, worker stop token, `PsTerminateSystemThread`/`ExitThread`, join and complete rollback. Acceptance requires one worker launch, one system-routine entry, no production `Boot()`, no concurrent guest execution, and zero retained resources.
 
 No graphics, audio, networking, general kernel expansion or production Apple guard changes are part of this plan.
+
+## Phase 2C-32 authentic secondary-thread SEH and TLS boundary
+
+Baseline `aa31737fb46118cbf7e3e5219057f4a6da8d8e4f` on `feature/ios-port`. **No authentic XBE instruction ran in this phase.** The phase extends the separate synthetic secondary fixture only; the Phase 2C-30 root route and its generated mapping are unchanged.
+
+### Complete `00319804` decode
+
+```text
+00319804  push 0x319858              stored exception-handler address
+00319809  mov eax, fs:[0]            previous exception list (KPCR+0)
+0031980F  push eax                   save previous list
+00319810  mov eax, [esp+0x10]        scope-table size (the caller's 0x18 push)
+00319814  mov [esp+0x10], ebp        replace the size slot with the caller's EBP
+00319818  lea ebp, [esp+0x10]        EBP = S-4 after the call frame
+0031981C  sub esp, eax              allocate 0x18 bytes
+0031981E  push ebx
+0031981F  push esi
+00319820  push edi
+00319821  mov eax, [ebp-8]           caller return address
+00319824  mov [ebp-0x18], esp        saved post-prolog ESP
+00319827  push eax                   return address for the RET below
+00319828  mov eax, [ebp-4]           scope table (0x3ED5B8)
+0031982B  mov [ebp-4], -1            initial scope flag
+00319832  mov [ebp-8], eax           scope table in the -8 slot
+00319835  lea eax, [ebp-0x10]        new registration address
+00319838  mov fs:[0], eax            install the SEH registration
+0031983E  ret                         returns to 002B5C1B
+```
+
+`00319858` is strictly the handler address stored in the registration record. The helper never calls or jumps to it; the normal RET reads `002B5C1B` from the slot pushed at `00319827`. The handler is not mapped as a generated function, and the probe verifies that resolution is not executable.
+
+### SEH stack and return contract
+
+With `S` the system-routine entry ESP (the callback frame pointer):
+
+| Address | Value / role |
+| --- | --- |
+| `S-0x04` | saved caller EBP (0) |
+| `S-0x08` | scope flag, `-1` then `0` after `002B5C1B` |
+| `S-0x0C` | scope table `003ED5B8` |
+| `S-0x10` | exception handler `00319858` |
+| `S-0x14` | previous `fs:[0]` (`FFFFFFFF`) and the new registration address |
+| `S-0x18` | helper local (`ebp-0x14`, not written on this path) |
+| `S-0x1C` | saved post-prolog ESP (`S-0x38`) |
+| `S-0x20` | helper local (`ebp-0x1C`, not written on this path) |
+| `S-0x24` | ETHREAD pointer |
+| `S-0x28` | TLS+4 |
+| `S-0x2C` | copy length |
+| `S-0x30` | saved EBX |
+| `S-0x34` | saved ESI |
+| `S-0x38` | saved EDI and post-prolog ESP |
+| `S-0x3C` | return address while the helper RET executes; overwritten by `push 1` later |
+
+After the helper returns: `EBP = S-4`, `ESP = S-0x38`, `fs:[0] = S-0x14`, and the body continues at `002B5C1B`. The helper's `ret` is a plain one-byte RET; `x86_checked_call` already expects `002B5C1B` and `x86_checked_ret` validates that slot and pops one word. The non-standard post-prolog ESP is authentic and the body is EBP-relative, so no new checked mechanism was needed. `00319858` is never dispatched, and the SEH epilog `002B5BD3` is not reached in this segment.
+
+### FS, KPCR and registration validation
+
+The prepared thread's `fs_base` is the KPCR (`B0000000` in the observed run). Before execution the probe verifies `fs:[0] = FFFFFFFF`, `KPCR+0x28 = ETHREAD`, `ETHREAD+0x28 = TLS`, and the production stack/TLS/id fields. During the run the only KPCR write is `fs:[0] = S-0x14` at `00319838`; the only ETHREAD access is the 4-byte TLS pointer read at `002B5C28`. The snapshot check requires the KPCR page to change at offset 0 only, and the rdata, source and data pages to remain unchanged. The registration record, saved ESP, saved EBP, saved EBX/ESI/EDI, scope table and scope flag are checked after the stop. No exception-handler instruction executes.
+
+### Implemented synthetic route
+
+| Item | Value |
+| --- | --- |
+| Route | 54 reviewed PCs in execution order |
+| Route bytes/hash | 167 bytes, FNV-1a `0xEF9505E0CE8AE719` |
+| Executed | **53** instructions on the zero-fill fallthrough, **45** when `jz` skips the fill block |
+| Stop | `002B5C76` pre-instruction, before `call 002B597D` |
+| Direct calls executed | 1 (`002B5C16` to `00319804`) |
+| Encoded calls | 3 (`00319804`, `002B58B8` in the start-routine trap, `002B597D` after the stop); only the first executes |
+| Trap-only | `002B38A2`, `002B58B8`, `002B597D`; handler `00319858` not executable |
+| Mapping | 5 generated functions, 0 continuations, 57 hooks, 1 checked RET |
+
+Observed authentic-style result (`prepare`, copy 0, zero-fill 0x90): `EBP=D002FF40`, `ESP=D002FF08`, `EDX=00000090`, `EDI=D0030000`, `[ESP]=1`, registration `D002FF30`, handler `00319858`, scope `003ED5B8`. Guest-memory changes were 47 and memory operations 67. The synthetic copy case (`0x12` copied, `0x7E` zero-filled) reports `copy=18 zero=126` and verifies the copied pattern and the zero tail; the skipped-fill case reports 45 instructions and leaves the pre-filled TLS bytes untouched.
+
+### TLS memory contract
+
+The authentic image's static globals are `[003ED3EC]=00000000`, `[003ED3F0]=00000000`, `[003ED3FC]=00000090`: copy length 0, zero-fill 0x90. `ETHREAD+0x28` is the TLS base; `[TLS]` is set to `TLS+4`; the zero-fill covers `TLS+4..TLS+0x94`, exactly the prepared TLS block. The synthetic copy scenario additionally uses a reviewed source page at `00020000`, copy length `0x12` and zero-fill `0x7E`. The observer admits only the three TLS-global reads, the ETHREAD TLS-pointer read, the reviewed TLS/source writes, and the ordinary stack below TLS. Source/destination overlap, destination overflow and uncommitted source are rejected. No TLS read is admitted in this segment.
+
+### Tests and static preflight
+
+Debug and Release: 27 isolated secondary scenarios pass, including the SEH registration and saved-state checks, modified helper return, bad FS base, read-only and uncommitted KPCR, TLS copy/zero-fill, copy/zero-fill corruption, bad TLS pointer, overflow, overlap, uncommitted source, trap entries, handler resolution, budget, deadline, external timeout, cancellation and zero-resource teardown. The synthetic aggregate validates the 53-instruction and 45-instruction paths. The existing 46-scenario root probe and the 72-instruction root-return tests still pass; ctest is 6/6 in Debug and Release.
+
+Real static preflight passes: `route=54/167 hash=EF9505E0CE8AE719`, `system=002B5C0F`, `seh=00319804`, `ret=002B5C1B`, `handler=00319858`, `tls_src=00000000`, `tls_end=00000000`, `zero=00000090`, `copy=0`, `tls_bytes=148`, `stop=002B5C76`. No guest instruction executed.
+
+### Real-image integration plan (not implemented)
+
+A separate supervised real-XBE secondary-entry mode is needed; the current real probe still runs only the root route. The mode must create and retain a fresh thread in its own run:
+
+1. **Standalone first.** Prepare the real image, prepare a fresh thread with the authentic arguments, validate the real KPCR/ETHREAD/TLS context, create a real callback ticket, enter `002B5C0F`, run the 54 reviewed PCs to `002B5C76`, validate the SEH/TLS results, then cancel the thread and restore the import slots.
+2. **Integrated second.** In one supervised run, execute the validated root sequence with the ordinal-255 prepared thread **retained** (do not cancel it), restore the two import slots, then enter the secondary segment on that same thread. This consumes the real root-produced thread, KPCR, ETHREAD, TLS and stack. Do not reuse the cancelled Phase 2C-30 `ThreadRef`; the retained thread must be fresh in that run.
+3. Keep the root route's 78-entry table and generated mapping unchanged. Use a separate secondary real config/mapping, or a combined mode that installs both mappings only for that run.
+4. Preflight must print the real prepared base ESP, the expected stop ESP/EBP relative to it, the KPCR/ETHREAD/TLS addresses, and the authentic TLS globals. The stop remains `002B5C76`; `002B597D`, the start routine, the handler, `StartThread` and production `Boot()` remain forbidden.
+
+Proposed first command, not run and not implemented:
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_real_preflight \
+  --run-once --execute-real --secondary-entry
+```
+
+### Remaining CPU/SEH/memory issues
+
+- `002B597D` and the rest of the system routine (`002B5C7B` onward) remain unreviewed; the dynamic `call [ebp+8]` must become a checked start-routine callback.
+- The SEH epilog `002B5BD3`, exception delivery and the handler `00319858` are not executed or validated beyond the stored registration.
+- `PsTerminateSystemThread` (`003C9E64`) and the start-routine path remain outside the reviewed segment.
+- No worker, `StartThread`, callback execution or production `Boot()` is enabled.
+
+### Decision
+
+**NO-GO for one authentic secondary-thread run now.** The synthetic SEH/TLS segment is complete, but the real secondary-entry mode and its preflight do not exist yet. **GO for the scoped Phase 2C-33 implementation** of the standalone real secondary-entry mode (fresh thread, 54-PC route, stop `002B5C76`), followed by the integrated root-retained-thread mode. Execution still requires separate approval.
+
+The shortest path to controlled single-worker activation is: validate `002B597D` and the system routine's remaining body; turn the dynamic start call into a checked `kThreadStart` callback; then activate one `StartThread` worker with the prepared FS/KPCR/ETHREAD/TLS context and a complete join/cancel path.
