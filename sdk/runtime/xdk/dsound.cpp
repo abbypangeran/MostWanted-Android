@@ -132,7 +132,7 @@ std::deque<Done> g_done;
 std::condition_variable_any g_done_cv;
 thread_local std::vector<Done> t_flushed;  // run by the STREAM call that flushed them, once g_lock is let go
 std::atomic<int64_t> g_pumped{0};          // the last DirectSoundDoWork, steady ms
-bool g_started = false;
+std::atomic<bool> g_started{false};
 uint32_t g_ds = 0;
 
 float Db(int32_t hundredths) { return hundredths <= -10000 ? 0.0f : std::pow(10.0f, hundredths / 2000.0f); }
@@ -347,24 +347,31 @@ void Run(X86Context& ctx, const std::vector<Done>& done) {
 }
 
 void Start() {
-    if (g_started) return;
-    g_started = true;
+    bool expected = false;
+    if (!g_started.compare_exchange_strong(expected, true)) return;
     audio::StartOutput(Render);
     // for a title that never calls DirectSoundDoWork: its callbacks come from here instead
-    StartHostThread("dsound", [](X86Context& ctx) {
+    if (!StartManagedHostThread("dsound", [](X86Context& ctx, WorkerStopToken stop) {
+        struct ResetStarted {
+            ~ResetStarted() { g_started = false; }
+        } reset_started;
         constexpr int64_t kPumpMs = 250;
-        for (;;) {
+        WorkerStopCallback wake(stop, [] { g_done_cv.notify_all(); });
+        if (!wake.Ready()) return;
+        while (!stop.StopRequested()) {
             std::vector<Done> done;
             {
                 std::unique_lock<std::recursive_mutex> lock(g_lock);
-                g_done_cv.wait_for(lock, std::chrono::milliseconds(50));
+                g_done_cv.wait_for(lock, std::chrono::milliseconds(50), [&] { return stop.StopRequested(); });
+                if (stop.StopRequested()) return;
                 if (NowMs() - g_pumped < kPumpMs) continue;
                 done.assign(g_done.begin(), g_done.end());
                 g_done.clear();
             }
             Run(ctx, done);
         }
-    });
+    }, 64u << 20))
+        g_started.store(false);
 }
 
 // WAVEFORMATEX

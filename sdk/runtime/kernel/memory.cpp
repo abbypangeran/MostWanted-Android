@@ -6,8 +6,10 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -26,6 +28,10 @@ namespace mem {
 
 static uint8_t* g_base = nullptr;
 static bool g_poisoned = false;
+static uint64_t g_generation = 0;
+static std::mutex g_guest_thread_owners_lock;
+static std::map<GuestThreadOwner, std::function<bool()>> g_guest_thread_owners;
+static GuestThreadOwner g_next_guest_thread_owner = 1;
 // Page mutations mark and wait without g_lock so leased users can publish through checked memory access.
 static std::recursive_mutex g_lock;
 static std::recursive_mutex g_virtual_ranges_lock;
@@ -110,6 +116,52 @@ bool IsInitialized() {
     return g_base != nullptr && !g_poisoned;
 }
 
+uint64_t Generation() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    return g_base ? g_generation : 0;
+}
+
+GuestThreadOwner RegisterGuestThreadOwner(std::function<bool()> finalize) {
+    if (!finalize) return 0;
+    std::lock_guard lock(g_guest_thread_owners_lock);
+    const GuestThreadOwner owner = g_next_guest_thread_owner++;
+    try {
+        g_guest_thread_owners.emplace(owner, std::move(finalize));
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+    return owner;
+}
+
+void UnregisterGuestThreadOwner(GuestThreadOwner owner) {
+    if (!owner) return;
+    std::lock_guard lock(g_guest_thread_owners_lock);
+    g_guest_thread_owners.erase(owner);
+}
+
+static bool FinalizeGuestThreadOwners() {
+    std::vector<std::function<bool()>> finalizers;
+    {
+        std::lock_guard lock(g_guest_thread_owners_lock);
+        try {
+            finalizers.reserve(g_guest_thread_owners.size());
+            for (const auto& [owner, finalize] : g_guest_thread_owners) finalizers.push_back(finalize);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+    }
+    bool finalized = true;
+    for (const auto& finalize : finalizers) {
+        try {
+            finalized = finalize() && finalized;
+        } catch (...) {
+            finalized = false;
+        }
+    }
+    std::lock_guard lock(g_guest_thread_owners_lock);
+    return finalized && g_guest_thread_owners.empty();
+}
+
 // physical memory shows at 0x80000000 and again at 0xF0000000 (write combined view)
 static bool InPhysical(uint32_t va) {
     return (va >= kContiguousBase && va < kContiguousBase + kPhysicalSize) ||
@@ -128,6 +180,7 @@ static bool IsPhysicalRange(uint64_t start, uint64_t end) {
 
 bool Init() {
     kernel::KernelMemoryLifecycle lifecycle;
+    std::lock_guard<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_base) {
         return lifecycle.SetReady(!g_poisoned);
@@ -205,6 +258,7 @@ bool Init() {
         LOGE("memory: could not reserve the 4 GB guest space");
         return false;
     }
+    ++g_generation;
     if (!lifecycle.SetReady(true)) return false;
     LOGI("memory: guest space at %p", static_cast<void*>(g_base));
     return true;
@@ -672,6 +726,10 @@ void Shutdown() {
         return;
     }
     std::lock_guard<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock);
+    if (!FinalizeGuestThreadOwners()) {
+        LOGE("memory: guest thread resources could not be finalized; guest memory remains mapped");
+        return;
+    }
     ScopedPageMutation mutation(0, kGuestPageCount);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (!g_base) return;
@@ -925,9 +983,9 @@ uint32_t AllocSystem(uint32_t size, uint32_t align) {
     return a;
 }
 
-void FreeSystem(uint32_t va) {
+bool FreeSystem(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    g_system.Free(va);
+    return g_system.Free(va);
 }
 
 uint32_t AllocStack(uint32_t size) {
@@ -946,20 +1004,22 @@ uint32_t AllocStack(uint32_t size) {
     return a + 0x10000 + size;
 }
 
-void FreeStack(uint32_t top) {
+bool FreeStack(uint32_t top) {
     std::lock_guard<std::recursive_mutex> ranges_lock(g_virtual_ranges_lock);
     uint32_t start, size;
     {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
         auto it = g_stack_tops.find(top);
-        if (it == g_stack_tops.end()) return;
+        if (it == g_stack_tops.end()) return false;
         start = it->second;
         size = g_stacks.SizeOf(start);
     }
-    if (!size || !Decommit(start, size)) return;
+    if (!size || !Decommit(start, size)) return false;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     auto it = g_stack_tops.find(top);
-    if (it != g_stack_tops.end() && it->second == start && g_stacks.Free(start)) g_stack_tops.erase(it);
+    if (it == g_stack_tops.end() || it->second != start || !g_stacks.Free(start)) return false;
+    g_stack_tops.erase(it);
+    return true;
 }
 
 uint32_t AllocationSize(uint32_t va) {

@@ -6,6 +6,13 @@
 
 #include "core/log.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 namespace kernel {
 
 struct WorkerStopToken::State {
@@ -84,8 +91,87 @@ WorkerStopCallback::~WorkerStopCallback() {
 
 struct WorkerLifecycle::Worker {
     std::thread thread;
+#ifdef _WIN32
+    HANDLE native_thread = nullptr;
+#else
+    pthread_t native_thread{};
+    bool native_thread_joinable = false;
+#endif
     std::shared_ptr<WorkerStopToken::State> stop = std::make_shared<WorkerStopToken::State>();
     std::atomic<State> state{State::kPrepared};
+
+#ifdef _WIN32
+    static DWORD WINAPI RunNative(void* raw) {
+        std::unique_ptr<std::function<void()>> owned(static_cast<std::function<void()>*>(raw));
+        (*owned)();
+        return 0;
+    }
+#else
+    static void* RunNative(void* raw) {
+        std::unique_ptr<std::function<void()>> owned(static_cast<std::function<void()>*>(raw));
+        (*owned)();
+        return nullptr;
+    }
+#endif
+
+    bool Start(std::function<void()> task, std::size_t stack_size) {
+        if (!stack_size) {
+            thread = std::thread(std::move(task));
+            return true;
+        }
+        std::unique_ptr<std::function<void()>> context;
+        try {
+            context = std::make_unique<std::function<void()>>(std::move(task));
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+#ifdef _WIN32
+        auto* raw = context.release();
+        native_thread = ::CreateThread(nullptr, stack_size, RunNative, raw, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (!native_thread) {
+            context.reset(raw);
+            return false;
+        }
+#else
+        pthread_attr_t attributes;
+        if (pthread_attr_init(&attributes)) return false;
+        const int configured = pthread_attr_setstacksize(&attributes, stack_size);
+        auto* raw = context.release();
+        const int result = configured ? configured : pthread_create(&native_thread, &attributes, RunNative, raw);
+        pthread_attr_destroy(&attributes);
+        if (result) {
+            context.reset(raw);
+            return false;
+        }
+        native_thread_joinable = true;
+#endif
+        return true;
+    }
+
+    bool IsCurrentThread() const {
+        if (thread.joinable() && thread.get_id() == std::this_thread::get_id()) return true;
+#ifdef _WIN32
+        return native_thread && ::GetThreadId(native_thread) == ::GetCurrentThreadId();
+#else
+        return native_thread_joinable && pthread_equal(native_thread, pthread_self());
+#endif
+    }
+
+    void Join() {
+        if (thread.joinable()) thread.join();
+#ifdef _WIN32
+        if (native_thread) {
+            ::WaitForSingleObject(native_thread, INFINITE);
+            ::CloseHandle(native_thread);
+            native_thread = nullptr;
+        }
+#else
+        if (native_thread_joinable) {
+            pthread_join(native_thread, nullptr);
+            native_thread_joinable = false;
+        }
+#endif
+    }
 };
 
 WorkerLifecycle::WorkerLifecycle(bool accepting) : accepting_(accepting) {}
@@ -94,18 +180,18 @@ WorkerLifecycle::~WorkerLifecycle() {
     if (!StopAndJoin()) std::terminate();
 }
 
-bool WorkerLifecycle::Start(Task task) {
+bool WorkerLifecycle::Start(Task task, std::size_t stack_size) {
     if (!task) return false;
     const bool owned_thread = CurrentThreadOwnsWorker();
     std::unique_lock<std::mutex> joining(join_lock_, std::defer_lock);
+    // Callers can hold locks that a worker needs to finish while shutdown owns join_lock_.
+    const bool owns_join_lock = !owned_thread && joining.try_lock();
+    const bool may_reap = owned_thread || owns_join_lock;
     std::vector<Worker*> finished;
-    if (!owned_thread) {
-        joining.lock();
-    }
-    {
+    if (may_reap) {
         std::unique_lock lock(lock_);
         if (!accepting_.load()) return false;
-        if (!owned_thread)
+        if (owns_join_lock)
             changed_.wait(lock, [this] {
                 return std::none_of(workers_.begin(), workers_.end(), [](const auto& worker) {
                     return worker->state.load() == State::kJoining;
@@ -126,9 +212,7 @@ bool WorkerLifecycle::Start(Task task) {
             }
         }
     }
-    for (Worker* worker : finished) {
-        if (worker->thread.joinable()) worker->thread.join();
-    }
+    for (Worker* worker : finished) worker->Join();
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
     if (!finished.empty()) {
         std::unique_lock test_lock(reap_test_lock_);
@@ -161,7 +245,7 @@ bool WorkerLifecycle::Start(Task task) {
         Worker* raw = worker.get();
         workers_.push_back(std::move(worker));
         try {
-            raw->thread = std::thread([this, raw, task = std::move(task)]() mutable {
+            const bool started = raw->Start([this, raw, task = std::move(task)]() mutable {
                 struct QuiesceOnExit {
                     Worker& worker;
                     ~QuiesceOnExit() { worker.state.store(State::kQuiescing); }
@@ -178,7 +262,11 @@ bool WorkerLifecycle::Start(Task task) {
                 State expected = State::kPrepared;
                 raw->state.compare_exchange_strong(expected, State::kRunning);
                 task(WorkerStopToken(raw->stop));
-            });
+            }, stack_size);
+            if (!started) {
+                workers_.pop_back();
+                return false;
+            }
         } catch (...) {
             workers_.pop_back();
             return false;
@@ -215,6 +303,7 @@ bool WorkerLifecycle::Join() {
         std::unique_lock lock(lock_);
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
         ++join_waiters_for_test_;
+        changed_.notify_all();
 #endif
         changed_.wait(lock, [this] {
             return std::none_of(workers_.begin(), workers_.end(), [](const auto& worker) {
@@ -223,6 +312,7 @@ bool WorkerLifecycle::Join() {
         });
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
         --join_waiters_for_test_;
+        changed_.notify_all();
 #endif
         try {
             workers.reserve(workers_.size());
@@ -230,15 +320,23 @@ bool WorkerLifecycle::Join() {
         } catch (const std::bad_alloc&) {
             return false;
         }
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+        joining_workers_for_test_ = true;
+        changed_.notify_all();
+#endif
     }
     for (Worker* worker : workers) {
-        if (worker->thread.joinable()) worker->thread.join();
+        worker->Join();
         worker->state.store(State::kJoined);
         worker->state.store(State::kResourcesReleased);
     }
     {
         std::lock_guard lock(lock_);
         workers_.clear();
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+        joining_workers_for_test_ = false;
+        changed_.notify_all();
+#endif
     }
     return true;
 }
@@ -261,7 +359,7 @@ bool WorkerLifecycle::Accepting() const { return accepting_.load(); }
 bool WorkerLifecycle::CurrentThreadOwnsWorker() const {
     std::lock_guard lock(lock_);
     for (const auto& worker : workers_)
-        if (worker->thread.joinable() && worker->thread.get_id() == std::this_thread::get_id()) return true;
+        if (worker->IsCurrentThread()) return true;
     return false;
 }
 
@@ -310,6 +408,11 @@ std::size_t WorkerLifecycle::JoinWaiterCountForTest() const {
     std::lock_guard lock(lock_);
     return join_waiters_for_test_;
 }
+
+bool WorkerLifecycle::WaitForJoinInProgressForTest(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(lock_);
+    return changed_.wait_for(lock, timeout, [this] { return joining_workers_for_test_; });
+}
 #endif
 
 namespace {
@@ -318,7 +421,9 @@ std::shared_mutex g_guest_dispatch_gate;
 thread_local uint32_t g_guest_dispatch_depth = 0;
 }
 
-bool StartKernelWorker(WorkerLifecycle::Task task) { return g_kernel_workers.Start(std::move(task)); }
+bool StartKernelWorker(WorkerLifecycle::Task task, std::size_t stack_size) {
+    return g_kernel_workers.Start(std::move(task), stack_size);
+}
 
 bool StopKernelWorkers() {
     g_kernel_workers.BeginShutdown();
@@ -331,7 +436,7 @@ bool StopKernelWorkers() {
 
 bool RestartKernelWorkers() { return g_kernel_workers.StartAccepting(); }
 bool KernelWorkersAccepting() { return g_kernel_workers.Accepting(); }
-#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+#if defined(MOSTWANTED_EXECUTION_PROBE_TESTS) || defined(MOSTWANTED_KERNEL_WORKER_TESTS)
 std::size_t KernelWorkerCountForTest() { return g_kernel_workers.OwnedCount(); }
 #endif
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS

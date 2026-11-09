@@ -13,6 +13,10 @@
 #include <string>
 #include <thread>
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
+
 #include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
@@ -523,6 +527,325 @@ void CheckGuestCallbackContract() {
     memory_shutdown.join();
     Check(memory_shutdown_done.load() && active_status.load() == kernel::GuestCallbackStatus::kInvoked,
           "memory teardown starts only after active synthetic callback exits");
+}
+
+void CheckGuestThreadLifecycle() {
+    constexpr uint32_t code_page = 0x90000;
+    constexpr uint32_t target = code_page + 0x10;
+    constexpr uint32_t output_page = 0xA5000;
+    static const X86FuncMapping functions[] = {{target, SyntheticGuestCallback}};
+    const dispatch::Metadata metadata{code_page, code_page + mem::kPage, target, functions, {}};
+    std::string error;
+    auto initialize = [&] {
+        const bool ready = mem::Init() && mem::Commit(code_page, mem::kPage) &&
+                           mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                           mem::Commit(output_page, mem::kPage) && dispatch::Init(metadata, error);
+        Check(ready, "thread lifecycle fixture memory and callback ticket mapping initialize");
+        return ready;
+    };
+    auto prepare = [&](kernel::ThreadRef& thread, uint32_t handle_out = output_page,
+                       uint32_t id_out = output_page + 4) {
+        const uint32_t status = kernel::PrepareSystemThreadEx(handle_out, 0x10000, 0x20, id_out, target, 0, false, 0,
+                                                              thread);
+        Check(status == kernel::kSuccess && thread, "production thread preparation retains one synthetic owner");
+        return status == kernel::kSuccess && bool(thread);
+    };
+    if (!initialize()) return;
+    const mem::Stats baseline = mem::Query();
+
+    kernel::ThreadRef registration_failure;
+    if (!prepare(registration_failure)) return;
+    kernel::SetThreadPreparationFailureForTest(kernel::ThreadPreparationFailPoint::kBeforeThreadRegistration);
+    const bool registration_started = kernel::StartThread(registration_failure);
+    Check(!registration_started && registration_failure->state.load() == kernel::ThreadState::kPrepared &&
+              !registration_failure->start_routine_ticket.target && !registration_failure->system_routine_ticket.target &&
+              kernel::Threads().empty() && kernel::KernelWorkerCountForTest() == 0,
+          "failed thread registration restores prepared state and clears both callback tickets");
+    const uint32_t registration_stack = registration_failure->stack_top;
+    Check(kernel::CancelPreparedThread(registration_failure) &&
+              !kernel::CancelPreparedThread(registration_failure) &&
+              mem::Query().system_used == baseline.system_used && !mem::IsCommitted(registration_stack - 1),
+          "prepared cancellation is exactly once and releases its stack and system allocations");
+
+    kernel::ThreadRef launch_failure;
+    if (!prepare(launch_failure)) return;
+    kernel::FailNextKernelWorkerStartForTest();
+    const bool launch_started = kernel::StartThread(launch_failure);
+    Check(!launch_started && launch_failure->state.load() == kernel::ThreadState::kPrepared &&
+              !launch_failure->start_routine_ticket.target && !launch_failure->system_routine_ticket.target &&
+              kernel::Threads().empty() && kernel::KernelWorkerCountForTest() == 0,
+          "failed worker launch rolls registration back without losing prepared ownership");
+    Check(kernel::CancelPreparedThread(launch_failure) && mem::Query().system_used == baseline.system_used,
+          "launch rollback remains cancellable and returns allocations to baseline");
+
+#if defined(__APPLE__)
+    std::size_t managed_stack_size = 0;
+    const bool stack_started = kernel::StartManagedHostThread(
+        "managed-stack-size-test", [&](X86Context&, kernel::WorkerStopToken) {
+            managed_stack_size = pthread_get_stacksize_np(pthread_self());
+        }, 64u << 20);
+    const bool stack_joined = kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+    Check(stack_started && stack_joined && managed_stack_size >= (64u << 20) &&
+              kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used,
+          "managed lifecycle preserves the reviewed 64 MiB stack for deep guest call chains");
+#endif
+
+    std::mutex termination_lock;
+    std::condition_variable termination_changed;
+    kernel::ThreadRef terminated_thread;
+    bool termination_entered = false;
+    bool termination_stop_requested = false;
+    std::atomic<bool> automatic_cleanup_ran{false};
+    std::atomic<bool> termination_stop_callback_ran{false};
+    struct CleanupProof {
+        std::atomic<bool>& ran;
+        ~CleanupProof() { ran.store(true); }
+    };
+    const bool termination_started = kernel::StartManagedHostThread(
+        "controlled-thread-exit-test", [&](X86Context&, kernel::WorkerStopToken stop) {
+            {
+                std::lock_guard lock(termination_lock);
+                terminated_thread = kernel::CurrentRef();
+                termination_entered = true;
+            }
+            termination_changed.notify_all();
+            kernel::WorkerStopCallback stop_callback(stop, [&] {
+                {
+                    std::lock_guard lock(termination_lock);
+                    termination_stop_requested = true;
+                }
+                termination_stop_callback_ran.store(true);
+                termination_changed.notify_all();
+            });
+            if (!stop_callback.Ready()) return;
+            CleanupProof proof{automatic_cleanup_ran};
+            {
+                std::unique_lock lock(termination_lock);
+                termination_changed.wait(lock, [&] { return termination_stop_requested; });
+            }
+            kernel::ExitThread(0x13579BDF);
+        });
+    bool termination_ready = false;
+    {
+        std::unique_lock lock(termination_lock);
+        termination_ready = termination_changed.wait_for(lock, std::chrono::seconds(5), [&] {
+            return termination_entered;
+        });
+    }
+    const bool termination_joined = kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+    const uint32_t termination_wait = termination_ready
+                                          ? kernel::Wait({std::static_pointer_cast<kernel::Object>(terminated_thread)},
+                                                         false, -100'000'000, false)
+                                          : kernel::kTimeout;
+    Check(termination_started && termination_ready && termination_stop_callback_ran.load() &&
+              termination_wait == kernel::kWait0 && termination_joined && automatic_cleanup_ran.load() &&
+              terminated_thread &&
+              terminated_thread->state.load() == kernel::ThreadState::kExited &&
+              terminated_thread->exit_code.load() == 0x13579BDF && terminated_thread->resources_released &&
+              !terminated_thread->stack_top && !terminated_thread->kpcr && !terminated_thread->ethread &&
+              mem::Query().system_used == baseline.system_used && kernel::KernelWorkerCountForTest() == 0,
+          "managed ExitThread unwinds C++ scopes, preserves exit code, finalizes resources, and joins");
+
+    kernel::ThreadRef duplicate_exit_thread;
+    bool second_exit_caught = false;
+    const bool duplicate_exit_started = kernel::StartManagedHostThread(
+        "duplicate-thread-exit-test", [&](X86Context&, kernel::WorkerStopToken) {
+            duplicate_exit_thread = kernel::CurrentRef();
+            try {
+                kernel::ExitThread(0x2468ACE0);
+            } catch (...) {
+            }
+            try {
+                kernel::ExitThread(0xFFFFFFFF);
+            } catch (...) {
+                second_exit_caught = true;
+            }
+        });
+    const bool duplicate_exit_joined = kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+    Check(duplicate_exit_started && duplicate_exit_joined && second_exit_caught && duplicate_exit_thread &&
+              duplicate_exit_thread->state.load() == kernel::ThreadState::kExited &&
+              duplicate_exit_thread->exit_code.load() == 0x2468ACE0 && duplicate_exit_thread->resources_released &&
+              kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used,
+          "duplicate managed ExitThread preserves first status and releases thread resources once");
+
+#if defined(__APPLE__)
+    kernel::ThreadRef rejected_callback;
+    const uint32_t callbacks_before_rejection = g_callback_fake_calls.load();
+    if (!prepare(rejected_callback)) return;
+    uint32_t rejected_handle = 0;
+    mem::Read(output_page, &rejected_handle, sizeof(rejected_handle));
+    const uint32_t rejected_ethread = rejected_callback->ethread;
+    const uint32_t rejected_kpcr = rejected_callback->kpcr;
+    const uint32_t rejected_stack = rejected_callback->stack_top;
+    const bool rejected_started = kernel::StartThread(rejected_callback);
+    const uint32_t rejected_wait = rejected_started
+                                       ? kernel::Wait({std::static_pointer_cast<kernel::Object>(rejected_callback)},
+                                                      false, -100'000'000, false)
+                                       : kernel::kTimeout;
+    const bool rejected_joined = kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+    const auto retained = kernel::FromHandle(rejected_handle);
+    Check(rejected_started && rejected_wait == kernel::kWait0 && rejected_joined &&
+              rejected_callback->state.load() == kernel::ThreadState::kCancelled &&
+              retained.get() == rejected_callback.get() && rejected_callback->exit_code.load() == 0 &&
+              rejected_callback->resources_released && !rejected_callback->ethread && !rejected_callback->kpcr &&
+              !rejected_callback->stack_top && !rejected_callback->start_routine_ticket.target &&
+              !rejected_callback->system_routine_ticket.target &&
+              !kernel::IsPointerBoundForTest(rejected_ethread, rejected_callback.get()) &&
+              !mem::AllocationSize(rejected_ethread) && !mem::AllocationSize(rejected_kpcr) &&
+              !mem::IsCommitted(rejected_stack - 1) && kernel::KernelWorkerCountForTest() == 0 &&
+              mem::Query().system_used == baseline.system_used &&
+              g_callback_fake_calls.load() == callbacks_before_rejection,
+          "Apple production callback rejection joins, frees guest blocks, and retains the signaled handle object");
+    kernel::CloseHandle(rejected_handle);
+
+    kernel::ThreadRef racing_thread;
+    if (!prepare(racing_thread, 0, 0)) return;
+    std::barrier race_start(3);
+    bool race_started = false;
+    bool race_cancelled = false;
+    std::thread starter([&] {
+        race_start.arrive_and_wait();
+        race_started = kernel::StartThread(racing_thread);
+    });
+    std::thread canceller([&] {
+        race_start.arrive_and_wait();
+        race_cancelled = kernel::CancelPreparedThread(racing_thread);
+    });
+    race_start.arrive_and_wait();
+    starter.join();
+    canceller.join();
+    bool race_joined = true;
+    if (race_started) {
+        const uint32_t wait = kernel::Wait({std::static_pointer_cast<kernel::Object>(racing_thread)}, false,
+                                           -100'000'000, false);
+        race_joined = wait == kernel::kWait0 && kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+    }
+    Check(race_started != race_cancelled && race_joined && racing_thread->resources_released &&
+              racing_thread->state.load() != kernel::ThreadState::kActive &&
+              kernel::KernelWorkerCountForTest() == 0 &&
+              g_callback_fake_calls.load() == callbacks_before_rejection,
+          "StartThread and prepared cancellation serialize with one winner and no duplicate resource release");
+#endif
+
+    std::mutex teardown_lock;
+    std::condition_variable teardown_changed;
+    kernel::ThreadRef completing_thread;
+    bool worker_entered = false;
+    bool shutdown_requested = false;
+    bool release_worker = false;
+    bool shutdown_done = false;
+    const bool completion_started = kernel::StartManagedHostThread(
+        "completion-teardown-race-test", [&](X86Context&, kernel::WorkerStopToken stop) {
+            {
+                std::lock_guard lock(teardown_lock);
+                completing_thread = kernel::CurrentRef();
+                worker_entered = true;
+            }
+            teardown_changed.notify_all();
+            kernel::WorkerStopCallback wake(stop, [&] {
+                {
+                    std::lock_guard lock(teardown_lock);
+                    shutdown_requested = true;
+                }
+                teardown_changed.notify_all();
+            });
+            std::unique_lock lock(teardown_lock);
+            teardown_changed.wait(lock, [&] { return release_worker; });
+        });
+    bool entered_for_teardown = false;
+    {
+        std::unique_lock lock(teardown_lock);
+        entered_for_teardown = teardown_changed.wait_for(lock, std::chrono::seconds(5), [&] { return worker_entered; });
+    }
+    std::thread shutdown([&] {
+        mem::Shutdown();
+        {
+            std::lock_guard lock(teardown_lock);
+            shutdown_done = true;
+        }
+        teardown_changed.notify_all();
+    });
+    bool stop_seen = false;
+    bool teardown_waited_for_worker = false;
+    {
+        std::unique_lock lock(teardown_lock);
+        stop_seen = teardown_changed.wait_for(lock, std::chrono::seconds(5), [&] { return shutdown_requested; });
+        teardown_waited_for_worker = stop_seen && !shutdown_done && mem::IsInitialized();
+        release_worker = true;
+    }
+    teardown_changed.notify_all();
+    shutdown.join();
+    Check(completion_started && entered_for_teardown && stop_seen && teardown_waited_for_worker && shutdown_done &&
+              completing_thread &&
+              completing_thread->state.load() == kernel::ThreadState::kExited &&
+              completing_thread->resources_released && !completing_thread->stack_top &&
+              kernel::KernelWorkerCountForTest() == 0 && !mem::IsInitialized(),
+          "host teardown waits for worker completion before releasing guest memory");
+
+    if (!initialize()) return;
+    kernel::ThreadRef stale_prepared;
+    if (!prepare(stale_prepared)) return;
+    const uint64_t old_generation = stale_prepared->memory_generation;
+    const uint32_t old_ethread = stale_prepared->ethread;
+    const uint32_t old_kpcr = stale_prepared->kpcr;
+    const uint32_t old_stack = stale_prepared->stack_top;
+    const uint32_t old_handle = stale_prepared->published_handle;
+    mem::Shutdown();
+    Check(stale_prepared->state.load() == kernel::ThreadState::kCancelled &&
+              stale_prepared->resources_released && !stale_prepared->ethread && !stale_prepared->kpcr &&
+              !stale_prepared->stack_top && !stale_prepared->start_routine_ticket.target &&
+              !kernel::FromHandle(old_handle) && kernel::KernelWorkerCountForTest() == 0,
+          "memory shutdown finalizes a prepared owner before allocator reset");
+
+    if (!initialize()) return;
+    kernel::ThreadRef reused_prepared;
+    if (!prepare(reused_prepared)) return;
+    uint32_t reused_handle = 0, reused_id = 0;
+    mem::Read(output_page, &reused_handle, sizeof(reused_handle));
+    mem::Read(output_page + 4, &reused_id, sizeof(reused_id));
+    Check(reused_prepared->memory_generation != old_generation && reused_prepared->ethread == old_ethread &&
+              reused_prepared->kpcr == old_kpcr && reused_prepared->stack_top == old_stack &&
+              !kernel::CancelPreparedThread(stale_prepared) &&
+              kernel::FromHandle(reused_handle).get() == reused_prepared.get() &&
+              kernel::FromPointer(reused_prepared->ethread).get() == reused_prepared.get() &&
+              reused_id == reused_prepared->id &&
+              mem::AllocationSize(old_ethread) != 0 && mem::AllocationSize(old_kpcr) != 0 &&
+              mem::IsCommitted(old_stack - 1),
+          "stale ThreadRef cannot release or overwrite allocations reused by a newer memory generation");
+    Check(kernel::CancelPreparedThread(reused_prepared) && mem::Query().system_used ==
+                                                           (baseline.system_used),
+          "reused prepared thread cancellation restores current-generation allocations");
+
+#if defined(__APPLE__)
+    kernel::HoldKernelWorkerActivationForTest(true);
+    kernel::ThreadRef shutdown_prepared;
+    if (!prepare(shutdown_prepared)) return;
+    uint32_t shutdown_handle = 0;
+    mem::Read(output_page, &shutdown_handle, sizeof(shutdown_handle));
+    const uint32_t callbacks_before_shutdown = g_callback_fake_calls.load();
+    const uint32_t active_ethread = shutdown_prepared->ethread;
+    const uint32_t active_kpcr = shutdown_prepared->kpcr;
+    const uint32_t active_stack = shutdown_prepared->stack_top;
+    const bool shutdown_started = kernel::StartThread(shutdown_prepared);
+    const bool closed_while_active = kernel::CloseHandle(shutdown_handle);
+    const bool guest_resources_retained = shutdown_started && closed_while_active &&
+                                          shutdown_prepared->state.load() == kernel::ThreadState::kActive &&
+                                          !shutdown_prepared->resources_released &&
+                                          kernel::KernelWorkerCountForTest() == 1 &&
+                                          mem::AllocationSize(active_ethread) != 0 &&
+                                          mem::AllocationSize(active_kpcr) != 0 &&
+                                          mem::IsCommitted(active_stack - 1);
+    mem::Shutdown();
+    kernel::HoldKernelWorkerActivationForTest(false);
+    Check(shutdown_started && closed_while_active && guest_resources_retained &&
+              shutdown_prepared->state.load() == kernel::ThreadState::kCancelled &&
+              shutdown_prepared->resources_released && !shutdown_prepared->ethread &&
+              !shutdown_prepared->stack_top && kernel::KernelWorkerCountForTest() == 0 &&
+              g_callback_fake_calls.load() == callbacks_before_shutdown,
+          "shutdown cancels one activation-held worker before dispatch and joins it after handle close");
+#else
+    mem::Shutdown();
+#endif
 }
 
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE_CLI
@@ -2724,6 +3047,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
 #endif
 
     CheckGuestCallbackContract();
+    CheckGuestThreadLifecycle();
     mem::Shutdown();
     return failures ? 1 : 0;
 }

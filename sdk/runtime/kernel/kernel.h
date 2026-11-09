@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -228,13 +229,18 @@ enum class ThreadState : uint8_t { kPrepared, kActive, kExited, kCancelled };
 struct Thread : Object {
     uint32_t id = 0;
     uint32_t kpcr = 0, ethread = 0, stack_top = 0, stack_size = 0, tls = 0;
+    uint64_t memory_generation = 0;
+    mem::GuestThreadOwner memory_owner = 0;
     uint32_t system_routine = 0, start_routine = 0, start_context = 0, published_handle = 0;
     GuestCallbackTicket system_routine_ticket, start_routine_ticket;
     uint32_t handle_out = 0, id_out = 0;
     bool handle_published = false, id_published = false;
-    uint32_t exit_code = 0;
+    std::atomic<uint32_t> exit_code{0};
     int priority = 0;
     std::atomic<ThreadState> state{ThreadState::kPrepared};
+    std::mutex lifecycle_lock;
+    bool resources_released = false;
+    bool activation_started = false;
     std::atomic<int> suspend{0};
     std::atomic<bool> stop_requested{false};
     std::mutex apc_lock;
@@ -251,8 +257,8 @@ using ThreadRef = std::shared_ptr<Thread>;
 
 Thread* Current();
 ThreadRef CurrentRef();
-void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
-bool StartManagedHostThread(const char* name, std::function<void(X86Context&, WorkerStopToken)> fn);
+bool StartManagedHostThread(const char* name, std::function<void(X86Context&, WorkerStopToken)> fn,
+                            std::size_t stack_size = 0);
 void RunDpcs(X86Context& ctx, WorkerStopToken stop);
 bool InitKernelData();
 bool StartKernelClock();
@@ -266,7 +272,14 @@ uint32_t PrepareSystemThreadEx(uint32_t handle_out, uint32_t stack_size, uint32_
 bool CancelPreparedThread(const ThreadRef& t);
 bool StartThread(ThreadRef t);
 #ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
-enum class ThreadPreparationFailPoint : uint8_t { kNone, kAfterStack, kAfterKpcr, kAfterEthread, kBeforePublish };
+enum class ThreadPreparationFailPoint : uint8_t {
+    kNone,
+    kAfterStack,
+    kAfterKpcr,
+    kAfterEthread,
+    kBeforePublish,
+    kBeforeThreadRegistration
+};
 void SetThreadPreparationFailureForTest(ThreadPreparationFailPoint point);
 uint32_t ThreadWorkerLaunchCountForTest();
 bool InitializePreparedThreadContextForTest(const ThreadRef& thread, X86Context& context);

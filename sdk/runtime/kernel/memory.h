@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 
 namespace mem {
@@ -25,7 +26,12 @@ constexpr uint32_t kMemCommit = 0x1000, kMemReserve = 0x2000, kMemDecommit = 0x4
 bool Init();
 void Shutdown();
 bool IsInitialized();
+uint64_t Generation();
 uint8_t* Base();
+
+using GuestThreadOwner = uint64_t;
+GuestThreadOwner RegisterGuestThreadOwner(std::function<bool()> finalize);
+void UnregisterGuestThreadOwner(GuestThreadOwner owner);
 
 // Holds page state stable across a multi-call checked memory operation.
 class ScopedLock {
@@ -103,10 +109,10 @@ void FreeContiguous(uint32_t va);
 uint32_t AllocationSize(uint32_t va);  // any allocator, 0 if unknown
 
 uint32_t AllocSystem(uint32_t size, uint32_t align = 16);
-void FreeSystem(uint32_t va);
+bool FreeSystem(uint32_t va);
 
 uint32_t AllocStack(uint32_t size);  // returns the top, guard below the bottom
-void FreeStack(uint32_t top);
+bool FreeStack(uint32_t top);
 
 uint32_t PhysicalFromVirtual(uint32_t va);
 uint32_t VirtualFromPhysical(uint32_t pa);

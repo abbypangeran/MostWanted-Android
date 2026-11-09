@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -59,7 +60,7 @@ public:
     WorkerLifecycle(const WorkerLifecycle&) = delete;
     WorkerLifecycle& operator=(const WorkerLifecycle&) = delete;
 
-    bool Start(Task task);
+    bool Start(Task task, std::size_t stack_size = 0);
     void BeginShutdown();
     bool Join();
     bool StopAndJoin();
@@ -75,6 +76,7 @@ public:
     std::size_t QuiescingCountForTest() const;
     std::size_t JoiningCountForTest() const;
     std::size_t JoinWaiterCountForTest() const;
+    bool WaitForJoinInProgressForTest(std::chrono::milliseconds timeout);
 #endif
 
 private:
@@ -90,17 +92,18 @@ private:
     bool hold_activation_ = false;
     bool fail_next_start_ = false;
     std::size_t join_waiters_for_test_ = 0;
+    bool joining_workers_for_test_ = false;
     std::mutex reap_test_lock_;
     std::condition_variable reap_test_changed_;
     bool hold_after_reap_ = false;
 #endif
 };
 
-bool StartKernelWorker(WorkerLifecycle::Task task);
+bool StartKernelWorker(WorkerLifecycle::Task task, std::size_t stack_size = 0);
 bool StopKernelWorkers();
 bool RestartKernelWorkers();
 bool KernelWorkersAccepting();
-#ifdef MOSTWANTED_EXECUTION_PROBE_TESTS
+#if defined(MOSTWANTED_EXECUTION_PROBE_TESTS) || defined(MOSTWANTED_KERNEL_WORKER_TESTS)
 std::size_t KernelWorkerCountForTest();
 #endif
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS

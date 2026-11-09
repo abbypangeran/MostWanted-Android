@@ -135,7 +135,7 @@ inline float g_top[3] = {0, 1, 0};
 inline std::deque<Done> g_done;
 inline std::condition_variable_any g_done_cv;
 inline std::atomic<int64_t> g_pumped{0};          // the last DirectSoundDoWork, steady ms
-inline bool g_started = false;
+inline std::atomic<bool> g_started{false};
 inline uint32_t g_ds = 0;
 inline bool g_headphones = false;  // IDirectSound_EnableHeadphones
 // BkXboxFx.bin's reverb (effect 16) reads its input from mix bin 11 alone

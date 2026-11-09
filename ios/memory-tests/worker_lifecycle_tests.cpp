@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -342,6 +343,82 @@ void CheckManagedReapingConcurrentWithJoin() {
           "external shutdown waits for managed reaping without duplicate join or stale worker access");
 }
 
+void CheckStartDoesNotHoldGuestRangeBehindJoin() {
+    kernel::WorkerLifecycle workers;
+    std::mutex lock;
+    std::condition_variable changed;
+    bool entered = false;
+    bool stop_requested = false;
+    bool release_worker = false;
+    bool start_finished = false;
+    bool shutdown_finished = false;
+    bool start_succeeded = true;
+    bool shutdown_joined = false;
+    Check(workers.Start([&](kernel::WorkerStopToken stop) {
+              kernel::WorkerStopCallback wake(stop, [&] {
+                  {
+                      std::lock_guard guard(lock);
+                      stop_requested = true;
+                  }
+                  changed.notify_all();
+              });
+              std::unique_lock guard(lock);
+              entered = true;
+              changed.notify_all();
+              changed.wait(guard, [&] { return release_worker; });
+              guard.unlock();
+              mem::ScopedVirtualRangeLock guest_owner_lock;
+          }),
+          "worker enters a finalizer barrier protected by the guest range lock");
+    {
+        std::unique_lock guard(lock);
+        Check(changed.wait_for(guard, std::chrono::seconds(5), [&] { return entered; }),
+              "range-lock worker reaches the shutdown barrier");
+    }
+    std::thread shutdown([&] {
+        shutdown_joined = workers.StopAndJoin();
+        {
+            std::lock_guard guard(lock);
+            shutdown_finished = true;
+        }
+        changed.notify_all();
+    });
+    {
+        std::unique_lock guard(lock);
+        Check(changed.wait_for(guard, std::chrono::seconds(5), [&] { return stop_requested; }),
+              "shutdown requests stop before worker join");
+    }
+    Check(workers.WaitForJoinInProgressForTest(std::chrono::seconds(5)),
+          "shutdown owns the worker join while the finalizer is held");
+    std::thread starter([&] {
+        mem::ScopedVirtualRangeLock guest_range_lock;
+        start_succeeded = workers.Start([](kernel::WorkerStopToken) {});
+        {
+            std::lock_guard guard(lock);
+            start_finished = true;
+        }
+        changed.notify_all();
+    });
+    bool start_returned = false;
+    {
+        std::unique_lock guard(lock);
+        start_returned = changed.wait_for(guard, std::chrono::seconds(5), [&] { return start_finished; });
+    }
+    if (!start_returned) {
+        std::fprintf(stderr, "FAIL: worker start blocked behind shutdown join while holding guest range lock\n");
+        std::abort();
+    }
+    {
+        std::lock_guard guard(lock);
+        release_worker = true;
+    }
+    changed.notify_all();
+    starter.join();
+    shutdown.join();
+    Check(!start_succeeded && shutdown_joined && shutdown_finished && workers.OwnedCount() == 0,
+          "concurrent worker start rejects promptly without blocking guest resource finalization");
+}
+
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
 void CheckProductionWaitSuspensionAndApcShutdown() {
     Check(mem::Init(), "guest memory initializes for synthetic thread-wait tests");
@@ -560,6 +637,7 @@ extern "C" int RunWorkerLifecycleTests() {
     CheckConcurrentSubmissionAndExit();
     CheckExitedWorkersAreReapedBeforeNewRegistration();
     CheckManagedReapingConcurrentWithJoin();
+    CheckStartDoesNotHoldGuestRangeBehindJoin();
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
     CheckProductionWaitSuspensionAndApcShutdown();
 #endif

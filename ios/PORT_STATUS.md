@@ -2765,3 +2765,83 @@ The first attempt to reuse `.local/ios-port/memory-macos` failed at link with mi
 **Blockers:** Thread-owned guest memory/ticket release semantics, explicit synthetic-only worker authorization, checked start callback and termination path, and unsupported start-routine instructions/imports.
 **Next action:** Implement the guest Thread resource-ownership and teardown contract first; rerun this milestone's worker-test plan before any authentic single-worker proposal.
 **Customer release:** Not performed; no game boot or authentic guest-thread concurrency claim.
+
+## Phase 2D-2 — guest-thread resource ownership and quiescent teardown
+
+**PHASE_2D2_OWNERSHIP = PASS.** This closes the first implementation package from Phase 2D-1: thread-owned guest allocations now have one generation-safe finalizer, and memory teardown drains prepared owners only after managed workers have joined. The Phase 2C-41 experiment remains frozen and was not rerun.
+
+### Ownership rules and state machine
+
+Thread object state and worker-manager state are separate. `Prepared`, `Active`, `Exited`, and `Cancelled` describe the Thread object; `Prepared`, `Running`/`StopRequested`, `Quiescing`, `Joining`, and `ResourcesReleased` describe the host worker.
+
+| Thread state | Strong `ThreadRef` owners | Guest resources and release rule |
+|---|---|---|
+| Prepared | Preparing caller; optional published handle and ETHREAD binding; memory-owner registry callback. | Stack/TLS, KPCR and ETHREAD remain owned. Cancellation or memory teardown may release them because no worker has been activated. |
+| Active | Worker task capture, worker-local `t_current`, active-thread registry, optional handle and ETHREAD binding, memory-owner registry. | Closing the guest handle drops only the handle-table reference. The worker and memory owner retain the Thread and guest blocks. Stop callbacks, APC queue, dispatch/page leases and callback frames must finish before finalization. |
+| Exited or Cancelled | Until the task returns: worker capture and any explicit caller/waiter refs; after task completion: explicit refs and any still-open handle. | The terminal state signals waiters but does not itself free memory. Finalization runs after the callback and stop-callback scopes unwind, clears context/APCs/tickets, unregisters and unbinds, then frees the current-generation blocks. |
+| Resources released | Any caller, waiter or still-open handle may retain the host Thread object. | Guest VAs and callback tickets are cleared; the handle retains only thread identity, signal state and exit code until `CloseHandle`. A stale ThreadRef cannot release allocations in a later memory generation. |
+
+Transitions implemented:
+
+```text
+Prepared --validated start + registration + worker launch--> Active
+Prepared --cancel or memory teardown-----------------------> Cancelled --> Resources released
+Prepared --registration/launch failure---------------------> Prepared (tickets cleared; retry/cancel remains valid)
+Active   --normal callback return---------------------------> Exited --> Resources released
+Active   --callback rejection or stop before dispatch-------> Cancelled --> Resources released
+Active   --ExitThread(code)--------------------------------> Exited(code) --> Resources released
+```
+
+`MarkExited` only records the terminal state and signals waiters; finalization is separate. `StartThread` and prepared cancellation serialize on the memory-range and per-thread lifecycle locks. Memory operations use the order memory-range lock, lifecycle lock, then object/dispatch locks. `mem::Shutdown` first stops and joins managed workers, then invokes registered prepared-thread finalizers before allocator reset or unmapping. A release failure keeps the owner registered and leaves guest memory mapped. If an old ThreadRef reaches finalization after a later mapping exists, its generation mismatch discards old VAs without freeing or touching the new mapping.
+
+Started-thread handles remain valid after worker exit and retain the exit code/signal metadata, while ETHREAD/KPCR/stack ownership is already released. The global handle table is not reset by `mem::Shutdown`; an open completed-thread handle can therefore retain its host object across a memory reinitialization until explicitly closed. This holds no guest allocations, binding, callback ticket or executable target. Kernel-wide handle-table reset remains outside this package; ordinary handle closure is covered, cross-generation handle-table reset is not.
+
+### Implementation and termination findings
+
+- `Thread` records its memory generation and owner registration. One finalizer now covers preparation rollback, prepared cancellation, worker completion/rejection/stop, managed host-worker completion and memory teardown. It preserves terminal state and exit code for open handles, clears callback tickets and inactive routine/context VAs, unbinds ETHREAD and releases each guest allocation once.
+- `FreeSystem` and `FreeStack` report whether release succeeded. Guest block fields are cleared only after release succeeds. `FreeStack` removes its allocator entry only after decommit succeeds.
+- `StartThread` serializes ticket creation, activation, cancellation and rollback. Registration/launch failure clears tickets and restores `Prepared`. Managed worker task-allocation failure also follows that rollback.
+- `WorkerLifecycle::Start` no longer blocks on the join mutex when another thread is joining workers. If shutdown has closed admission, launch fails promptly; if another registration is only reaping completed workers, a new worker may still be added under the worker-list lock. This avoids waiting for shutdown while holding guest-range or callback-queue locks.
+- The old detached worker entry point was removed. The compiled game DirectSound pump in `src/sound/mixer.cpp` and the SDK DirectSound source now use the managed stop/join path. Guest and DirectSound workers retain the former 64 MiB host stack requirement; other managed workers keep their existing default. A Darwin test measured the requested 64 MiB worker stack.
+- `ExitThread` now records the first exit code and throws a private termination signal on a managed worker. This unwinds C++ stack objects, callback/page/dispatch leases and stop-callback scopes into the worker-owned cleanup path. A repeated host-side `ExitThread` request cannot overwrite the first code. When no managed Thread is current, the existing platform-native exit fallback remains.
+- On Apple, `CallGuestCallback` still validates then returns `kExecutionDisabled`; there is no callback invocation. The lifecycle tests do not route `CallGuestCallbackForTest` through `StartThread`, add no ordinal-258 bridge, and execute no guest callback or XBE instruction. Existing synchronous callback fixture tests remain separate.
+
+Apple’s [`pthread_exit(3)` reference](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/pthread_exit.3.html) describes cancellation cleanup handlers and pthread TLS destructors, not C++ automatic-variable unwinding. A local Darwin check also observed that a C++ automatic destructor did not run after `pthread_exit`; the managed exception path avoids depending on that behavior. The host-side unwind test does not prove exception propagation through a real guest callback or `PsTerminateSystemThread` import.
+
+### Deterministic coverage and resource evidence
+
+The new lifecycle fixture uses barriers and condition variables for races; timeouts only bound test hangs. It covers:
+
+- Injected pre-registration failure and worker-launch failure; both restore `Prepared`, clear callback tickets and leave no active workers.
+- Prepared cancellation twice; the second request is rejected without a second free. Stack decommit and `mem::Query().system_used` return to the recorded baseline.
+- Normal managed host-task completion, `ExitThread` C++ scope unwinding, exit-code observation through `Wait`, duplicate host-side exit request, and exactly-once final resource release.
+- Apple production callback rejection through real `StartThread`: the callback substitute call count does not change; the worker joins, callback tickets clear, ETHREAD binding and allocation records disappear, guest system allocation count returns to baseline, and the completed handle still resolves to the signaled Thread object until the test closes it.
+- Barrier-synchronized StartThread-versus-cancel admission; exactly one operation wins and no worker/resource remains afterward.
+- Shutdown while a worker is activation-held, before dispatch; closing its handle leaves all guest allocations owned, and teardown keeps memory mapped until the worker is released. A separate condition-variable race also holds a managed worker until shutdown requests stop, then verifies join and resource release.
+- Worker admission versus shutdown join while the caller holds the guest-range lock; the launch rejects promptly, allowing the joined worker to enter its range-protected finalizer.
+- Prepared-owner teardown, allocator-address reuse after memory reinitialization, and proof that a stale prior-generation ThreadRef cannot free the reused ETHREAD/KPCR/stack or overwrite the new published handle/ID.
+- The existing `seh-uncommitted` failure probe, which exposed and now covers cancellation after guest object pages have been decommitted. Prepared cancellation updates the host-side signal and does not write into the invalid guest ETHREAD page.
+
+Resource assertions include zero active worker count, cleared thread allocation fields/tickets, no ETHREAD pointer binding, zero allocation records for freed blocks, restored system-allocation baseline, decommitted stack pages, and successful memory shutdown (`IsInitialized == false`). The shutdown owner registry leaves memory mapped if any finalizer fails.
+
+Coverage is intentionally labeled: normal **guest callback** return and `PsTerminateSystemThread` from guest code remain untested because the Apple production boundary forbids dispatch. The successful completion and termination assertions above use managed host tasks calling the production ownership/finalization helpers; they do not fabricate guest execution. The Apple `StartThread` path covers rejection and teardown only.
+
+### Validation and delivery state
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Recompiler, callback, startup, VBlank and synthetic execution-probe suite | 6/6 CTest passed | 6/6 CTest passed |
+| Darwin memory/worker regression suite | 1/1 CTest passed | 1/1 CTest passed |
+| `src/sound/mixer.cpp` syntax check | Passed | Same source check applies |
+| Authentic Phase 2C-41 experiment | Not rerun | Not rerun |
+
+Both the complete fixture target set and memory test target set build in Debug and Release. The checked probe regression additionally verifies failed guest-memory cleanup and leaves all teardown counters at zero. Full game/app linking was not applicable: this checkout has neither `generated/game` nor `assets/default.xbe`; no iOS simulator/device app, `Boot()`, or installation was run.
+
+**Synthetic-only StartThread adapter: GO for a separate package.** It must require an explicit synthetic dispatch identity, reuse the production ticket/lease/worker/finalizer path, enforce one-worker scope, and stay compile-time gated outside production. Its required first checks are normal synthetic callback return, guest-requested `ExitThread`/ordinal-258 handling, callback lease unwinding, and handle retention/release. This GO does not authorize authentic start-routine execution or changing Apple’s production guard.
+
+**Development:** Ownership and generation-safe teardown implemented; detached worker callers moved to managed join with the prior deep-call stack size preserved.
+**Validation:** Applicable Debug/Release CTest suites pass: 6/6 fixture tests and 1/1 memory/worker test per configuration.
+**Integration:** Scoped work remains on `feature/ios-port`; no `main` merge.
+**Remaining blockers:** Guest callback return and guest-import termination are unvalidated; post-stop exception propagation across guest frames is unverified; open handles survive `mem::Shutdown` until `CloseHandle`; a full game link is unavailable without generated game inputs.
+**Next action:** Implement the separately gated synthetic-only StartThread adapter with explicit synthetic-image authorization, then prove return/termination and lease teardown before any authentic single-worker proposal.
+**Customer release:** Not performed; no game boot, authentic XBE continuation, or authentic guest-thread concurrency claim.
