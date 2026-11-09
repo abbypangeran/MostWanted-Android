@@ -2296,3 +2296,22 @@ The first unreviewed operation is the kernel import call at `002B5986` through `
 ```
 
 **NO-GO for extending beyond the reviewed 125-instruction boundary** until that run passes and `002B597D` plus the start-routine path are separately reviewed.
+
+## Phase 2C-35R integrated failure-path cleanup
+
+The integrated probe's `CleanupIntegrated()` now owns the retained thread before dispatch, image or memory is released. It:
+
+1. rejects a non-empty `kernel::Threads()` registration set;
+2. captures the retained `ThreadRef`, clears `Thread::ctx`, and clears `g_prepared_thread` before cancellation so a second cleanup cannot cancel twice;
+3. calls the state-based `CancelPreparedThread` directly, which is safe whether the guest handle is still open or was already closed by `NtClose`;
+4. verifies handle invalidation, published handle/id clearing, stack release, `kCancelled` state and empty thread registration;
+5. restores both import slots and records restoration failure;
+6. calls `TeardownReal` only after the thread result is known, so dispatch, image and memory are not released under a still-owned prepared thread.
+
+`RunIntegratedExecute` now returns a nonzero status when cleanup, cancellation, restoration or teardown fails. The successful path still uses `CancelRealPreparedThread` for its stronger closed-handle postcondition and single-cancellation contract; it is not used on early failure paths. The success message derives instruction/call/import totals from `g_probe` and `g_secondary` records and rejects anything other than root 72/2/2/2, secondary 53/1/0/0 and combined 125/3/2/2.
+
+New fault-injection scenarios cover cleanup with an open handle, cleanup after `NtClose`, repeated cleanup, cancellation failure, restoration failure, secondary-context failure and a secondary step failure that throws before any guest instruction executes. The integrated self-test now reports 32 PASS checks in Debug and Release. All failure scenarios are checked for the absence of the `INTEGRATED_REAL_EXEC ok` marker.
+
+Reviewed failure exits: before preparation, after preparation with an open handle, after handle closure, after import-restoration failure, after handoff validation failure, after secondary context/ticket/execution failure, during final cancellation, and during final teardown. The only paths without a `CleanupIntegrated` call are `mem::Init` failure (no memory or thread exists) and `RestartKernelWorkers` failure (no thread or patched import exists). No authentic XBE instruction was executed.
+
+Updated decision: **GO for one later supervised integrated run remains**, conditional on review and explicit authorisation; **NO-GO for extending beyond the 125-instruction boundary**.

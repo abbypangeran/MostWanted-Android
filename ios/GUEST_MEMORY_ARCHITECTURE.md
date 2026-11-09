@@ -341,3 +341,7 @@ The secondary phase replaces the root memory policy with exact spans:
 - import page `003C9000` remains forbidden; the secondary route has no import call or operand read.
 
 The memory observer clears the root operation list before the secondary segment, enforces the 256-operation budget independently, and records the secondary operations. The secondary snapshot covers the retained stack page, KPCR page, rdata page and image base. The KPCR page must change only at offset 0 to the computed `S-0x14` registration; rdata and image base must not change. The host-written callback frame `[FFFFFFF0, 002B38A2, 00000000]` is written by `CallGuestCallbackForTest` before guest entry and is not counted as a guest instruction or guest memory operation. `Thread::ctx` points at the local secondary context only for the segment and is cleared before cancellation.
+
+## Phase 2C-35R integrated cleanup ordering
+
+Failure cleanup runs before dispatch, image and memory teardown. It clears `Thread::ctx`, resets `g_prepared_thread`, cancels the prepared thread through `CancelPreparedThread` (valid with an open or already-closed handle), then verifies handle invalidation, output clearing, stack release, cancelled state and empty `kernel::Threads()`. Only after that result is known does it restore both import slots and call `TeardownReal`. A cancellation or restoration failure returns nonzero even when the subsequent teardown reports zero remaining bytes. The successful path still uses `CancelRealPreparedThread` once, after both segments' postconditions pass.

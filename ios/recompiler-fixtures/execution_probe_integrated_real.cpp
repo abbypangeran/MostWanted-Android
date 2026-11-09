@@ -84,6 +84,7 @@ struct SecondaryState {
 };
 
 SecondaryState g_secondary;
+bool g_integrated_fail_secondary_step = false;
 
 const sec::RouteStep* FindSecondaryStep(uint32_t pc) {
     for (const sec::RouteStep& step : sec::kRoute)
@@ -123,6 +124,7 @@ void RecordSecondaryStep(uint32_t pc, X86Context& ctx, const sec::RouteStep& ste
 void SecondaryStep(uint32_t pc, X86Context& ctx) {
     if (!g_secondary.running) Fail("secondary instruction outside its segment", pc);
     if (g_secondary.in_step) Fail("re-entry during a secondary step", pc);
+    if (g_integrated_fail_secondary_step) Fail("injected secondary execution failure", pc);
     SecondaryInStep guard;
 
     if (pc == sec::kStartRoutine) Fail("start routine entry is forbidden", pc);
@@ -899,8 +901,42 @@ bool VerifyImportRestoration(const RealFacts& facts, std::string& error) {
 }
 
 bool CleanupIntegrated(Options& options) {
-    if (g_prepared_thread) g_prepared_thread->ctx = nullptr;
-    return TeardownReal(options);
+    bool thread_ok = kernel::Threads().empty();
+    if (g_prepared_thread) {
+        const kernel::ThreadRef thread = g_prepared_thread;
+        g_prepared_thread.reset();
+        thread->ctx = nullptr;
+        const uint32_t handle = thread->published_handle;
+        const uint32_t handle_out = thread->handle_out;
+        const uint32_t id_out = thread->id_out;
+        const uint32_t stack_top = thread->stack_top;
+        const bool cancelled = kernel::CancelPreparedThread(thread);
+        uint32_t cleared_handle = 1, cleared_id = 1;
+        const bool handle_output_ok =
+            handle_out == 0 ||
+            (mem::Read(handle_out, &cleared_handle, sizeof(cleared_handle)) == mem::AccessStatus::kOk &&
+             cleared_handle == 0);
+        const bool id_output_ok =
+            id_out == 0 ||
+            (mem::Read(id_out, &cleared_id, sizeof(cleared_id)) == mem::AccessStatus::kOk && cleared_id == 0);
+        const bool handle_closed = handle == 0 || !kernel::FromHandle(handle);
+        const bool stack_freed = stack_top == 0 || !mem::IsCommitted(stack_top - 1);
+        const bool state_ok = thread->state.load() == kernel::ThreadState::kCancelled &&
+                              thread->published_handle == 0;
+        const bool no_registration = kernel::Threads().empty();
+        thread_ok = thread_ok && cancelled && handle_output_ok && id_output_ok && handle_closed && stack_freed &&
+                    state_ok && no_registration;
+        std::printf("CLEANUP thread=%p cancelled=%d handle_closed=%d outputs=%d stack_freed=%d state=%u "
+                    "registered=%zu\n",
+                    static_cast<const void*>(thread.get()), int(cancelled), int(handle_closed),
+                    int(handle_output_ok && id_output_ok), int(stack_freed), unsigned(thread->state.load()),
+                    kernel::Threads().size());
+    }
+    const bool imports_restored = RestoreImportSlots();
+    const bool teardown_ok = TeardownReal(options);
+    const bool ok = thread_ok && imports_restored && teardown_ok;
+    if (!ok) std::printf("RESULT fail reason=\"integrated cleanup did not complete\"\n");
+    return ok;
 }
 
 void PrintIntegratedFacts(const RealFacts& root_facts, const SecondaryFacts& secondary) {
@@ -1160,6 +1196,55 @@ int RunIntegratedPreflight(const std::string& scenario) {
         if (valid) return finish("corrupted secondary state was accepted", false);
         return finish(error.c_str(), true);
     }
+    if (scenario == "cleanup-open-handle" || scenario == "cleanup-closed-handle") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (!PrepareCandidateThread(facts, g_prepared_thread, error)) return finish(error.c_str(), false);
+        if (scenario == "cleanup-closed-handle" &&
+            !kernel::CloseHandle(g_prepared_thread->published_handle))
+            return finish("could not close the candidate handle", false);
+        const bool cleanup_ok = CleanupIntegrated(options);
+        std::printf("RESULT %s %s\n", cleanup_ok ? "ok" : "fail", scenario.c_str());
+        return cleanup_ok ? 0 : 5;
+    }
+    if (scenario == "cleanup-twice") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (!PrepareCandidateThread(facts, g_prepared_thread, error)) return finish(error.c_str(), false);
+        const bool first = CleanupIntegrated(options);
+        const bool second = CleanupIntegrated(options);
+        std::printf("RESULT %s cleanup-twice\n", first && second ? "ok" : "fail");
+        return first && second ? 0 : 5;
+    }
+    if (scenario == "cleanup-cancel-failure" || scenario == "cleanup-restore-failure") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (!PrepareCandidateThread(facts, g_prepared_thread, error)) return finish(error.c_str(), false);
+        if (scenario == "cleanup-cancel-failure") g_prepared_thread->state = kernel::ThreadState::kActive;
+        else g_import_restore_fail_ordinal = kImportOrdinal;
+        const bool cleanup_ok = CleanupIntegrated(options);
+        std::printf("RESULT %s %s\n", cleanup_ok ? "unexpected-ok" : "expected-fail", scenario.c_str());
+        return cleanup_ok ? 3 : 5;
+    }
+    if (scenario == "secondary-context-failure" || scenario == "secondary-execution-failure") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        if (!PrepareCandidateThread(facts, g_prepared_thread, error)) return finish(error.c_str(), false);
+        if (scenario == "secondary-context-failure") {
+            const uint32_t bad = 0x12345678;
+            mem::Write(g_prepared_thread->kpcr, &bad, sizeof(bad));
+        }
+        g_integrated_fail_secondary_step = true;
+        SecondaryFacts secondary;
+        const bool ran = RunSecondarySegment(g_prepared_thread, secondary, error);
+        g_integrated_fail_secondary_step = false;
+        if (g_prepared_thread) g_prepared_thread->ctx = nullptr;
+        const bool cleanup_ok = CleanupIntegrated(options);
+        if (ran) return 3;
+        if (scenario == "secondary-context-failure")
+            std::printf("RESULT ok secondary context rejected: %s\n", error.c_str());
+        return cleanup_ok ? 0 : 5;
+    }
     if (scenario == "forbidden-entry") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (!ok) return finish(error.c_str(), false);
@@ -1224,50 +1309,72 @@ int RunIntegratedExecute() {
     RealFacts root_facts;
     if (!PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, root_facts, error)) {
         std::printf("SETUP fail %s\n", error.c_str());
-        CleanupIntegrated(options);
-        return 4;
+        return CleanupIntegrated(options) ? 4 : 5;
     }
     if (!ValidateSecondaryRouteText(image, error)) {
         std::printf("SETUP fail %s\n", error.c_str());
-        CleanupIntegrated(options);
-        return 4;
+        return CleanupIntegrated(options) ? 4 : 5;
     }
     options.allow_root_return = true;
     options.root_sentinel_at_entry = true;
     const Report report = RunProbe(options);
     if (report.failure) {
         PrintFailure(report.error);
-        CleanupIntegrated(options);
-        return 3;
+        return CleanupIntegrated(options) ? 3 : 5;
     }
     if (!VerifyRealPostconditions(root_facts, error)) {
         std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
-        CleanupIntegrated(options);
-        return 3;
+        return CleanupIntegrated(options) ? 3 : 5;
     }
-    if (!RestoreImportSlots() || !VerifyImportRestoration(root_facts, error)) {
+    const uint32_t root_instructions = g_probe.executed;
+    const uint32_t root_direct = g_probe.direct_calls;
+    const uint32_t root_kernel = g_probe.kernel_calls;
+    const uint32_t root_imports = g_probe.import_reads;
+    if (root_instructions != kIntegratedRootInstructions || root_direct != 2 || root_kernel != 2 ||
+        root_imports != 2) {
+        std::printf("RESULT fail reason=\"root segment totals are not the reviewed set\"\n");
+        return CleanupIntegrated(options) ? 3 : 5;
+    }
+    if (!RestoreImportSlots()) {
+        std::printf("RESULT fail reason=\"import restoration failed\"\n");
+        CleanupIntegrated(options);
+        return 5;
+    }
+    if (!VerifyImportRestoration(root_facts, error)) {
         std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
         CleanupIntegrated(options);
-        return 3;
+        return 5;
     }
     const kernel::ThreadRef thread = g_prepared_thread;
     if (!ValidateRetainedThread(root_facts, thread, true, error)) {
         std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
-        CleanupIntegrated(options);
-        return 3;
+        return CleanupIntegrated(options) ? 3 : 5;
     }
     SecondaryFacts secondary;
     if (!RunSecondarySegment(thread, secondary, error)) {
         std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
-        thread->ctx = nullptr;
-        CleanupIntegrated(options);
-        return 3;
+        if (thread) thread->ctx = nullptr;
+        return CleanupIntegrated(options) ? 3 : 5;
     }
     thread->ctx = nullptr;
+    const uint32_t secondary_instructions = g_secondary.executed;
+    const uint32_t secondary_direct = g_secondary.direct_calls;
+    const uint32_t secondary_kernel = g_secondary.kernel_calls;
+    const uint32_t secondary_imports = g_secondary.import_reads;
+    const uint32_t combined_instructions = root_instructions + secondary_instructions;
+    const uint32_t combined_direct = root_direct + secondary_direct;
+    const uint32_t combined_kernel = root_kernel + secondary_kernel;
+    const uint32_t combined_imports = root_imports + secondary_imports;
+    if (secondary_instructions != kIntegratedSecondaryInstructions || secondary_direct != 1 ||
+        secondary_kernel != 0 || secondary_imports != 0 || combined_instructions != kIntegratedTotalInstructions ||
+        combined_direct != kIntegratedDirectCalls || combined_kernel != kIntegratedKernelCalls ||
+        combined_imports != kIntegratedImportReads) {
+        std::printf("RESULT fail reason=\"combined segment totals are not the reviewed set\"\n");
+        return CleanupIntegrated(options) ? 3 : 5;
+    }
     if (!CancelRealPreparedThread(root_facts, error)) {
         std::printf("RESULT fail reason=\"%s\"\n", error.c_str());
-        CleanupIntegrated(options);
-        return 3;
+        return CleanupIntegrated(options) ? 3 : 5;
     }
     if (!TeardownReal(options)) {
         std::printf("RESULT fail reason=\"teardown failed\"\n");
@@ -1275,9 +1382,8 @@ int RunIntegratedExecute() {
     }
     std::printf("INTEGRATED_REAL_EXEC ok instructions=%u root=%u secondary=%u direct_calls=%u kernel_calls=%u "
                 "import_reads=%u workers=%zu last=%08X stop=%08X\n",
-                kIntegratedTotalInstructions, kIntegratedRootInstructions, kIntegratedSecondaryInstructions,
-                kIntegratedDirectCalls, kIntegratedKernelCalls, kIntegratedImportReads,
-                kernel::KernelWorkerCountForTest(), uint32_t(0x002B5C74), sec::kStopBefore);
+                combined_instructions, root_instructions, secondary_instructions, combined_direct, combined_kernel,
+                combined_imports, kernel::KernelWorkerCountForTest(), uint32_t(0x002B5C74), sec::kStopBefore);
     return 0;
 }
 
@@ -1491,6 +1597,13 @@ int main(int argc, char** argv) {
         {"handoff-bad-tls", 3, "TLS pointer slot"},
         {"handoff-seh", 3, "SEH saved"},
         {"handoff-tls-contents", 3, "TLS zero-fill mismatch"},
+        {"cleanup-open-handle", 0, "CLEANUP thread="},
+        {"cleanup-closed-handle", 0, "CLEANUP thread="},
+        {"cleanup-twice", 0, "cleanup-twice"},
+        {"cleanup-cancel-failure", 5, "integrated cleanup did not complete"},
+        {"cleanup-restore-failure", 5, "integrated cleanup did not complete"},
+        {"secondary-context-failure", 0, "secondary context rejected"},
+        {"secondary-execution-failure", 0, "injected secondary execution failure"},
         {"forbidden-entry", 0, ""},
         {"cancel-twice", 0, ""},
         {"close-twice", 0, ""},
@@ -1501,7 +1614,8 @@ int main(int argc, char** argv) {
         const ChildResult result = SpawnChild(self, test.scenario, std::chrono::seconds(15));
         const int exit_code = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : -1;
         const bool condition = !result.timed_out && exit_code == test.expect_exit &&
-                               (test.expected[0] == 0 || result.output.find(test.expected) != std::string::npos);
+                               (test.expected[0] == 0 || result.output.find(test.expected) != std::string::npos) &&
+                               result.output.find("INTEGRATED_REAL_EXEC ok") == std::string::npos;
         std::printf("%s: integrated child %s exits %d\n", condition ? "PASS" : "FAIL", test.scenario, exit_code);
         if (!condition) ++failed;
     }
