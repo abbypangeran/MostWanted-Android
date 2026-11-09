@@ -6,12 +6,13 @@
 // Phase 2C-15 audited startup prefix, extended by Phase 2C-18 by one
 // instruction (the ordinal-255 import call at 0x002B5CE0), by Phase 2C-20
 // through the helper's successful return path, by Phase 2C-22 through its
-// RET 0x18, and by Phase 2C-24 through the caller's handle check, stopping
-// before the NtClose wrapper call at 0x002B3980.
+// RET 0x18, by Phase 2C-24 through the caller's handle check, and by Phase
+// 2C-26 through the NtClose wrapper, stopping before the caller's own RET at
+// 0x002B3987.
 //
 // The route mirrors the instruction shapes recorded in PORT_STATUS.md for
 // 0x002B3916 -> 0x002B396A -> 0x002B5CA7 -> 0x002B5CE0 -> the success arm at
-// 0x002B5D0E..0x002B5D12 -> 0x002B396F..0x002B397F.  The synthetic fixture
+// 0x002B5D0E..0x002B5D12 -> 0x002B396F..0x002B3986.  The synthetic fixture
 // builder and the execution probe both consume this table, so the allowed PCs,
 // lengths, transitions and call targets stay in one place.  The addresses are
 // real; the fixture bytes and their data values are synthetic and are not
@@ -98,9 +99,21 @@ struct RouteStep {
     X(0x002B3973, 2, kConditional, 0x002B3975, 0x002B397F)                                   \
     X(0x002B3975, 1, kForbidden, 0, 0)                                                       \
     X(0x002B397F, 1, kSequential, 0x002B3980, 0)                                             \
-    X(0x002B3980, 5, kStop, 0, 0)                                                            \
+    X(0x002B3980, 5, kCall, 0x002B2759, 0)                                                   \
+    X(0x002B3985, 1, kSequential, 0x002B3986, 0)                                             \
+    X(0x002B3986, 1, kSequential, 0x002B3987, 0)                                             \
+    X(0x002B3987, 1, kStop, 0, 0)                                                            \
+    X(0x002B2759, 4, kSequential, 0x002B275D, 0)                                             \
+    X(0x002B275D, 6, kKernelCall, 0x002B2763, 0)                                             \
+    X(0x002B2763, 2, kSequential, 0x002B2765, 0)                                             \
+    X(0x002B2765, 2, kConditional, 0x002B2767, 0x002B276C)                                   \
+    X(0x002B2767, 2, kSequential, 0x002B2769, 0)                                             \
+    X(0x002B2769, 1, kSequential, 0x002B276A, 0)                                             \
+    X(0x002B276A, 2, kSequential, 0x002B2774, 0)                                             \
+    X(0x002B276C, 1, kForbidden, 0, 0)                                                       \
+    X(0x002B2774, 3, kSequential, 0x002B3985, 0)                                             \
     X(0x002B55EE, 1, kForbidden, 0, 0)                                                       \
-    X(0x002B2759, 4, kForbidden, 0, 0)
+    X(0x002B3826, 4, kForbidden, 0, 0)
 
 inline constexpr RouteStep kRoute[] = {
 #define EXECUTION_PROBE_ROUTE_STEP(pc, len, kind, next, alt) {pc, len, StepKind::kind, next, alt},
@@ -117,26 +130,36 @@ inline constexpr uint32_t kImportReturn = 0x002B5CE6;
 inline constexpr uint32_t kPostImportBranch = 0x002B5CEA;  // jnl successor of the kernel status
 inline constexpr uint32_t kDebugPath = 0x002B5CEC;         // forbidden arm, a trap-only boundary function
 inline constexpr uint32_t kHandleRead = 0x002B5D0E;        // mov eax, [ebp+0x0C]
-inline constexpr uint32_t kLastInstruction = 0x002B397F;   // push edi, executed
-inline constexpr uint32_t kStopBefore = 0x002B3980;        // NtClose call, never executed
+inline constexpr uint32_t kLastInstruction = 0x002B3986;   // pop esi, executed
+inline constexpr uint32_t kStopBefore = 0x002B3987;        // caller ret, never executed
 inline constexpr uint32_t kImportSlot = 0x003C9E68;
 inline constexpr uint32_t kImportOrdinal = 255;
 inline constexpr uint32_t kImportEncoding = 0x800000FF;
 
 // the caller's arm after the helper returns: it moves the published handle to
 // EDI, tests it against ESI (zero), and calls the NtClose wrapper only when the
-// handle is non-zero.  The wrapper's call is the first unreviewed kernel
-// service, so it is the new mandatory stop; the zero-handle arm is forbidden.
+// handle is non-zero.  The wrapper's NtClose call is the first reviewed kernel
+// service; the caller's own RET is the new mandatory stop.
 inline constexpr uint32_t kCallerBranch = 0x002B3973;         // jnz 0x002B397F
 inline constexpr uint32_t kCallerOffPath = 0x002B3975;        // zero-handle arm
-inline constexpr uint32_t kCallerContinuation = 0x002B397F;   // push edi, last executed
-inline constexpr uint32_t kCloseCall = 0x002B3980;            // call 0x002B2759, never executed
+inline constexpr uint32_t kCallerContinuation = 0x002B397F;   // push edi
+inline constexpr uint32_t kCloseCall = 0x002B3980;            // call 0x002B2759
+inline constexpr uint32_t kCloseContinue = 0x002B3985;        // pop edi, wrapper return
 inline constexpr uint32_t kCloseTarget = 0x002B2759;          // NtClose wrapper
 inline constexpr uint32_t kOffPathCall = 0x002B397A;          // call 0x002B55EE, off path
 inline constexpr uint32_t kOffPathTarget = 0x002B55EE;
-inline constexpr uint32_t kCloseImportCall = 0x002B275D;      // call [0x003C9D4C], never executed
+inline constexpr uint32_t kCloseImportCall = 0x002B275D;      // call [0x003C9D4C]
 inline constexpr uint32_t kCloseImportSlot = 0x003C9D4C;
 inline constexpr uint32_t kCloseOrdinal = 187;                // NtClose
+inline constexpr uint32_t kCloseImportEncoding = 0x800000BB;
+inline constexpr uint32_t kCloseImportReturn = 0x002B2763;
+inline constexpr uint32_t kCloseStatusTest = 0x002B2763;      // test eax, eax
+inline constexpr uint32_t kCloseBranch = 0x002B2765;          // jl 0x002B276C
+inline constexpr uint32_t kCloseSuccess = 0x002B2767;         // xor eax, eax
+inline constexpr uint32_t kCloseRet = 0x002B2774;             // ret 0x04
+inline constexpr uint32_t kCloseErrorPath = 0x002B276C;       // forbidden
+inline constexpr uint32_t kCloseErrorCall = 0x002B276D;       // call 0x002B3826, forbidden
+inline constexpr uint32_t kCloseErrorTarget = 0x002B3826;     // forbidden stub
 
 // authentic arguments the reviewed helper pushes; both routines are data here
 // and are never entered.
@@ -152,11 +175,22 @@ inline constexpr uint32_t kImportArg0Offset = 0x34;  // lea eax, [ebp+0x0C] with
 inline constexpr uint32_t kRetInstruction = 0x002B5D12;
 inline constexpr uint32_t kRetTarget = 0x002B396F;
 inline constexpr uint32_t kRetPopBytes = 0x18;
-inline constexpr uint32_t kStopInstruction = 0x002B3980;  // call 0x002B2759, never executed
+inline constexpr uint32_t kStopInstruction = 0x002B3987;  // caller ret, never executed
 
-inline constexpr uint32_t kMaximumInstructions = 64;
-inline constexpr uint32_t kMaximumDirectCalls = 1;
-inline constexpr uint32_t kMaximumKernelCalls = 1;
+// one reviewed import call; the observer counts each slot separately.
+struct ImportStep {
+    uint32_t pc, slot, return_pc, ordinal, encoding;
+};
+inline constexpr ImportStep kImportSteps[] = {
+    {kImportCall, kImportSlot, kImportReturn, kImportOrdinal, kImportEncoding},
+    {kCloseImportCall, kCloseImportSlot, kCloseImportReturn, kCloseOrdinal, kCloseImportEncoding},
+};
+inline constexpr size_t kImportStepCount = sizeof(kImportSteps) / sizeof(kImportSteps[0]);
+
+inline constexpr uint32_t kMaximumInstructions = 80;
+inline constexpr uint32_t kMaximumDirectCalls = 2;
+inline constexpr uint32_t kMaximumKernelCalls = 2;
+inline constexpr uint32_t kMaximumImportReads = 2;
 inline constexpr uint32_t kMaximumMemoryOperations = 256;
 inline constexpr uint32_t kMaximumTraceRecords = kMaximumInstructions;
 

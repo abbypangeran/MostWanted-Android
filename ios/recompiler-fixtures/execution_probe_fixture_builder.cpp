@@ -95,9 +95,23 @@ constexpr Instruction kInstructions[] = {
     {0x002B3978, {0x6A, 0x01}, 2},                                      // push 1
     {0x002B397A, {0xE8, 0x6F, 0x1C, 0x00, 0x00}, 5},                    // call 0x2B55EE
     {0x002B397F, {0x57}, 1},                                            // push edi
-    {0x002B3980, {0xE8, 0xD4, 0xED, 0xFF, 0xFF}, 5},                    // call 0x2B2759 - stop boundary
+    {0x002B3980, {0xE8, 0xD4, 0xED, 0xFF, 0xFF}, 5},                    // call 0x2B2759
+    {0x002B3985, {0x5F}, 1},                                            // pop edi
+    {0x002B3986, {0x5E}, 1},                                            // pop esi
+    {0x002B3987, {0xC3}, 1},                                            // ret - stop boundary
+    {0x002B2759, {0xFF, 0x74, 0x24, 0x04}, 4},                          // push [esp+4]
+    {0x002B275D, {0xFF, 0x15, 0x4C, 0x9D, 0x3C, 0x00}, 6},              // call [0x3C9D4C] - ordinal 187
+    {0x002B2763, {0x85, 0xC0}, 2},                                      // test eax, eax
+    {0x002B2765, {0x7C, 0x05}, 2},                                      // jl 0x2B276C
+    {0x002B2767, {0x33, 0xC0}, 2},                                      // xor eax, eax
+    {0x002B2769, {0x40}, 1},                                            // inc eax
+    {0x002B276A, {0xEB, 0x08}, 2},                                      // jmp 0x2B2774
+    {0x002B276C, {0x50}, 1},                                            // push eax - forbidden
+    {0x002B276D, {0xE8, 0xB4, 0x10, 0x00, 0x00}, 5},                    // call 0x2B3826
+    {0x002B2772, {0x33, 0xC0}, 2},                                      // xor eax, eax
+    {0x002B2774, {0xC2, 0x04, 0x00}, 3},                                // ret 0x04
     {0x002B55EE, {0x55}, 1},                                            // push ebp - boundary
-    {0x002B2759, {0xFF, 0x74, 0x24, 0x04}, 4},                          // push [esp+4] - boundary
+    {0x002B3826, {0xFF, 0x74, 0x24, 0x04}, 4},                          // push [esp+4] - boundary
 };
 
 void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
@@ -155,7 +169,7 @@ bool WriteConfig(const char* path) {
               "checked_memory = true\n\n"
               "[[function]]\n"
               "at = 0x002B3916\n"
-              "end = 0x002B3985\n\n"
+              "end = 0x002B3988\n\n"
               "[[function]]\n"
               "at = 0x002B5CA7\n"
               "end = 0x002B5D15\n\n"
@@ -167,7 +181,10 @@ bool WriteConfig(const char* path) {
               "end = 0x002B55EF\n\n"
               "[[function]]\n"
               "at = 0x002B2759\n"
-              "end = 0x002B275D\n";
+              "end = 0x002B2777\n\n"
+              "[[function]]\n"
+              "at = 0x002B3826\n"
+              "end = 0x002B382A\n";
     for (const auto& step : execution_probe::kRoute) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc

@@ -70,20 +70,32 @@ inline constexpr const char* kExpectedRouteText[] = {
     "cmp edi, esi",                // 002B3971
     "jnz 0x002B397F",              // 002B3973
     "push esi",                    // 002B3975, zero-handle arm, forbidden
-    "push edi",                    // 002B397F, last executed
-    "call 0x002B2759",             // 002B3980, NtClose wrapper, pre-instruction stop
+    "push edi",                    // 002B397F
+    "call 0x002B2759",             // 002B3980, NtClose wrapper
+    "pop edi",                     // 002B3985
+    "pop esi",                     // 002B3986, last executed
+    "ret",                         // 002B3987, caller RET, pre-instruction stop
+    "push [esp+0x04]",             // 002B2759, NtClose wrapper entry
+    "call [0x003C9D4C]",           // 002B275D, NtClose ordinal 187
+    "test eax, eax",               // 002B2763
+    "jl 0x002B276C",               // 002B2765
+    "xor eax, eax",                // 002B2767
+    "inc eax",                     // 002B2769
+    "jmp 0x002B2774",              // 002B276A
+    "push eax",                    // 002B276C, forbidden error arm
+    "ret 0x04",                    // 002B2774, wrapper return
     "push ebp",                    // 002B55EE, off-path callee boundary
-    "push [esp+0x04]",             // 002B2759, NtClose wrapper boundary
+    "push [esp+0x04]",             // 002B3826, error callee boundary
 };
 
 inline constexpr size_t kExpectedRouteTextCount =
     sizeof(kExpectedRouteText) / sizeof(kExpectedRouteText[0]);
 
-// FNV-1a over the 191 reviewed instruction bytes in route order.  A hash keeps
+// FNV-1a over the 217 reviewed instruction bytes in route order.  A hash keeps
 // the proprietary bytes out of tracked source while still pinning the exact
 // encoding that the text table decodes.
-inline constexpr uint32_t kExpectedRouteBytes = 191;
-inline constexpr uint64_t kExpectedRouteHash = 0x543CADDFE334635CULL;
+inline constexpr uint32_t kExpectedRouteBytes = 217;
+inline constexpr uint64_t kExpectedRouteHash = 0x6FBF924DD2C56F08ULL;
 
 // the debug arm's first instruction, reviewed as a forbidden boundary; it is a
 // one-instruction function so the recompiler does not follow its call at all.

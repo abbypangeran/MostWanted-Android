@@ -1789,3 +1789,44 @@ Expected authentic post-stop state: `EAX=EDI=00001000`, `ESI=EBP=ECX=0`, `ESP=D0
 Focused validation passed: synthetic Debug/Release suites (including the new `caller-not-taken` zero-handle rejection), real preflight and self-test in Debug and Release (66/66 route, 5 functions, 66 hooks, ordinal-187 slot, import restore, zero teardown). No shared runtime, Apple guard or generated game source changed; iOS and Android were not rebuilt.
 
 Decision: **GO for one bounded real run of the extended caller segment**, **NO-GO** for `002B3980`, `NtClose`, `002B55EE`, `StartThread`, callbacks, workers or production `Boot()`.
+
+## Phase 2C-26 checked NtClose and prepared-thread handle lifecycle
+
+Baseline `34039ad8149bcf69c72cf6b04edef483f4396fd6` on `feature/ios-port`. **No real XBE instruction ran in this phase.**
+
+The route now executes the authentic `NtClose` wrapper and returns to the caller, stopping before the caller's own RET:
+
+```
+002B397F  push edi
+002B3980  call 002B2759
+002B3985  pop edi
+002B3986  pop esi
+002B3987  ret                    mandatory pre-instruction stop
+
+002B2759  push [esp+0x04]
+002B275D  call [003C9D4C]        ordinal 187, NtClose
+002B2763  test eax, eax
+002B2765  jl 002B276C            not taken on success; error arm forbidden
+002B2767  xor eax, eax
+002B2769  inc eax
+002B276A  jmp 002B2774
+002B2774  ret 0x04
+```
+
+| Check | Result |
+| --- | --- |
+| Reviewed route | **78/78** instructions; 217 bytes; FNV-1a `0x6FBF924DD2C56F08` |
+| Expected authentic run | **71** guest instructions, first `002B3916`, last `002B3986` |
+| Mapping | 6 functions (entry, helper, `NtClose` wrapper, debug boundary, off-path stub, error stub), 0 continuations, 78 hooks |
+| Calls | 2 direct (`002B5CA7`, `002B2759`), 2 kernel (`PsCreateSystemThreadEx`, `NtClose`), 2 import reads (one per slot) |
+| Stop | `002B3987` pre-instruction; `ESP` restored to `D001FFF0`, checked frames clear |
+
+The test-only ordinal-187 bridge reuses the ordinal-255 fixture architecture in `sdk/runtime/cpu/dispatch.cpp`: a fixture table admits only ordinal 255 (`PsCreateSystemThreadEx`, 10 arguments) and ordinal 187 (`NtClose`, 1 argument), validates the registered export name, return PC, argument span, exact stdcall cleanup and return-address readback. The handler reads the single handle with `mem::Read`, calls `kernel::CloseHandle`, and never starts or cancels a thread. Production `x86_kernel` and the Apple guards are unchanged.
+
+Lifecycle: ordinal 255 publishes handle `00001000`; ordinal 187 removes that handle-table entry; `FromHandle(00001000)` then fails, while the separately retained `ThreadRef` remains `kPrepared` and owns the guest stack. Teardown cancels it, clears the published output, frees the allocations and returns `mem::Query()` to baseline. A test-only `close-cancel` mode deliberately cancels on close and is rejected by the postconditions.
+
+Import page `003C9000`: authentic `003C9E68 = 800000FF` and `003C9D4C = 800000BB`; preparation patches both to `FE0003FC` and `FE0002EC`, protects the page read-only, and teardown restores and reads back both values. Failure injection for either slot exits nonzero and suppresses `REAL_EXEC ok`.
+
+Focused validation passed in Debug and Release: synthetic probe (both import calls, close/duplicate/invalid/bad-cleanup/bad-return/cancel-on-close, second read, argument span, budget and teardown), real preflight and self-test (78/78, 6 functions, 78 hooks, both authentic encodings and restorations, zero resources), and ctest 5/5 per configuration. Android shared-code change is limited to the test-only dispatch branch and a constant move; a targeted NDK compile is included in the report.
+
+Decision: **GO for one supervised real run through the wrapper**, stopping before `002B3987`. **NO-GO** for the caller RET and anything beyond it, `StartThread`, callbacks, workers or production `Boot()`.

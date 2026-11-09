@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
               "checked_memory = true\n\n"
               "[[function]]\n"
               "at = 0x002B3916\n"
-              "end = 0x002B3985\n\n"
+              "end = 0x002B3988\n\n"
               "[[function]]\n"
               "at = 0x002B5CA7\n"
               "end = 0x002B5D15\n\n"
@@ -42,7 +42,10 @@ int main(int argc, char** argv) {
               "end = 0x002B55EF\n\n"
               "[[function]]\n"
               "at = 0x002B2759\n"
-              "end = 0x002B275D\n";
+              "end = 0x002B2777\n\n"
+              "[[function]]\n"
+              "at = 0x002B3826\n"
+              "end = 0x002B382A\n";
     for (const auto& step : execution_probe::kRoute) {
         config << "\n[[hook]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << step.pc
                << "\ncall = \"ProbeStep_0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
