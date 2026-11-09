@@ -1890,3 +1890,120 @@ Decision: **GO for one later supervised 72-instruction root-return run** using t
 .local/ios-port/phase2c16-fixtures/Release/execution_probe_real_preflight \
   --run-once --execute-real --root-return
 ```
+
+## Phase 2C-30 authentic root completion
+
+The authorised gated run executed **72 authentic guest instructions** on macOS (`002B3916`..`002B3987`), consumed the `FFFFFFF0` root sentinel, reported `ROOT completed esp=D001FFF4 eax=00000001 frame=returned`, restored both import slots and released every resource. Evidence is in `.local/ios-port/phase2c30-evidence/`. This is real guest execution in the macOS probe, not an iOS game boot.
+
+## Phase 2C-31 deterministic secondary-thread entry foundation
+
+Baseline `9c7cfe4be510f9d40f52e3f54b61efbb58dad02f` on `feature/ios-port`. **No authentic secondary-thread instruction ran in this phase.**
+
+### Decoded entry paths
+
+The inactive thread prepared by the validated ordinal-255 call has system routine `002B5C0F` and start routine `002B38A2` (context `0`). The system routine begins:
+
+```text
+002B5C0F  push 0x18              ; SEH scope-table size
+002B5C11  push 0x3ED5B8          ; SEH scope table
+002B5C16  call 0x00319804       ; __SEH_prolog-style helper, unreviewed
+002B5C1B  and [ebp-4], 0
+002B5C1F  mov eax, fs:[0x28]    ; ETHREAD (KPCR+0x28)
+002B5C28  mov edx, [eax+0x28]    ; TLS block
+002B5C34  mov ebx, [0x3ED3F0]
+002B5C3A  mov esi, [0x3ED3EC]
+002B5C4E  rep movsd / 002B5C55 rep movsb
+002B5C57  mov ecx, [0x3ED3FC]   ; optional zero-fill length
+002B5C74  push 1 / call 0x002B597D
+002B5C7B  push [ebp+0xC] / call [ebp+8]   ; dynamic start-routine call
+002B5C84  push 0 / call 0x002B597D
+002B5C99  or [ebp-4], -1 / push [ebp-0x1C]
+002B5CA0  call [0x003C9E64]    ; PsTerminateSystemThread
+002B5CA6  int3
+```
+
+The start routine begins:
+
+```text
+002B38A2  call 0x002B58B8       ; unreviewed; first import/CPU probe
+002B38A7  call 0x002B5664       ; unreviewed
+002B38AC  mov eax, fs:[0x20]    ; KPCR+0x28 self pointer
+002B38B2  mov eax, [eax+0x250]
+002B38C8  mov eax, fs:[0x28]    ; ETHREAD
+002B38CE  mov edi, fs:[4]       ; KPCR+4, the stack top
+002B38D5  mov edx, [0x004DF78C] ; 0xFFFFFFDB from the startup prefix
+002B38DB  mov edx, [edi+edx*4]  ; TLS slot at stack_top-0x94
+002B38DE  sub edx, [eax+0x28]   ; subtract the TLS base
+002B38E1  mov byte [ecx], 1 / mov [ecx+4], edx
+002B3913  ret 0x04              ; pops the context argument
+```
+
+### First meaningful unsafe boundary
+
+For the system routine it is the call at `002B5C16` to `00319804`. The helper is not in the real mapping; the synthetic fixture maps only a one-instruction trap stub at its entry. It installs an exception registration at `fs:[0]`, allocates `0x18` bytes and pushes the caller's registers, then `ret`s to `002B5C1B`. Its stack shape is not an ordinary call/return and its KPCR `fs:[0]` write is outside the current reviewed spans. Static decode shows the `00319858` value is the exception handler stored in the SEH frame, not the helper's return target; that distinction must be re-checked before the helper is mapped. For the start routine the first unsafe boundary is its entry `002B38A2`; its first callee `002B58B8` is also unreviewed.
+
+### Verified thread context and callback contracts
+
+The separate synthetic fixture builds the prepared thread exactly as the ordinal-255 bridge does: `PrepareSystemThreadEx(handle_out, 0x10000, 0x94, id_out, 0x002B38A2, 0, false, 0x002B5C0F, thread)`. `InitializePreparedThreadContextForTest` then uses production `InitContext`:
+
+| Item | Observed / required |
+| --- | --- |
+| Guest stack | `D0020000`-`D0030000` (owned, committed) |
+| TLS | `D002FF6C` = `stack_top - 0x94` |
+| Initial ESP | `D002FF50` = `(tls & ~15) - 16`, 16-byte aligned |
+| FS base | `B0000000` = KPCR |
+| KPCR/ETHREAD | `B0000000` / `B0000400`; stack, TLS and id fields match production |
+| x87/SSE | `FCW=0x27F`, `MXCSR=0x1F80` |
+| Thread | `kPrepared`, suspend `0`, handle `00001000`, `Threads()` empty |
+
+The callback contracts are unchanged: `kSystemRoutine` is `(kGuestFunction, kNullableUnresolvedPointer)` and `kThreadStart` is `(kNullableUnresolvedPointer)`. `PrepareGuestCallback(002B5C0F, kSystemRoutine)` accepts only when the start routine resolves to a generated function; `CallGuestCallbackForTest` then validates the two arguments `(002B38A2, 00000000)` and the stack frame `[FFFFFFF0, 002B38A2, 00000000]` before invoking the system routine. The production Apple `CallGuestCallback` guard and `Boot()` are untouched.
+
+### Fixture architecture
+
+A new, separate target (`execution_probe_secondary_tests`) owns a new synthetic image and generated mapping. The successful 72-instruction root route, its 78-entry table, generated mapping and hash `0x6FBF924DD2C56F08` are unchanged.
+
+| Item | Value |
+| --- | --- |
+| Executed route | `002B5C0F` (2 bytes), `002B5C11` (5 bytes), stop before `002B5C16` |
+| Route bytes/hash | 12 bytes, FNV-1a `0x59728DC843F34996` |
+| Mapping | 4 functions: system routine, start routine, `002B58B8`, `00319804` |
+| Hooks | 6: the 3 route PCs plus trap-only entries `002B38A2`, `002B58B8`, `00319804` |
+| Calls | 2 checked direct calls encoded (`002B5C16` and `002B38A2`), neither executed |
+| Budgets | 2 instructions, 8 memory operations, 0 direct/kernel/import calls, 12-second child alarm, parent watchdog |
+| Memory | Only 4-byte writes inside the prepared thread's stack; import page access fails |
+
+Authentic XBE static preflight passes: SHA-1 `f636a16af04171089f879a4bed646e185c734233`, title `4541007B`, entry `002B3916`, base `00010000`; the three route texts and the three trap texts match, the `002B5C16` call target is `00319804`, and the start-routine entry calls `002B58B8`.
+
+### Synthetic evidence
+
+Debug and Release: the secondary probe runs 2 instructions (`002B5C0F`, `002B5C11`) and stops at `002B5C16`; the trace shows the two pushes, the stop shows `ESP=D002FF3C`, `EBP=0`, `frame=clear`, and the frame check reports `sentinel=FFFFFFF0 start=002B38A2 context=00000000 push0=003ED5B8 push1=00000018`. Guest-memory changes are exactly the two pushes plus the two non-zero host frame words (`guest_memory_changes=4`; the zero context write does not change memory). Cancellation closes the handle, clears both outputs, frees the stack, clears both callback tickets, and leaves zero workers and zero resources.
+
+Negative cases pass: instruction budget, wall-clock deadline, external parent timeout, decommitted stack (`kStackWriteDenied`), non-executable callback target (`kCodePageDenied`), unmapped system routine, unmapped start-routine argument, wrong ticket class, direct entry at `002B38A2`/`002B58B8`/`00319804` (all trap), and injected thread-preparation failure with full rollback. Existing synthetic probe (46 scenarios), real preflight/self-test, and ctest 6/6 pass in Debug and Release.
+
+### Remaining dependencies and risks
+
+- `00319804` is unmapped; its SEH registration, `fs:[0]` write and non-standard stack shape need explicit review before it can run.
+- The KPCR/ETHREAD/TLS pages are prepared and readable, but the fixture allows no guest writes to them. The system routine's SEH prolog writes `fs:[0]` and the TLS copy writes into the TLS block at `[ETHREAD+0x28]+4`; both spans must be added deliberately for the next segment.
+- `002B597D`, `002B5664`, `002B58B8` and `002B582B` are unmapped; the dynamic start-routine call `call [ebp+8]` must become a checked callback, not a raw indirect call.
+- `PsTerminateSystemThread` (`003C9E64`) is a third import slot and is outside this phase.
+- The prepared thread is never activated: no `StartThread`, callback execution, worker, SEH delivery or `PsTerminateSystemThread`.
+
+### Decision
+
+**NO-GO for authentic secondary-thread execution in Phase 2C-31.** The real probe's mapping and prepared-thread entry path do not yet cover `002B5C0F`; only the synthetic fixture exercises the two-push entry. A deterministic authentic system-routine micro-run of those two instructions is a plausible **Phase 2C-32 implementation target**, but it needs a separate real-image secondary-entry mode, a real-image callback ticket and a preflight that reports the prepared stack/KPCR/ETHREAD/TLS values. This is a GO for that scoped implementation, not for execution now. The first proposed command (not run) would be:
+
+```sh
+.local/ios-port/phase2c16-fixtures/Release/execution_probe_real_preflight \
+  --run-once --execute-real --secondary-entry
+```
+
+That mode does not exist yet and must stop before `002B5C16`; it must not run `00319804`, `002B38A2`, `002B597D`, `PsTerminateSystemThread` or anything after the stop.
+
+### Next milestone: one-worker activation plan
+
+1. Map `00319804` and validate the SEH prolog/`fs:[0]` registration and its return/stack contract against the checked frame; add the KPCR page to the reviewed writable spans.
+2. Map the TLS copy (`002B5C1B`..`002B5C72`), validate the `003ED3EC`/`003ED3F0`/`003ED3FC` source spans and the `ETHREAD+0x28` destination, and test `rep movsd`/`rep movsb` under the observer.
+3. Map `002B597D` and stop before `002B5C7E`; turn the dynamic `call [ebp+8]` into a checked `kThreadStart` callback for `002B38A2` with context `0`, and keep the start routine trap-only until its own callees are reviewed.
+4. Only then consider one kernel worker: `StartThread` on a single prepared thread, `InitContext`, callback tickets, exception handling, worker stop token, `PsTerminateSystemThread`/`ExitThread`, join and complete rollback. Acceptance requires one worker launch, one system-routine entry, no production `Boot()`, no concurrent guest execution, and zero retained resources.
+
+No graphics, audio, networking, general kernel expansion or production Apple guard changes are part of this plan.
