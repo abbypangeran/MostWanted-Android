@@ -73,7 +73,8 @@ GuestCallbackStatus CallGuestCallback(X86Context& ctx, const GuestCallbackTicket
 #ifdef MOSTWANTED_GUEST_CALLBACK_TESTS
 GuestCallbackStatus CallGuestCallbackForTest(X86Context& ctx, const GuestCallbackTicket& ticket,
                                              uint32_t current_target, std::span<const uint32_t> arguments,
-                                             uint32_t stack_base, uint32_t stack_size, uint32_t& result);
+                                             uint32_t stack_base, uint32_t stack_size, uint32_t& result,
+                                             uint32_t* final_esp = nullptr);
 #endif
 
 }  // namespace kernel

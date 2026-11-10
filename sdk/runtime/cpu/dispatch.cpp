@@ -637,7 +637,8 @@ GuestCallbackStatus CallGuestCallback(X86Context& ctx, const GuestCallbackTicket
 #ifdef MOSTWANTED_GUEST_CALLBACK_TESTS
 GuestCallbackStatus CallGuestCallbackForTest(X86Context& ctx, const GuestCallbackTicket& ticket,
                                              uint32_t current_target, std::span<const uint32_t> arguments,
-                                             uint32_t stack_base, uint32_t stack_size, uint32_t& result) {
+                                             uint32_t stack_base, uint32_t stack_size, uint32_t& result,
+                                             uint32_t* final_esp) {
     result = 0;
     if (arguments.size() > kMaximumCallbackArguments) return GuestCallbackStatus::kTooManyArguments;
     if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
@@ -673,6 +674,7 @@ GuestCallbackStatus CallGuestCallbackForTest(X86Context& ctx, const GuestCallbac
     ctx.last_icall = current_target;
     function(ctx, mem::Base());
     result = ctx.eax;
+    if (final_esp) *final_esp = ctx.esp;
     return GuestCallbackStatus::kInvoked;
 }
 #endif

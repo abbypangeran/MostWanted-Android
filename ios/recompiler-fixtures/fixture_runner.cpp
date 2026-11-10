@@ -57,6 +57,15 @@ std::atomic<kernel::GuestExceptionChainStatus> g_seh_validation_status{kernel::G
 std::atomic<uint32_t> g_seh_validation_count{0};
 std::atomic<uint32_t> g_seh_validation_calls{0};
 std::atomic<uint32_t> g_seh_handler_calls{0};
+kernel::ThreadRef g_exception_dispatch_thread;
+std::array<kernel::GuestCallbackTicket, 2> g_exception_handler_tickets{};
+std::atomic<kernel::SyntheticExceptionStatus> g_exception_dispatch_status{kernel::SyntheticExceptionStatus::kInvalidOwner};
+std::atomic<uint32_t> g_exception_dispatch_disposition{0};
+std::atomic<uint32_t> g_exception_dispatch_handlers{0};
+std::atomic<uint32_t> g_exception_dispatch_calls{0};
+std::array<kernel::SyntheticExceptionStatus, 7> g_exception_negative_statuses{};
+bool g_exception_run_negatives = true;
+bool g_exception_force_bad_ticket = false;
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
 std::mutex g_synthetic_hook_lock;
 std::condition_variable g_synthetic_hook_cv;
@@ -95,6 +104,9 @@ std::condition_variable g_kernel258_cv;
 bool g_kernel258_gate = false;
 bool g_kernel258_entered = false;
 bool g_kernel258_release = false;
+uint32_t g_kernel258_capture_log_va = 0;
+std::array<uint32_t, 52> g_kernel258_exception_log{};
+bool g_kernel258_exception_log_read = false;
 
 void ResetKernel258Gate(bool gate) {
     std::lock_guard lock(g_kernel258_lock);
@@ -121,6 +133,11 @@ void Kernel258FixtureHandler(X86Context& ctx, uint8_t*) {
     if (!kernel::SyntheticWorkerClaimHeld()) {
         kernel::Return(ctx, kernel::kInvalidParameter, 1);
         return;
+    }
+    if (g_kernel258_capture_log_va) {
+        g_kernel258_exception_log_read =
+            mem::Read(g_kernel258_capture_log_va, g_kernel258_exception_log.data(),
+                      sizeof(g_kernel258_exception_log)) == mem::AccessStatus::kOk;
     }
     {
         std::unique_lock lock(g_kernel258_lock);
@@ -217,6 +234,63 @@ void SyntheticSehHandlerMustNotRun(X86Context&, uint8_t*) { ++g_seh_handler_call
 
 void SyntheticSehInspectionCallback(X86Context& ctx, uint8_t* base) {
     SyntheticGuestCallback(ctx, base);
+    x86_checked_ret(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0, 0);
+}
+
+void SyntheticExceptionDispatchBridge(X86Context& ctx, uint8_t*) {
+    kernel::SyntheticExceptionResult result{kernel::SyntheticExceptionStatus::kInvalidOwner, 0, 0};
+    if (g_exception_dispatch_thread) {
+        if (g_exception_run_negatives) {
+            auto wrong = g_exception_handler_tickets;
+            wrong[0].target = wrong[1].target;
+            g_exception_negative_statuses[0] = kernel::DispatchSyntheticGuestExceptionForTest(
+                ctx, *g_exception_dispatch_thread, ctx.esi, ctx.edi, wrong).status;
+            auto stale = g_exception_handler_tickets;
+            --stale[0].dispatch_generation;
+            g_exception_negative_statuses[1] = kernel::DispatchSyntheticGuestExceptionForTest(
+                ctx, *g_exception_dispatch_thread, ctx.esi, ctx.edi, stale).status;
+            g_exception_negative_statuses[2] = kernel::DispatchSyntheticGuestExceptionForTest(
+                ctx, *g_exception_dispatch_thread, ctx.esi + 0x10000000, ctx.edi,
+                g_exception_handler_tickets).status;
+            g_exception_negative_statuses[3] = kernel::DispatchSyntheticGuestExceptionForTest(
+                ctx, *g_exception_dispatch_thread, ctx.esi, ctx.edi + 4,
+                g_exception_handler_tickets).status;
+            uint32_t unsupported = 99;
+            if (mem::Write(0xA52B4, &unsupported, sizeof(unsupported)) == mem::AccessStatus::kOk) {
+                g_exception_negative_statuses[4] = kernel::DispatchSyntheticGuestExceptionForTest(
+                    ctx, *g_exception_dispatch_thread, ctx.esi, ctx.edi, g_exception_handler_tickets).status;
+                unsupported = 1;
+                mem::Write(0xA52B4, &unsupported, sizeof(unsupported));
+            }
+            kernel::Thread other_owner;
+            g_exception_negative_statuses[5] = kernel::DispatchSyntheticGuestExceptionForTest(
+                ctx, other_owner, ctx.esi, ctx.edi, g_exception_handler_tickets).status;
+            uint32_t head = 0, outer = 0;
+            if (mem::Read(ctx.fs_base, &head, sizeof(head)) == mem::AccessStatus::kOk &&
+                mem::Read(head, &outer, sizeof(outer)) == mem::AccessStatus::kOk) {
+                const std::array<uint32_t, 2> overlapping{outer, g_exception_handler_tickets[0].target};
+                const uint32_t overlapping_va = ctx.esp - sizeof(overlapping);
+                if (mem::Write(overlapping_va, overlapping.data(), sizeof(overlapping)) == mem::AccessStatus::kOk &&
+                    mem::Write(ctx.fs_base, &overlapping_va, sizeof(overlapping_va)) == mem::AccessStatus::kOk) {
+                    g_exception_negative_statuses[6] = kernel::DispatchSyntheticGuestExceptionForTest(
+                        ctx, *g_exception_dispatch_thread, ctx.esi, ctx.edi, g_exception_handler_tickets).status;
+                    mem::Write(ctx.fs_base, &head, sizeof(head));
+                }
+            }
+        }
+        auto tickets = g_exception_handler_tickets;
+        if (g_exception_force_bad_ticket) tickets[0].target = tickets[1].target;
+        result = kernel::DispatchSyntheticGuestExceptionForTest(ctx, *g_exception_dispatch_thread, ctx.esi, ctx.edi,
+                                                                 tickets);
+    }
+    g_exception_dispatch_status = result.status;
+    g_exception_dispatch_disposition = result.disposition;
+    g_exception_dispatch_handlers = result.handlers_called;
+    ++g_exception_dispatch_calls;
+    if (result.status != kernel::SyntheticExceptionStatus::kHandled)
+        x86_checked_trap(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0,
+                         "synthetic exception dispatch failed");
+    ctx.eax = result.disposition;
     x86_checked_ret(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0, 0);
 }
 
@@ -960,6 +1034,11 @@ void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t seh_restore_handler_target = code_page + 0x90;
     constexpr uint32_t seh_unlink_target = code_page + 0xA0;
     constexpr uint32_t seh_terminate_target = code_page + 0xB0;
+    constexpr uint32_t exception_bridge_target = code_page + 0xC0;
+    constexpr uint32_t exception_outer_handler = code_page + 0xD0;
+    constexpr uint32_t exception_inner_handler = code_page + 0xE0;
+    constexpr uint32_t exception_termination_handler = code_page + 0xF0;
+    constexpr uint32_t exception_search_target = code_page + 0xA40;
     constexpr uint32_t output_page = 0xA5000;
     constexpr uint32_t seh_log = output_page + 0x200;
     constexpr uint32_t seh_context = output_page + 0x100;
@@ -984,6 +1063,11 @@ void CheckSyntheticWorkerLifecycle() {
         {seh_restore_handler_target, sub_00011980},
         {seh_unlink_target, sub_000119A0},
         {seh_terminate_target, sub_000119E0},
+        {exception_bridge_target, SyntheticExceptionDispatchBridge},
+        {exception_outer_handler, sub_00011B20},
+        {exception_inner_handler, sub_00011AE0},
+        {exception_termination_handler, sub_00011B60},
+        {exception_search_target, sub_00011A40},
     };
     const dispatch::Metadata metadata{code_page, code_page + mem::kPage, target, functions, {}};
     std::string error;
@@ -1290,6 +1374,193 @@ void CheckSyntheticWorkerLifecycle() {
         kernel::CloseHandle(handle);
         g_seh_validation_thread.reset();
         Check(dispatch::Init(metadata, error), "SEH worker dispatch leases unwind after normal completion");
+    }
+
+    {
+        kernel::ThreadRef thread;
+        if (!prepare(thread, exception_search_target, seh_context, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        const uint32_t old_stack_top = thread->stack_top;
+        const uint32_t old_stack_size = thread->stack_size;
+        g_exception_dispatch_thread = thread;
+        g_exception_dispatch_status = kernel::SyntheticExceptionStatus::kInvalidOwner;
+        g_exception_dispatch_disposition = 0xFFFFFFFF;
+        g_exception_dispatch_handlers = 0;
+        g_exception_dispatch_calls = 0;
+        g_exception_run_negatives = true;
+        g_exception_negative_statuses.fill(kernel::SyntheticExceptionStatus::kHandled);
+        mem::Fill(seh_log, 0, 0xC0);
+        const uint32_t search_disposition = 1;
+        const bool disposition_ready = mem::Write(seh_log + 0xB4, &search_disposition,
+                                                  sizeof(search_disposition)) == mem::AccessStatus::kOk &&
+                                       mem::Write(seh_log + 0xBC, &exception_inner_handler,
+                                                  sizeof(exception_inner_handler)) == mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket bridge_ticket;
+        const bool tickets_ready = disposition_ready &&
+            kernel::PrepareGuestCallback(exception_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_inner_handler, kernel::GuestCallbackClass::kFixture,
+                                         g_exception_handler_tickets[0]) == kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_outer_handler, kernel::GuestCallbackClass::kFixture,
+                                         g_exception_handler_tickets[1]) == kernel::GuestCallbackStatus::kReady;
+        const bool armed = tickets_ready &&
+                           arm_seh_nested(exception_search_target, seh_context, seh_context, bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        std::array<uint32_t, 48> log{};
+        const bool log_read = mem::Read(seh_log, log.data(), sizeof(log)) == mem::AccessStatus::kOk;
+        const auto retained = kernel::FromHandle(handle);
+        Check(g_exception_negative_statuses[0] == kernel::SyntheticExceptionStatus::kInvalidTicket &&
+                  g_exception_negative_statuses[1] == kernel::SyntheticExceptionStatus::kInvalidTicket &&
+                  g_exception_negative_statuses[2] == kernel::SyntheticExceptionStatus::kInvalidRecord &&
+                  g_exception_negative_statuses[3] == kernel::SyntheticExceptionStatus::kInvalidContext &&
+                  g_exception_negative_statuses[4] == kernel::SyntheticExceptionStatus::kUnsupportedDisposition &&
+                  g_exception_negative_statuses[5] == kernel::SyntheticExceptionStatus::kInvalidOwner &&
+                  g_exception_negative_statuses[6] == kernel::SyntheticExceptionStatus::kInvalidChain,
+              "synthetic exception dispatch rejects bad tickets, record/context, disposition, owner and overlapping frame");
+        Check(started && wait == kernel::kWait0 && joined && log_read &&
+                  g_exception_dispatch_status.load() == kernel::SyntheticExceptionStatus::kHandled &&
+                  g_exception_dispatch_disposition.load() == 0 && g_exception_dispatch_handlers.load() == 2 &&
+                  g_exception_dispatch_calls.load() == 1 && log[23] == 0 &&
+                  log[24] == 0xE042D900 && log[25] == 0 &&
+                  log[26] >= old_stack_top - old_stack_size && log[26] < old_stack_top && log[27] != 0 &&
+                  log[32] && log[33] && log[32] != log[33] && log[34] == 0xFFFFFFFF &&
+                  log[36] == seh_log + 0x60 && log[37] == log[33] && log[38] == seh_log + 0x68 && log[39] == 0 &&
+                  log[40] == seh_log + 0x60 && log[41] == log[32] && log[42] == seh_log + 0x68 && log[43] == 0 &&
+                  log[44] == 2 && log[45] == 1 && log[47] == exception_inner_handler &&
+                  thread->state.load() == kernel::ThreadState::kExited &&
+                  thread->exit_code.load() == seh_context && thread->resources_released && !thread->ctx &&
+                  !thread->kpcr && !thread->ethread && !thread->stack_top &&
+                  retained.get() == thread.get() && kernel::KernelWorkerCountForTest() == 0 &&
+                  kernel::Threads().empty() && mem::Query().system_used == baseline.system_used &&
+                  !kernel::SyntheticWorkerArmed(),
+              "generated exception search invokes inner then outer handlers through checked tickets and finalizes");
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::Init(metadata, error), "synthetic exception dispatch releases all dispatch leases");
+    }
+
+    {
+        kernel::ThreadRef thread;
+        if (!prepare(thread, exception_search_target, seh_context, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(seh_log, 0, 0xC0);
+        const uint32_t search_disposition = 1;
+        const bool data_ready = mem::Write(seh_log + 0xB4, &search_disposition,
+                                           sizeof(search_disposition)) == mem::AccessStatus::kOk &&
+                                mem::Write(seh_log + 0xBC, &exception_inner_handler,
+                                           sizeof(exception_inner_handler)) == mem::AccessStatus::kOk;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        g_exception_force_bad_ticket = true;
+        g_exception_dispatch_calls = 0;
+        kernel::GuestCallbackTicket bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(exception_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_inner_handler, kernel::GuestCallbackClass::kFixture,
+                                         g_exception_handler_tickets[0]) == kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_outer_handler, kernel::GuestCallbackClass::kFixture,
+                                         g_exception_handler_tickets[1]) == kernel::GuestCallbackStatus::kReady;
+        const bool started = tickets_ready &&
+                             arm_seh_nested(exception_search_target, seh_context, seh_context, bridge_ticket) &&
+                             kernel::StartThread(thread);
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        uint32_t post_bridge = UINT32_MAX;
+        const bool log_read = mem::Read(seh_log + 0x5C, &post_bridge, sizeof(post_bridge)) == mem::AccessStatus::kOk;
+        Check(started && wait == kernel::kWait0 && joined && log_read && post_bridge == 0 &&
+                  g_exception_dispatch_status.load() == kernel::SyntheticExceptionStatus::kInvalidTicket &&
+                  g_exception_dispatch_calls.load() == 1 && thread->state.load() == kernel::ThreadState::kCancelled &&
+                  thread->resources_released && !thread->ctx && !thread->kpcr && !thread->ethread &&
+                  !thread->stack_top && kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "invalid final handler ticket traps before guest continuation and cancels the worker cleanly");
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        g_exception_force_bad_ticket = false;
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::Init(metadata, error), "failed exception dispatch releases all dispatch leases");
+    }
+
+    {
+        ResetKernel258Gate(true);
+        g_kernel258_capture_log_va = seh_log;
+        g_kernel258_exception_log_read = false;
+        kernel::RegisterExport(258, "PsTerminateSystemThread", Kernel258FixtureHandler);
+        const bool bridge_enabled = dispatch::SetKernel258FixtureBridge(true);
+        kernel::ThreadRef thread;
+        if (!bridge_enabled || !prepare(thread, exception_search_target, seh_context, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        const uint32_t old_kpcr = thread->kpcr;
+        const uint32_t term_calls_before = g_kernel258_calls.load();
+        mem::Fill(seh_log, 0, 0xD0);
+        const uint32_t term_thunk = dispatch::KernelThunkAddress(258);
+        const bool data_ready = mem::Write(seh_context, &term_thunk, sizeof(term_thunk)) == mem::AccessStatus::kOk &&
+                                mem::Write(seh_log + 0xBC, &exception_termination_handler,
+                                           sizeof(exception_termination_handler)) == mem::AccessStatus::kOk;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        g_exception_dispatch_calls = 0;
+        kernel::GuestCallbackTicket bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(exception_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_termination_handler, kernel::GuestCallbackClass::kFixture,
+                                         g_exception_handler_tickets[0]) == kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_outer_handler, kernel::GuestCallbackClass::kFixture,
+                                         g_exception_handler_tickets[1]) == kernel::GuestCallbackStatus::kReady;
+        const bool armed = tickets_ready && arm_seh_nested(exception_search_target, seh_context, 0xD95A, bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const bool entered = started && WaitKernel258Entered();
+        std::atomic<bool> shutdown_done{false};
+        std::thread shutdown;
+        if (entered) shutdown = std::thread([&] { mem::Shutdown(); shutdown_done = true; });
+        const bool shutdown_started = entered && kernel::WaitForKernelWorkersShutdownForTest(std::chrono::seconds(5));
+        const bool waited = entered && shutdown_started && !shutdown_done.load();
+        ReleaseKernel258Gate();
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        if (shutdown.joinable()) shutdown.join();
+        else join_workers();
+        X86Context stale{};
+        stale.fs_base = old_kpcr;
+        const auto retained = kernel::FromHandle(handle);
+        Check(started && entered && shutdown_started && waited && shutdown_done.load() &&
+                  wait == kernel::kWait0 && g_kernel258_exception_log_read &&
+                  g_kernel258_exception_log[32] && g_kernel258_exception_log[33] &&
+                  g_kernel258_exception_log[34] == 0 &&
+                  g_kernel258_exception_log[47] == exception_termination_handler &&
+                  g_kernel258_exception_log[48] == 0 && g_kernel258_exception_log[49] == 1 &&
+                  g_kernel258_calls.load() == term_calls_before + 1 &&
+                  thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == 0xD95A &&
+                  thread->resources_released && !thread->ctx && !thread->kpcr && !thread->ethread &&
+                  !thread->stack_top && !thread->memory_owner && !mem::IsInitialized() &&
+                  kernel::ValidateGuestExceptionChain(stale, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kInvalidOwner &&
+                  retained.get() == thread.get() && kernel::KernelWorkerCountForTest() == 0 &&
+                  kernel::Threads().empty(),
+              "shutdown waits inside a ticketed guest handler; ordinal 258 exits before its marker and releases live frames");
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        g_kernel258_capture_log_va = 0;
+        kernel::DisarmSyntheticWorker();
+        ResetKernel258Gate(false);
+        Check(dispatch::SetKernel258FixtureBridge(false), "handler termination bridge disables after quiescence");
+        if (!initialize()) return;
+        Check(dispatch::Init(metadata, error), "handler termination releases dispatch and page leases");
     }
 
     callbacks_before = g_callback_fake_calls.load();
