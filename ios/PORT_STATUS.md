@@ -3099,7 +3099,7 @@ The preflights restored all patched imports and ended with zero workers/resource
 
 **Development:** Checked arithmetic and register-indirect call forms are implemented and synthetic-tested; the start and system dependency maps are recorded above.
 **Validation:** Applicable Debug/Release fixture, worker, memory, and static preflight suites pass.
-**Integration:** Scoped changes are ready for commit and fast-forward push on `feature/ios-port`; `main` is untouched. At the accepted base, the feature branch was 77 commits ahead of and zero behind `origin/main`.
+**Integration:** Implementation commit `b95c717deda92be2fabdaf74beb7d018c0894407` was fast-forward pushed to `origin/feature/ios-port`. The feature branch is 78 commits ahead of and zero behind `origin/main`; `main` is untouched.
 **Blockers:** Protection semantics, four EAX target families, the SEH handler/unwind path, imports with host-visible effects, system termination/epilogue, and the unbounded `0x001C8C20` descendants.
 **Next packages, ranked:** (1) review `0x002B58B8` protection/import and privileged-instruction contracts; (2) resolve and classify the four EAX target families and establish a production-safe indirect-target policy; (3) validate SEH registration/handler/unwind with synthetic exception fixtures; (4) implement and test the exact system epilogue OR and authentic ordinal-258 ABI; (5) expand only the `0x001C8C20` dependency needed to close these paths.
 **Customer release:** Not performed. No game boot, authentic start routine, authentic guest worker, multiple-worker concurrency, or iPhone install is claimed.
