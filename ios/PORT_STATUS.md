@@ -3600,3 +3600,106 @@ The integrated preflight still reports `PREFLIGHT reachable generated instructio
 **Next package recommendation:** implement a bounded, static-only **authentic callback-table target policy** first: enumerate the initial targets of `004720C8`, `0041E7E0`, `0041F94C` and `0041E7F0`, classify their call contracts, and add a preflight audit that rejects any table entry whose live target is not in the reviewed executable set. Only then consider a supervised run that enters `002B38A2`; that run must stop before `002B5C86` (the post-start list walk) and before `002B5CA0` (ordinal 258), or explicitly authorize those targets. This is **NO-GO** for authentic startup execution now: the 143-instruction route is complete and frozen, but the start-routine dependency closure is not.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-12 — static callback-target policy
+
+**`PHASE_2D12_CALLBACK_POLICY = PASS`.** A tracked, SHA-1-bound callback manifest and a fail-closed C++ validator now cover all four authentic startup tables, the dynamic list callback and its auxiliary slots. The validator is integrated into the integrated real-image preflight and has a dedicated positive/negative self-test scenario. No authentic callback or instruction ran.
+
+### Policy artifacts
+
+- `ios/recompiler-fixtures/callback_policy_manifest.txt` — reviewed manifest: 4 tables, 1,120 slots (875 live), 877 target records, 2 auxiliary slots, the list record and 12 lifecycle/data signatures. It is bound to image SHA-1 `f636a16af04171089f879a4bed646e185c734233`, full generated mapping count `28848` and digest `B2F9C249`.
+- `ios/recompiler-fixtures/callback_policy_generate.py` — reproducible generator for the manifest. It reads the authentic image, the full generated function mapping and the checked callback census source; it never executes guest code. The committed manifest is the reviewed policy: if the full generated mapping changes, the preflight fails closed until the manifest is regenerated.
+- `ios/recompiler-fixtures/callback_policy.h` / `.cpp` — manifest parser and auditor. It checks image identity, mapping count/digest, table extents and digests, slot contents, live counts, duplicate/overlapping ranges, target section/executable membership, target fingerprints, generated-mapping membership, ABI/cleanup consistency, status counts and lifecycle signatures.
+- Preflight integration in `execution_probe_integrated_real.cpp` prints the human summary, the machine-readable `CALLBACK_POLICY_RESULT {...}` line and only then reaches `PREFLIGHT PASS`.
+- `AuthorizesExecution` is deliberately separate from static classification. It requires `runtime_authorized`, `VERIFIED_STATIC`, matching argument count, no traps/indirect calls/indirect writes/frame mismatch, and the exact reviewed table slot. The shipped manifest sets every target to `auth=0`, so the static inventory cannot authorize a callback by itself.
+
+### Initial-slot census
+
+| Table | Address | Slots | Live | Verified | Inferred | Prohibited | Notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| A | `004720C8` | 1 | 1 | 0 | 0 | 1 | `00316DA8`; reads `[esp+4]`, `RET`, called with zero arguments, and traps on `fnclex`. |
+| B | `0041E7E0` | 3 | 2 | 0 | 2 | 0 | `0031BBA5`, `0031F04D`; zero-arg `RET`; register-indirect writes. |
+| C | `0041F94C` | 6 | 5 | 3 | 0 | 2 | `003B0C6B`, `00320602`, `0031BD3E` verified; `00317EFB`, `003195F1` trap. |
+| D | `0041E7F0` | 1,110 | 867 | 835 | 1 | 31 | Initializer chain; `00368ED0` inferred; 31 trapped targets. |
+| List | `004E87D8` | 1 | 1 | 0 | 1 | 0 | `0032062A`; one-arg `RET 4`; two indirect calls. |
+| Aux | `004720CC`/`004720D0` | 2 | 2 | 0 | 2 | 0 | `00326A43`, a bare `RET`; not a generated function entry. |
+
+Totals: **877 target records** — 838 `VERIFIED_STATIC`, 5 `INFERRED`, 34 `PROHIBITED`, 0 `UNRESOLVED`, 0 `INVALID_MAPPING`, 0 authorized. All 875 live table targets are unique and present as entries in the full generated mapping. Every target carries the `RECHECK` requirement.
+
+Side-effect census across the 877 targets: 398 have absolute global writes, 15 have register-indirect writes, 7 read `fs:`, 1 has an indirect call (`0032062A`), 11 have no normal `RET` terminal (all are among the trapped/prohibited set), and 0 call a kernel import directly.
+
+### ABI and side-effect summary
+
+- **`00316DA8`** is cdecl with one argument: it reads `[esp+4]` before any prologue and returns with `RET`. The `004720C8` call site pushes nothing, so the read lands in the caller's frame slot (the start routine's return address `002B38F8`), not in a supplied argument. It is flagged `ARG_MISMATCH` and `TRAP` and is `PROHIBITED`. This is a static contract mismatch, not a claim that the retail target was called incorrectly on the console.
+- **`0031BBA5`** and **`0031F04D`** are zero-argument cdecl `RET` functions. `0031BBA5` allocates 0x88 bytes, stores `0032062A` at `004E87E0`, and registers node `004E87D8` through `002B5B8A`. Both are `INFERRED` because of register-indirect writes.
+- **Table C** has three verified zero-argument initializers and two trapped targets. `003B0C6B` installs three pointers at `004DF780..`; `00317EFB` and `003195F1` trap on unsupported instructions.
+- **Table D** is the C/C++ initializer chain: 835 zero-argument `RET` targets are statically verified; 31 trap on unsupported instructions; `00368ED0` is inferred because of register-indirect writes.
+- **`0032062A`** is stdcall with one argument (`cmp [esp+4],0`; `RET 4`). It calls `0031BB53` directly and two function pointers through `004720CC`/`004720D0` (initial `00326A43`, a bare `RET`). It is `INFERRED`, not authorized.
+- **`00326A43`** is a bare `RET` in executable code but not a generated function entry. It is recorded as `INTERIOR_RET` and `INFERRED`; it is intentionally not treated as a mapped callback.
+
+### Writable-table provenance
+
+Static references to the table bases are reads in the four walkers only: `002B57D4` (`004720C8`), `002B57E1` (`0041F94C`), `002B5805` (`0041E7F0`) and `002B582D` (`0041E7E0`). No direct static store to a table slot was found. The tables are in writable sections, so register-indirect, aliased or runtime-computed mutation cannot be excluded; the manifest therefore does not claim immutability.
+
+All live targets carry `RECHECK`. A future indirect call must re-read the exact slot immediately before dispatch, confirm the target still equals the manifest value, confirm the target's generated mapping entry and fingerprint, and re-apply owner, memory-generation, dispatch-generation and page/stack lease checks. `AuthorizesExecution` requires the exact reviewed slot, not just a target address.
+
+### Dynamic list lifecycle
+
+Machine-checked signatures in the manifest cover:
+
+1. `002B5C76` `call 002B597D` with argument `1` — the first walk. The file sentinel is empty, the only static registration site is inside the start routine, so this is the reviewed empty-list call.
+2. `002B5C7E` `call [ebp+8]` — the start routine `002B38A2`.
+3. `0031BC0F` inside `0031BBA5` registers node `004E87D8` through `002B5B8A`; the callback is written to `004E87E0` as `0032062A`.
+4. `002B5C86` `call 002B597D` with argument `0` — the post-start walk over the registered node, calling `0032062A(0)`, then `00326A43` and `0031BB53(0)`.
+5. `002B5CA0` calls ordinal 258 `PsTerminateSystemThread` with the start routine's return value.
+
+Node layout is `LIST_ENTRY` at `+0` and callback at `+8`; the critical section is `0046C8B0`, its lock fields are `0046C8C0..0046C8C8`, and the sentinel is `0046C8CC` (self-linked in the file). The registration helper takes `(node, insert)`, enters/leaves the same critical section and returns with `RET 8`. The walker's `push [esp+0x10]` is the helper argument after stdcall cleanup; `0032062A` consumes it at `[esp+4]` and returns with `RET 4`.
+
+This is a statically reconstructed sequence, not a runtime trace. Other nodes could appear if runtime code reaches the registration helper through a computed path or mutates the static node; no such static writer was found, but the list must be re-read and revalidated before the second walk. The node is static and outlives the walk; the 0x88 allocation made by `0031BBA5` is stored elsewhere and is not the list node.
+
+### Synthetic-versus-authentic dispatch gap
+
+| Requirement | Current status |
+|---|---|
+| Persistent target policy for 1,110 slots | Static manifest and validator implemented; runtime admission not implemented. |
+| Repeated calls | List callback is invoked with `1` then `0`; one-use tickets do not cover this. |
+| Pre-registered nodes | Node `004E87D8` is registered before the post-start walk; static inventory records it, runtime re-read is required. |
+| Writable-table mutation | Detected by slot re-read requirement; no static writer claim. |
+| Re-entrancy | Initializer targets call ordinary guest code; exact depth unreviewed. |
+| Multiple guest workers | Not supported; the system routine runs on a new guest thread in the authentic flow. |
+| Long-lived callbacks | The start routine can run the whole game loop and terminate through ordinal 258; current tickets assume a prompt return. |
+| Kernel/SEH dependencies | Retail SEH 302/312 and the authentic ordinal-258 bridge remain fail-closed. |
+
+The policy can validate the initial targets statically; it is not sufficient to execute the initializer chain safely. Runtime admission still needs persistent authorization, slot re-reads, generation/owner/lease checks, re-entrancy depth and worker scheduling.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 681 PASS / 0 FAIL | 681 PASS / 0 FAIL |
+| Integrated self-test cases | 68 PASS / 0 FAIL | 68 PASS / 0 FAIL |
+| Callback-policy positive audit | PASS | PASS |
+| Callback-policy negative scenarios | 14 rejections | 14 rejections |
+| Integrated preflight, callback policy + `PREFLIGHT PASS` | PASS | PASS |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Root / secondary `--static-real` | PASS | PASS |
+| Root / secondary / integrated preflight | PASS | PASS |
+| Android ARM64 syntax (baseline, no shared production change) | PASS | — |
+
+The integrated self-test grew from the Phase 2D-11 baseline of 67 cases to 68; the checked fixture count is unchanged at 681. The integrated preflight still reports the frozen route: 143/143 reachable generated instructions, 72 root + 71 secondary, root hash `6FBF924DD2C56F08`, validates the secondary route hash `B3408A252D44C99D`, 11 functions, 0 continuations and 156 hooks. The callback policy adds no execution path: `CALLBACK_POLICY ... authorized=0`, and all 877 records remain `auth=0`.
+
+### Remaining blockers, ranked
+
+1. **No persistent runtime callback admission.** The manifest can authorize nothing (`auth=0`); the 34 prohibited and 5 inferred targets need explicit resolution or re-validation. The 867-entry initializer chain needs repeated, slot-revalidated dispatch.
+2. **34 prohibited targets.** All have at least one generated trap; `00316DA8` additionally has the zero-argument call-site/one-argument-target mismatch. Executing the initializer chain before these are resolved would trap.
+3. **Writable-table and list mutation.** No static writer was found, but the tables and node are writable. Any future call must re-read the slot and the list head under the reviewed lock and validate the observed target.
+4. **Guest scheduling and worker activation.** The system routine runs on a new guest thread; the production `StartThread` path is still test-only and `kExecutionDisabled` remains. Multiple/repeated workers and long-lived callbacks are outside the current model.
+5. **Ordinal 258 and retail SEH.** The post-start path terminates through `002B5CA0`; the authentic bridge is not enabled, and the exception path still uses unvalidated `002B5BD3`/302/312.
+6. **Protection 179/182.** ABI is corroborated but the physical-window/edge semantics remain unresolved; the build-5838 path skips the block.
+
+### Next milestone
+
+Implement a **persistent callback admission policy** (still without authentic execution): a per-call slot re-read and target revalidation API that binds the manifest record, the observed slot value, the full generated mapping entry, the owner, memory/dispatch generations and page/stack leases; supports repeated calls to the same target; and stops before the first target whose status is not `VERIFIED_STATIC`. Then add an explicitly bounded supervised entry at `002B38A2` that stops before `002B5C86` (post-start list walk) and `002B5CA0` (ordinal 258). Do not authorize authentic execution yet.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

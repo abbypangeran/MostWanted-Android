@@ -244,6 +244,7 @@ add_custom_target(generate_execution_probe_integrated DEPENDS ${INTEGRATED_PROBE
 set_target_properties(generate_execution_probe_integrated PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_executable(execution_probe_integrated_real_preflight
     execution_probe_integrated_real.cpp
+    callback_policy.cpp
     ${XBE_SDK}/runtime/cpu/dispatch.cpp
     ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
     ${XBE_SDK}/runtime/core/log.cpp
@@ -261,6 +262,8 @@ add_executable(execution_probe_integrated_real_preflight
 )
 add_dependencies(execution_probe_integrated_real_preflight generate_execution_probe_integrated)
 target_compile_features(execution_probe_integrated_real_preflight PRIVATE cxx_std_20)
+get_filename_component(CALLBACK_POLICY_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/callback_policy_manifest.txt" ABSOLUTE)
+get_filename_component(CALLBACK_POLICY_MAPPING "${CMAKE_CURRENT_SOURCE_DIR}/../../generated/game/x86_func_mapping.cpp" ABSOLUTE)
 target_include_directories(execution_probe_integrated_real_preflight PRIVATE ${XBE_SDK}/runtime ${INTEGRATED_PROBE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(execution_probe_integrated_real_preflight PRIVATE
     MOSTWANTED_EXECUTION_PROBE_TESTS=1
@@ -272,6 +275,8 @@ target_compile_definitions(execution_probe_integrated_real_preflight PRIVATE
     EXECUTION_PROBE_REAL_XBE="${EXECUTION_PROBE_REAL_XBE}"
     EXECUTION_PROBE_REAL_GENERATED_DIR="${INTEGRATED_PROBE_GENERATED_DIR}"
     EXECUTION_PROBE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    CALLBACK_POLICY_MANIFEST="${CALLBACK_POLICY_MANIFEST}"
+    CALLBACK_POLICY_MAPPING="${CALLBACK_POLICY_MAPPING}"
 )
 target_link_libraries(execution_probe_integrated_real_preflight PRIVATE Threads::Threads Zydis)
 set_target_properties(execution_probe_integrated_real_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)

@@ -34,6 +34,7 @@ bool ValidateMappingTextFromStrings(const std::string& header, const std::string
 #undef main
 
 #include "execution_probe_integrated_secondary_route.h"
+#include "callback_policy.h"
 #include "kernel/guest_callback.h"
 
 namespace {
@@ -1731,6 +1732,42 @@ bool DriveCriticalSectionHelperAbi(const SecondaryFacts& facts, uint32_t enter_r
     return true;
 }
 
+bool LoadCallbackPolicyAudit(const xbe::Image& image, callback_policy::Manifest& manifest,
+                             callback_policy::GeneratedMapping& mapping,
+                             callback_policy::AuditResult& audit, std::string& error) {
+    std::vector<uint8_t> bytes;
+    if (!ReadFile(CALLBACK_POLICY_MANIFEST, bytes)) {
+        error = "callback policy manifest is missing";
+        return false;
+    }
+    const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    if (!callback_policy::ParseManifest(text, manifest, error)) return false;
+    if (!callback_policy::LoadGeneratedMapping(CALLBACK_POLICY_MAPPING, mapping, error)) return false;
+    return callback_policy::AuditAgainstImage(image, Sha1Hex(image.file), manifest, mapping, audit, error);
+}
+
+void PrintCallbackPolicy(const callback_policy::Manifest& manifest, const callback_policy::GeneratedMapping& mapping,
+                         const callback_policy::AuditResult& audit) {
+    std::printf("CALLBACK_POLICY mapping=%u digest=%08X tables=%u slots=%u targets=%u verified=%u inferred=%u "
+                "unresolved=%u prohibited=%u invalid=%u authorized=%u\n",
+                uint32_t(mapping.order.size()), mapping.digest, audit.tables, audit.slots, audit.targets,
+                audit.verified, audit.inferred, audit.unresolved, audit.prohibited, audit.invalid, audit.authorized);
+    std::printf("CALLBACK_POLICY_RESULT {\"ok\":true,\"mapping\":%u,\"digest\":%08X,\"tables\":%u,\"slots\":%u,"
+                "\"targets\":%u,\"verified\":%u,\"inferred\":%u,\"unresolved\":%u,\"prohibited\":%u,"
+                "\"invalid\":%u,\"authorized\":%u}\n",
+                uint32_t(mapping.order.size()), mapping.digest, audit.tables, audit.slots, audit.targets, audit.verified,
+                audit.inferred, audit.unresolved, audit.prohibited, audit.invalid, audit.authorized);
+    const auto frame = manifest.targets.find(0x00316DA8);
+    if (frame != manifest.targets.end())
+        std::printf("CALLBACK_POLICY frame-sensitive=00316DA8 args=%u status=%s flags=%08X\n", frame->second.args,
+                    callback_policy::StatusName(frame->second.status), frame->second.flags);
+    const auto list = manifest.targets.find(manifest.list.callback);
+    if (list != manifest.targets.end())
+        std::printf("CALLBACK_POLICY list node=%08X callback=%08X args=%u cleanup=%s status=%s auth=%u\n",
+                    manifest.list.node, manifest.list.callback, list->second.args, list->second.cleanup.c_str(),
+                    callback_policy::StatusName(list->second.status), list->second.runtime_authorized ? 1u : 0u);
+}
+
 int RunIntegratedPreflight(const std::string& scenario) {
     alarm(12);
     if (!mem::Init()) {
@@ -1760,6 +1797,12 @@ int RunIntegratedPreflight(const std::string& scenario) {
     if (scenario == "preflight") {
         ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
         if (!ok) return finish(error.c_str(), false);
+        callback_policy::Manifest policy;
+        callback_policy::GeneratedMapping mapping;
+        callback_policy::AuditResult policy_audit;
+        if (!LoadCallbackPolicyAudit(image, policy, mapping, policy_audit, error))
+            return finish(error.c_str(), false);
+        PrintCallbackPolicy(policy, mapping, policy_audit);
         if (!ValidateSecondaryRouteText(image, error)) return finish(error.c_str(), false);
         std::string generated;
         size_t supported = 0;
@@ -1803,6 +1846,145 @@ int RunIntegratedPreflight(const std::string& scenario) {
         candidate->ctx = nullptr;
         if (!CancelCandidateAtOutputs(candidate, facts.import_args[0], facts.import_args[4], error))
             return finish(error.c_str(), false);
+        return finish(nullptr, false);
+    }
+    if (scenario == "callback-policy") {
+        ok = PrepareRealImage(EXECUTION_PROBE_REAL_XBE, image, options, facts, error);
+        if (!ok) return finish(error.c_str(), false);
+        callback_policy::Manifest policy;
+        callback_policy::GeneratedMapping mapping;
+        callback_policy::AuditResult audit;
+        if (!LoadCallbackPolicyAudit(image, policy, mapping, audit, error)) return finish(error.c_str(), false);
+        if (audit.tables != 4 || audit.slots != 875 || audit.targets != 877 || audit.verified != 838 ||
+            audit.inferred != 5 || audit.unresolved != 0 || audit.prohibited != 34 || audit.invalid != 0 ||
+            audit.authorized != 0)
+            return finish("callback policy review counts changed", false);
+        PrintCallbackPolicy(policy, mapping, audit);
+        const auto frame = policy.targets.find(0x00316DA8);
+        if (frame == policy.targets.end() || frame->second.status != callback_policy::Status::kProhibited ||
+            !(frame->second.flags & callback_policy::kArgMismatch) || frame->second.args != 1)
+            return finish("callback policy frame-sensitive classification changed", false);
+
+        const std::string sha1 = Sha1Hex(image.file);
+        auto rejected = [&](const callback_policy::Manifest& candidate, const char* label, std::string& reason) {
+            callback_policy::AuditResult result;
+            if (callback_policy::AuditAgainstImage(image, sha1, candidate, mapping, result, reason)) return false;
+            std::printf("CALLBACK_POLICY_REJECT %s: %s\n", label, reason.c_str());
+            return true;
+        };
+        auto rejected_image = [&](const xbe::Image& candidate, const char* label, std::string& reason) {
+            callback_policy::AuditResult result;
+            if (callback_policy::AuditAgainstImage(candidate, sha1, policy, mapping, result, reason)) return false;
+            std::printf("CALLBACK_POLICY_REJECT %s: %s\n", label, reason.c_str());
+            return true;
+        };
+        std::string reason;
+
+        {
+            callback_policy::AuditResult result;
+            if (callback_policy::AuditAgainstImage(image, std::string(40, '0'), policy, mapping, result, reason))
+                return finish("callback policy accepted a wrong image identity", false);
+            std::printf("CALLBACK_POLICY_REJECT identity: %s\n", reason.c_str());
+        }
+        {
+            xbe::Image changed = image;
+            const int64_t offset = changed.Offset(0x004720C8);
+            const uint32_t zero = 0;
+            if (offset < 0) return finish("could not locate table A", false);
+            std::memcpy(changed.file.data() + size_t(offset), &zero, sizeof(zero));
+            if (!rejected_image(changed, "table-data", reason))
+                return finish("callback policy accepted changed table data", false);
+        }
+        {
+            auto changed = policy;
+            changed.tables[3].count = 1109;
+            if (!rejected(changed, "table-length", reason))
+                return finish("callback policy accepted an incorrect table length", false);
+        }
+        {
+            auto changed = policy;
+            changed.tables[3].live = 866;
+            if (!rejected(changed, "table-live", reason))
+                return finish("callback policy accepted an incorrect live count", false);
+        }
+        {
+            auto changed = policy;
+            changed.slots.push_back(changed.slots.front());
+            if (!rejected(changed, "duplicate-slot", reason))
+                return finish("callback policy accepted a duplicate slot", false);
+        }
+        {
+            auto changed = policy;
+            changed.tables.push_back({'E', 0x004720C8, 1, 1, 0x56110B57u, true});
+            if (!rejected(changed, "table-overlap", reason))
+                return finish("callback policy accepted overlapping tables", false);
+        }
+        {
+            auto changed = policy;
+            changed.targets[0x003B0C6B].section_flags = 0;
+            if (!rejected(changed, "non-executable", reason))
+                return finish("callback policy accepted a non-executable target", false);
+        }
+        {
+            auto changed = policy;
+            changed.targets[0x003B0C6B].mapped = false;
+            if (!rejected(changed, "unmapped", reason))
+                return finish("callback policy accepted an unmapped target", false);
+        }
+        {
+            auto changed = policy;
+            changed.targets[0x003B0C6B].status = callback_policy::Status::kInvalidMapping;
+            if (!rejected(changed, "invalid-target", reason))
+                return finish("callback policy accepted an invalid target status", false);
+        }
+        {
+            xbe::Image changed = image;
+            const int64_t offset = changed.Offset(0x002B5CA0);
+            if (offset < 0) return finish("could not locate the list termination signature", false);
+            changed.file[size_t(offset)] ^= 0xFF;
+            if (!rejected_image(changed, "signature", reason))
+                return finish("callback policy accepted a changed lifecycle signature", false);
+        }
+        {
+            auto changed = mapping;
+            changed.order.push_back(0x003C9C9E);
+            callback_policy::AuditResult result;
+            if (callback_policy::AuditAgainstImage(image, sha1, policy, changed, result, reason))
+                return finish("callback policy accepted a stale generated mapping", false);
+            std::printf("CALLBACK_POLICY_REJECT stale-mapping: %s\n", reason.c_str());
+        }
+        {
+            auto changed = policy;
+            changed.list.args = 0;
+            if (!rejected(changed, "list-abi", reason))
+                return finish("callback policy accepted a wrong list ABI", false);
+        }
+        {
+            auto changed = policy;
+            changed.targets[0x003B0C6B].status = callback_policy::Status::kUnresolved;
+            callback_policy::AuditResult result;
+            std::string why;
+            if (!callback_policy::AuditAgainstImage(image, sha1, changed, mapping, result, why))
+                return finish(("callback policy could not record an unresolved ABI: " + why).c_str(), false);
+            if (result.unresolved != 1)
+                return finish("callback policy did not count the unresolved ABI", false);
+            if (callback_policy::AuthorizesExecution(changed, 'C', 0x0041F950, 0x003B0C6B, 0))
+                return finish("callback policy authorized an unresolved target", false);
+            std::printf("CALLBACK_POLICY_REJECT unresolved-authorization: recorded but not authorized\n");
+        }
+        if (callback_policy::AuthorizesExecution(policy, 'A', 0x004720C8, 0x00316DA8, 0))
+            return finish("callback policy authorized the frame-sensitive target", false);
+        if (callback_policy::AuthorizesExecution(policy, 'C', 0x0041F950, 0x003B0C6B, 0))
+            return finish("callback policy authorized a target by manifest presence alone", false);
+        {
+            auto changed = policy;
+            changed.targets[0x00316DA8].runtime_authorized = true;
+            if (callback_policy::AuthorizesExecution(changed, 'A', 0x004720C8, 0x00316DA8, 0))
+                return finish("callback policy authorized a prohibited target", false);
+            std::printf("CALLBACK_POLICY_REJECT prohibited-authorization: flag alone is insufficient\n");
+        }
+        std::printf("RESULT ok callback-policy verified=%u inferred=%u prohibited=%u unresolved=%u authorized=0\n",
+                    audit.verified, audit.inferred, audit.prohibited, audit.unresolved);
         return finish(nullptr, false);
     }
     if (scenario == "owner-prepared-thread" || scenario == "owner-zero-rejected" ||
@@ -2933,6 +3115,7 @@ int main(int argc, char** argv) {
     };
     const Case cases[] = {
         {"preflight", 0, "PREFLIGHT PASS"},
+        {"callback-policy", 0, "RESULT ok callback-policy"},
         {"identity-missing", 3, "real XBE is missing"},
         {"identity-mismatch", 3, "SHA-1 mismatch"},
         {"root-route-mismatch", 3, "route"},
