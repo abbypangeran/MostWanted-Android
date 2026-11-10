@@ -63,6 +63,21 @@ std::atomic<kernel::SyntheticExceptionStatus> g_exception_dispatch_status{kernel
 std::atomic<uint32_t> g_exception_dispatch_disposition{0};
 std::atomic<uint32_t> g_exception_dispatch_handlers{0};
 std::atomic<uint32_t> g_exception_dispatch_calls{0};
+std::atomic<kernel::SyntheticUnwindStatus> g_unwind_status{kernel::SyntheticUnwindStatus::kInvalidOwner};
+std::atomic<kernel::SyntheticUnwindStatus> g_unwind_reentry_status{
+    kernel::SyntheticUnwindStatus::kInvalidOwner};
+std::atomic<uint32_t> g_unwind_calls{0};
+std::atomic<bool> g_unwind_force_bad_target{false};
+std::atomic<bool> g_unwind_force_bad_ip{false};
+std::atomic<bool> g_unwind_force_bad_ticket{false};
+std::mutex g_continuation_admission_lock;
+std::condition_variable g_continuation_admission_cv;
+bool g_continuation_admission_entered = false;
+bool g_continuation_admission_release = false;
+std::mutex g_unwind_pause_lock;
+std::condition_variable g_unwind_pause_cv;
+bool g_unwind_pause_entered = false;
+bool g_unwind_pause_release = false;
 std::array<kernel::SyntheticExceptionStatus, 7> g_exception_negative_statuses{};
 bool g_exception_run_negatives = true;
 bool g_exception_force_bad_ticket = false;
@@ -292,6 +307,102 @@ void SyntheticExceptionDispatchBridge(X86Context& ctx, uint8_t*) {
                          "synthetic exception dispatch failed");
     ctx.eax = result.disposition;
     x86_checked_ret(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0, 0);
+}
+
+void SyntheticUnwindPauseHandler(X86Context& ctx, uint8_t*) {
+    {
+        std::unique_lock lock(g_unwind_pause_lock);
+        g_unwind_pause_entered = true;
+        g_unwind_pause_cv.notify_all();
+        g_unwind_pause_cv.wait(lock, [] { return g_unwind_pause_release; });
+    }
+    ctx.eax = 0;
+    if (ctx.checked_call) {
+        ctx.checked_call->returned = true;
+        ctx.checked_call = ctx.checked_call->previous;
+    }
+    ctx.esp += 20;
+}
+
+void SyntheticUnwindReentryHandler(X86Context& ctx, uint8_t*) {
+    if (g_exception_dispatch_thread) {
+        const uint32_t record = kernel::R32(ctx.esp + 4);
+        const uint32_t frame = kernel::R32(ctx.esp + 8);
+        const uint32_t context = kernel::R32(ctx.esp + 0x0C);
+        const auto tickets = g_exception_handler_tickets;
+        g_unwind_reentry_status = kernel::SyntheticRtlUnwindForTest(
+                                      ctx, *g_exception_dispatch_thread, record, frame, 0x11F00u, context, tickets)
+                                      .status;
+    }
+    ctx.eax = 0;
+    if (ctx.checked_call) {
+        ctx.checked_call->returned = true;
+        ctx.checked_call = ctx.checked_call->previous;
+    }
+    ctx.esp += 20;
+}
+
+void SyntheticUnwindBridge(X86Context& ctx, uint8_t*) {
+    ++g_unwind_calls;
+    kernel::SyntheticUnwindResult result{kernel::SyntheticUnwindStatus::kInvalidOwner, 0};
+    if (g_exception_dispatch_thread) {
+        auto tickets = g_exception_handler_tickets;
+        if (g_unwind_force_bad_ticket.load()) tickets[0].target = tickets[1].target;
+        const uint32_t record_va = ctx.esi;
+        const uint32_t target_frame = g_unwind_force_bad_target.load() ? 0xDEADBEEF : ctx.edi;
+        const uint32_t target_ip = g_unwind_force_bad_ip.load() ? 0x11F04u : ctx.edx;
+        result = kernel::SyntheticRtlUnwindForTest(ctx, *g_exception_dispatch_thread, record_va, target_frame,
+                                                   target_ip, ctx.ebx, tickets);
+    }
+    g_unwind_status = result.status;
+    x86_checked_trap(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0,
+                     "synthetic unwind failed");
+}
+
+void ContinuationAdmissionHook() {
+    std::unique_lock lock(g_continuation_admission_lock);
+    g_continuation_admission_entered = true;
+    g_continuation_admission_cv.notify_all();
+    g_continuation_admission_cv.wait(lock, [] { return g_continuation_admission_release; });
+}
+
+void ResetContinuationAdmission() {
+    std::lock_guard lock(g_continuation_admission_lock);
+    g_continuation_admission_entered = false;
+    g_continuation_admission_release = false;
+}
+
+bool WaitContinuationAdmissionEntered() {
+    std::unique_lock lock(g_continuation_admission_lock);
+    return g_continuation_admission_cv.wait_for(lock, std::chrono::seconds(5),
+                                                [] { return g_continuation_admission_entered; });
+}
+
+void ReleaseContinuationAdmission() {
+    {
+        std::lock_guard lock(g_continuation_admission_lock);
+        g_continuation_admission_release = true;
+    }
+    g_continuation_admission_cv.notify_all();
+}
+
+void ResetUnwindPause() {
+    std::lock_guard lock(g_unwind_pause_lock);
+    g_unwind_pause_entered = false;
+    g_unwind_pause_release = false;
+}
+
+bool WaitUnwindPauseEntered() {
+    std::unique_lock lock(g_unwind_pause_lock);
+    return g_unwind_pause_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_unwind_pause_entered; });
+}
+
+void ReleaseUnwindPause() {
+    {
+        std::lock_guard lock(g_unwind_pause_lock);
+        g_unwind_pause_release = true;
+    }
+    g_unwind_pause_cv.notify_all();
 }
 
 void CallbackPageMutationWaiting() {
@@ -1039,7 +1150,27 @@ void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t exception_inner_handler = code_page + 0xE0;
     constexpr uint32_t exception_termination_handler = code_page + 0xF0;
     constexpr uint32_t exception_search_target = code_page + 0xA40;
+    constexpr uint32_t continuation_target = code_page + 0xF00;
+    constexpr uint32_t exception_continuation_handler = code_page + 0xF04;
+    constexpr uint32_t unwind_handler = code_page + 0xF08;
+    constexpr uint32_t unwind_termination_handler = code_page + 0xF0C;
+    constexpr uint32_t unwind_bridge_target = code_page + 0xF10;
+    constexpr uint32_t unwind_pause_handler = code_page + 0xF14;
+    constexpr uint32_t continuation_outer = code_page + 0xF18;
+    constexpr uint32_t unwind_reentry_handler = code_page + 0xF1C;
+    constexpr uint32_t continuation_start_target = code_page + 0xF20;
+    constexpr uint32_t unwind_start_target = code_page + 0xF30;
     constexpr uint32_t output_page = 0xA5000;
+    constexpr uint32_t continuation_record = output_page + 0x400;
+    constexpr uint32_t continuation_outer_slot = output_page + 0x408;
+    constexpr uint32_t continuation_inner_slot = output_page + 0x40C;
+    constexpr uint32_t continuation_context = output_page + 0x410;
+    constexpr uint32_t continuation_log = output_page + 0x450;
+    constexpr uint32_t continuation_post_bridge = output_page + 0x4E0;
+    constexpr uint32_t continuation_target_ip_slot = output_page + 0x4D8;
+    constexpr uint32_t continuation_marker = output_page + 0x500;
+    constexpr uint32_t continuation_result_slot = output_page + 0x540;
+    constexpr uint32_t continuation_unwind_log = output_page + 0x550;
     constexpr uint32_t seh_log = output_page + 0x200;
     constexpr uint32_t seh_context = output_page + 0x100;
     constexpr uint32_t start_context = 0x13572468;
@@ -1068,8 +1199,19 @@ void CheckSyntheticWorkerLifecycle() {
         {exception_inner_handler, sub_00011AE0},
         {exception_termination_handler, sub_00011B60},
         {exception_search_target, sub_00011A40},
+        {continuation_target, sub_00011C20},
+        {exception_continuation_handler, sub_00011BA0},
+        {unwind_handler, sub_00011CA0},
+        {unwind_termination_handler, sub_00011CE0},
+        {unwind_bridge_target, SyntheticUnwindBridge},
+        {unwind_pause_handler, SyntheticUnwindPauseHandler},
+        {continuation_outer, SyntheticSehHandlerMustNotRun},
+        {unwind_reentry_handler, SyntheticUnwindReentryHandler},
+        {continuation_start_target, sub_00011D20},
+        {unwind_start_target, sub_00011DE0},
     };
-    const dispatch::Metadata metadata{code_page, code_page + mem::kPage, target, functions, {}};
+    static const uint32_t continuations[] = {continuation_target};
+    const dispatch::Metadata metadata{code_page, code_page + mem::kPage, target, functions, continuations};
     std::string error;
     auto initialize = [&] {
         const bool ready = mem::Init() && mem::Commit(code_page, mem::kPage) && mem::Commit(output_page, mem::kPage) &&
@@ -1134,6 +1276,24 @@ void CheckSyntheticWorkerLifecycle() {
         authorization.dispatch_generation = start_ticket.dispatch_generation;
         authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
         authorization.callback_ticket = callback_ticket;
+        return kernel::ArmSyntheticWorker(authorization);
+    };
+    auto arm_continuation = [&](uint32_t start, uint32_t context, uint32_t expected_exit,
+                                const kernel::GuestCallbackTicket& bridge_ticket) {
+        kernel::GuestCallbackTicket start_ticket;
+        if (kernel::PrepareGuestCallback(start, kernel::GuestCallbackClass::kThreadStart, start_ticket) !=
+            kernel::GuestCallbackStatus::kReady)
+            return false;
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.context = context;
+        authorization.expected_exit = expected_exit;
+        authorization.code_base = code_page;
+        authorization.code_end = code_page + mem::kPage;
+        authorization.dispatch_generation = start_ticket.dispatch_generation;
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        authorization.continuation_target = continuation_target;
+        authorization.callback_ticket = bridge_ticket;
         return kernel::ArmSyntheticWorker(authorization);
     };
     auto clear_dynamic_output = [&] {
@@ -1561,6 +1721,780 @@ void CheckSyntheticWorkerLifecycle() {
         Check(dispatch::SetKernel258FixtureBridge(false), "handler termination bridge disables after quiescence");
         if (!initialize()) return;
         Check(dispatch::Init(metadata, error), "handler termination releases dispatch and page leases");
+    }
+
+    // Phase 2D-10: checked synthetic guest-context continuation.
+    {
+        constexpr uint32_t expected = 0xC0DE2002;
+        kernel::ThreadRef thread;
+        if (!prepare(thread, unwind_start_target, continuation_record, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(continuation_record, 0, 0x40);
+        mem::Fill(continuation_log, 0, 0x20);
+        mem::Fill(continuation_marker, 0, 0x40);
+        mem::Fill(continuation_unwind_log, 0, 0x20);
+        const uint32_t target_esp = thread->stack_top - 0x200;
+        const uint32_t target_ebp = thread->stack_top - 0x180;
+        const uint32_t sentinel = 0xFFFFFFF0u;
+        std::array<uint32_t, 16> context_block{};
+        context_block[2] = continuation_target;
+        context_block[3] = target_esp;
+        context_block[4] = target_ebp;
+        context_block[5] = 0x11111111;
+        context_block[6] = 0x22222222;
+        context_block[7] = 0x33333333;
+        context_block[8] = 0x44444444;
+        context_block[9] = 0x55555555;
+        context_block[10] = 0x66666666;
+        context_block[11] = 0x000008D5u;
+        const uint32_t inner_target = unwind_handler;
+        const uint32_t outer_target = continuation_outer;
+        uint32_t disposition = 0;
+        const bool data_ready =
+            mem::Write(continuation_record, std::array<uint32_t, 2>{0xE042D900u, 0}.data(), 8) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_target_ip_slot, &continuation_target, sizeof(continuation_target)) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(continuation_result_slot, &expected, sizeof(expected)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_unwind_log + 0x14, &disposition, sizeof(disposition)) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(target_esp, &sentinel, sizeof(sentinel)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_context, context_block.data(), sizeof(context_block)) ==
+                mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(unwind_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+        g_exception_handler_tickets[0] = inner_ticket;
+        g_exception_handler_tickets[1] = outer_ticket;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        const uint32_t handler_calls_before = g_seh_handler_calls.load();
+        const uint32_t unwind_calls_before = g_unwind_calls.load();
+        Check(tickets_ready, "nested unwind tickets and context prepare");
+        const bool armed =
+            tickets_ready && arm_continuation(unwind_start_target, continuation_record, expected, bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        std::array<uint32_t, 16> marker{};
+        std::array<uint32_t, 2> frames{};
+        std::array<uint32_t, 4> unwind_log{};
+        uint32_t post_bridge = 1;
+        const bool marker_read = mem::Read(continuation_marker, marker.data(), sizeof(marker)) == mem::AccessStatus::kOk;
+        const bool frames_read = mem::Read(continuation_log, frames.data(), sizeof(frames)) == mem::AccessStatus::kOk;
+        const bool unwind_read = mem::Read(continuation_unwind_log, unwind_log.data(), sizeof(unwind_log)) ==
+                                 mem::AccessStatus::kOk;
+        const bool post_read = mem::Read(continuation_post_bridge, &post_bridge, sizeof(post_bridge)) ==
+                               mem::AccessStatus::kOk;
+        const auto retained = kernel::FromHandle(handle);
+        Check(started && wait == kernel::kWait0 && joined && marker_read && frames_read && unwind_read && post_read &&
+                  thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == expected &&
+                  thread->resources_released && !thread->ctx && !thread->kpcr && !thread->ethread &&
+                  !thread->stack_top && retained.get() == thread.get() && frames[0] && frames[1] &&
+                  marker[0] == 0x11111111 && marker[1] == 0x22222222 && marker[2] == 0x33333333 &&
+                  marker[3] == 0x44444444 && marker[4] == 0x55555555 && marker[5] == 0x66666666 &&
+                  marker[6] == frames[0] && marker[8] == 0x600D && marker[10] == 0x600D && marker[11] == 0x600D &&
+                  unwind_log[0] == frames[1] && unwind_log[1] == 2 && unwind_log[2] == 1 &&
+                  post_bridge == 0 && g_seh_handler_calls.load() == handler_calls_before &&
+                  g_unwind_calls.load() == unwind_calls_before + 1 &&
+                  kernel::LastSyntheticContinuationStatusForTest() ==
+                      kernel::SyntheticContinuationStatus::kResumed &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  !kernel::SyntheticWorkerArmed() && mem::Query().system_used == baseline.system_used,
+              "nested unwind invokes the inner handler, removes it, and resumes the outer-scope continuation");
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::Init(metadata, error), "nested unwind releases dispatch and page leases after completion");
+    }
+
+    {
+        kernel::RegisterExport(258, "PsTerminateSystemThread", Kernel258FixtureHandler);
+        const bool bridge_enabled = dispatch::SetKernel258FixtureBridge(true);
+        const uint32_t terminate_thunk = dispatch::KernelThunkAddress(258);
+        kernel::ThreadRef thread;
+        if (!bridge_enabled || !prepare(thread, unwind_start_target, continuation_record, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(continuation_record, 0, 0x40);
+        mem::Fill(continuation_marker, 0, 0x40);
+        mem::Fill(continuation_unwind_log, 0, 0x20);
+        const uint32_t target_esp = thread->stack_top - 0x200;
+        const uint32_t sentinel = 0xFFFFFFF0u;
+        std::array<uint32_t, 16> context_block{};
+        context_block[2] = continuation_target;
+        context_block[3] = target_esp;
+        context_block[4] = thread->stack_top - 0x180;
+        context_block[11] = 0x000008D5u;
+        const uint32_t inner_target = unwind_termination_handler;
+        const uint32_t outer_target = continuation_outer;
+        const bool data_ready =
+            mem::Write(continuation_record, std::array<uint32_t, 2>{0xE042D900u, 0}.data(), 8) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_target_ip_slot, &continuation_target, sizeof(continuation_target)) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(seh_context, &terminate_thunk, sizeof(terminate_thunk)) == mem::AccessStatus::kOk &&
+            mem::Write(target_esp, &sentinel, sizeof(sentinel)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_context, context_block.data(), sizeof(context_block)) ==
+                mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(unwind_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+        g_exception_handler_tickets[0] = inner_ticket;
+        g_exception_handler_tickets[1] = outer_ticket;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        const uint32_t termination_calls_before = g_kernel258_calls.load();
+        Check(tickets_ready, "unwind termination tickets and context prepare");
+        const bool armed = tickets_ready && arm_continuation(unwind_start_target, continuation_record, 0xD9A0,
+                                                            bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        std::array<uint32_t, 4> unwind_log{};
+        std::array<uint32_t, 16> marker{};
+        const bool log_read = mem::Read(continuation_unwind_log, unwind_log.data(), sizeof(unwind_log)) ==
+                              mem::AccessStatus::kOk;
+        const bool marker_read = mem::Read(continuation_marker, marker.data(), sizeof(marker)) ==
+                                 mem::AccessStatus::kOk;
+        const auto retained = kernel::FromHandle(handle);
+        Check(started && wait == kernel::kWait0 && joined && log_read && marker_read &&
+                  thread->state.load() == kernel::ThreadState::kExited &&
+                  thread->exit_code.load() == 0xD9A0 && thread->resources_released && !thread->ctx &&
+                  !thread->kpcr && !thread->ethread && !thread->stack_top && retained.get() == thread.get() &&
+                  unwind_log[3] == 1 && unwind_log[2] == 0 && marker[0] == 0 &&
+                  g_kernel258_calls.load() == termination_calls_before + 1 &&
+                  kernel::LastSyntheticContinuationStatusForTest() !=
+                      kernel::SyntheticContinuationStatus::kResumed &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "guest termination during unwind preserves the exit status and never enters the continuation");
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::SetKernel258FixtureBridge(false), "unwind termination bridge disables after the test");
+        Check(dispatch::Init(metadata, error), "unwind termination releases dispatch and page leases");
+    }
+
+    {
+        constexpr uint32_t expected = 0xC0DE1001;
+        kernel::ThreadRef thread;
+        if (!prepare(thread, continuation_start_target, continuation_record, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(continuation_record, 0, 0x40);
+        mem::Fill(continuation_log, 0, 0x20);
+        mem::Fill(continuation_marker, 0, 0x40);
+        const uint32_t inner_target = exception_continuation_handler;
+        const uint32_t outer_target = continuation_outer;
+        const bool data_ready =
+            mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_result_slot, &expected, sizeof(expected)) == mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+        g_exception_handler_tickets[0] = inner_ticket;
+        g_exception_handler_tickets[1] = outer_ticket;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        g_exception_dispatch_calls = 0;
+        const uint32_t handler_calls_before = g_seh_handler_calls.load();
+        Check(tickets_ready, "continuation handler tickets and slots prepare");
+        const bool armed =
+            tickets_ready && arm_continuation(continuation_start_target, continuation_record, expected, bridge_ticket);
+        Check(armed, "continuation authorization arms for the generated continuation target");
+        const bool started = armed && kernel::StartThread(thread);
+        Check(started, "continuation worker starts");
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        std::array<uint32_t, 16> marker{};
+        std::array<uint32_t, 2> frames{};
+        uint32_t post_bridge = 1;
+        const bool marker_read = mem::Read(continuation_marker, marker.data(), sizeof(marker)) == mem::AccessStatus::kOk;
+        const bool frames_read = mem::Read(continuation_log, frames.data(), sizeof(frames)) == mem::AccessStatus::kOk;
+        const bool post_read = mem::Read(continuation_post_bridge, &post_bridge, sizeof(post_bridge)) ==
+                               mem::AccessStatus::kOk;
+        const auto retained = kernel::FromHandle(handle);
+        Check(started && wait == kernel::kWait0 && joined && marker_read && frames_read && post_read &&
+                  thread->state.load() == kernel::ThreadState::kExited &&
+                  thread->exit_code.load() == expected && thread->resources_released && !thread->ctx &&
+                  !thread->kpcr && !thread->ethread && !thread->stack_top &&
+                  !thread->start_routine_ticket.target && retained.get() == thread.get() &&
+                  marker[0] == 0x11111111 && marker[1] == 0x22222222 && marker[2] == 0x33333333 &&
+                  marker[3] == 0x44444444 && marker[4] == 0x55555555 && marker[5] == 0x66666666 &&
+                  marker[6] == frames[1] && marker[8] == 0x600D && marker[9] == 0xE0E0E0E0 &&
+                  marker[10] == 0x600D && marker[11] == 0x600D &&
+                  post_bridge == 0 && g_seh_handler_calls.load() == handler_calls_before &&
+                  kernel::LastSyntheticContinuationStatusForTest() ==
+                      kernel::SyntheticContinuationStatus::kResumed &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  !kernel::SyntheticWorkerArmed() && mem::Query().system_used == baseline.system_used,
+              "handler disposition resumes the authorized generated continuation with preserved registers and flags");
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::Init(metadata, error), "continuation releases dispatch and page leases after completion");
+    }
+
+    {
+        constexpr uint32_t expected = 0xC0DE3003;
+        auto run_fault = [&](kernel::SyntheticContinuationFault fault,
+                             kernel::SyntheticContinuationStatus& continuation_status,
+                             kernel::SyntheticExceptionStatus& dispatch_status) {
+            kernel::ThreadRef thread;
+            if (!prepare(thread, continuation_start_target, continuation_record, output_page)) return false;
+            uint32_t handle = 0;
+            mem::Read(output_page, &handle, sizeof(handle));
+            mem::Fill(continuation_record, 0, 0x40);
+            mem::Fill(continuation_log, 0, 0x20);
+            mem::Fill(continuation_marker, 0, 0x40);
+            const uint32_t inner_target = exception_continuation_handler;
+            const uint32_t outer_target = continuation_outer;
+            const bool data_ready =
+                mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+                mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+                mem::Write(continuation_result_slot, &expected, sizeof(expected)) == mem::AccessStatus::kOk;
+            kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+            const bool tickets_ready = data_ready &&
+                kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                    kernel::GuestCallbackStatus::kReady &&
+                kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                    kernel::GuestCallbackStatus::kReady &&
+                kernel::PrepareGuestCallback(exception_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                             bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+            g_exception_handler_tickets[0] = inner_ticket;
+            g_exception_handler_tickets[1] = outer_ticket;
+            g_exception_dispatch_thread = thread;
+            g_exception_run_negatives = false;
+            g_exception_dispatch_status = kernel::SyntheticExceptionStatus::kHandled;
+            g_exception_dispatch_calls = 0;
+            const bool armed = tickets_ready &&
+                               arm_continuation(continuation_start_target, continuation_record, expected, bridge_ticket);
+            kernel::SetSyntheticContinuationFaultForTest(fault);
+            const bool started = armed && kernel::StartThread(thread);
+            const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+            if (!started) kernel::CancelPreparedThread(thread);
+            const bool joined = join_workers();
+            uint32_t marker0 = 1, post = 1;
+            const bool marker_read = mem::Read(continuation_marker, &marker0, sizeof(marker0)) ==
+                                     mem::AccessStatus::kOk;
+            const bool post_read = mem::Read(continuation_post_bridge, &post, sizeof(post)) ==
+                                   mem::AccessStatus::kOk;
+            continuation_status = kernel::LastSyntheticContinuationStatusForTest();
+            dispatch_status = g_exception_dispatch_status.load();
+            const bool ok = started && wait == kernel::kWait0 && joined && marker_read && post_read &&
+                            thread->state.load() == kernel::ThreadState::kCancelled &&
+                            thread->exit_code.load() == 0 && thread->resources_released &&
+                            !thread->ctx && !thread->kpcr && !thread->ethread && !thread->stack_top &&
+                            marker0 == 0 && post == 0 && kernel::KernelWorkerCountForTest() == 0 &&
+                            kernel::Threads().empty() && mem::Query().system_used == baseline.system_used;
+            kernel::CloseHandle(handle);
+            g_exception_dispatch_thread.reset();
+            g_exception_handler_tickets = {};
+            g_exception_run_negatives = true;
+            kernel::SetSyntheticContinuationFaultForTest(kernel::SyntheticContinuationFault::kNone);
+            kernel::DisarmSyntheticWorker();
+            Check(dispatch::Init(metadata, error), "failed continuation releases dispatch and page leases");
+            return ok;
+        };
+
+        const kernel::SyntheticContinuationFault faults[] = {
+            kernel::SyntheticContinuationFault::kUnauthorizedTarget,
+            kernel::SyntheticContinuationFault::kInvalidStack,
+            kernel::SyntheticContinuationFault::kInvalidFlags,
+            kernel::SyntheticContinuationFault::kStaleDispatch,
+            kernel::SyntheticContinuationFault::kStaleMemory,
+        };
+        for (kernel::SyntheticContinuationFault fault : faults) {
+            kernel::SyntheticContinuationStatus continuation_status = kernel::SyntheticContinuationStatus::kResumed;
+            kernel::SyntheticExceptionStatus dispatch_status = kernel::SyntheticExceptionStatus::kHandled;
+            const bool ok = run_fault(fault, continuation_status, dispatch_status);
+            Check(ok && dispatch_status == kernel::SyntheticExceptionStatus::kInvalidContinuation &&
+                      continuation_status != kernel::SyntheticContinuationStatus::kResumed,
+                  "invalid continuation context is rejected before a guest continuation executes");
+        }
+    }
+
+    {
+        constexpr uint32_t expected = 0xC0DE4004;
+        auto run_unwind_failure = [&](bool bad_target, bool bad_ip, bool bad_ticket, uint32_t disposition,
+                                      kernel::SyntheticUnwindStatus expected_status, uint32_t esp_offset = 0x200,
+                                      uint32_t eflags = 0x000008D5u) {
+            kernel::ThreadRef thread;
+            if (!prepare(thread, unwind_start_target, continuation_record, output_page)) return false;
+            uint32_t handle = 0;
+            mem::Read(output_page, &handle, sizeof(handle));
+            mem::Fill(continuation_record, 0, 0x40);
+            mem::Fill(continuation_log, 0, 0x20);
+            mem::Fill(continuation_marker, 0, 0x40);
+            mem::Fill(continuation_unwind_log, 0, 0x20);
+            const uint32_t target_esp = thread->stack_top - esp_offset;
+            const uint32_t sentinel = 0xFFFFFFF0u;
+            std::array<uint32_t, 16> context_block{};
+            context_block[2] = continuation_target;
+            context_block[3] = target_esp;
+            context_block[4] = thread->stack_top - 0x180;
+            context_block[11] = eflags;
+            const uint32_t inner_target = unwind_handler;
+            const uint32_t outer_target = continuation_outer;
+            const bool data_ready =
+                mem::Write(continuation_record, std::array<uint32_t, 2>{0xE042D900u, 0}.data(), 8) ==
+                    mem::AccessStatus::kOk &&
+                mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+                mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+                mem::Write(continuation_target_ip_slot, &continuation_target, sizeof(continuation_target)) ==
+                    mem::AccessStatus::kOk &&
+                mem::Write(continuation_unwind_log + 0x14, &disposition, sizeof(disposition)) ==
+                    mem::AccessStatus::kOk &&
+                mem::Write(target_esp, &sentinel, sizeof(sentinel)) == mem::AccessStatus::kOk &&
+                mem::Write(continuation_context, context_block.data(), sizeof(context_block)) ==
+                    mem::AccessStatus::kOk;
+            kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+            const bool tickets_ready = data_ready &&
+                kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                    kernel::GuestCallbackStatus::kReady &&
+                kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                    kernel::GuestCallbackStatus::kReady &&
+                kernel::PrepareGuestCallback(unwind_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                             bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+            g_exception_handler_tickets[0] = inner_ticket;
+            g_exception_handler_tickets[1] = outer_ticket;
+            g_exception_dispatch_thread = thread;
+            g_exception_run_negatives = false;
+            const bool armed =
+                tickets_ready && arm_continuation(unwind_start_target, continuation_record, expected, bridge_ticket);
+            g_unwind_force_bad_target = bad_target;
+            g_unwind_force_bad_ip = bad_ip;
+            g_unwind_force_bad_ticket = bad_ticket;
+            g_unwind_status = kernel::SyntheticUnwindStatus::kContinued;
+            const bool started = armed && kernel::StartThread(thread);
+            const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+            if (!started) kernel::CancelPreparedThread(thread);
+            const bool joined = join_workers();
+            uint32_t marker0 = 1, post = 1;
+            std::array<uint32_t, 4> unwind_log{};
+            const bool marker_read = mem::Read(continuation_marker, &marker0, sizeof(marker0)) ==
+                                     mem::AccessStatus::kOk;
+            const bool post_read = mem::Read(continuation_post_bridge, &post, sizeof(post)) ==
+                                   mem::AccessStatus::kOk;
+            const bool log_read = mem::Read(continuation_unwind_log, unwind_log.data(), sizeof(unwind_log)) ==
+                                  mem::AccessStatus::kOk;
+            const bool ok = started && wait == kernel::kWait0 && joined && marker_read && post_read && log_read &&
+                            thread->state.load() == kernel::ThreadState::kCancelled &&
+                            thread->exit_code.load() == 0 && thread->resources_released && marker0 == 0 &&
+                            post == 0 && g_unwind_status.load() == expected_status &&
+                            unwind_log[2] == (disposition ? 1u : 0u) &&
+                            kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                            mem::Query().system_used == baseline.system_used;
+            kernel::CloseHandle(handle);
+            g_exception_dispatch_thread.reset();
+            g_exception_handler_tickets = {};
+            g_exception_run_negatives = true;
+            g_unwind_force_bad_target = false;
+            g_unwind_force_bad_ip = false;
+            g_unwind_force_bad_ticket = false;
+            kernel::DisarmSyntheticWorker();
+            Check(dispatch::Init(metadata, error), "failed unwind releases dispatch and page leases");
+            return ok;
+        };
+
+        Check(run_unwind_failure(true, false, false, 0, kernel::SyntheticUnwindStatus::kInvalidTarget),
+              "unwind rejects a target frame outside the registered chain");
+        Check(run_unwind_failure(false, true, false, 0, kernel::SyntheticUnwindStatus::kInvalidTarget),
+              "unwind rejects a target IP outside the authorized continuation");
+        Check(run_unwind_failure(false, false, true, 0, kernel::SyntheticUnwindStatus::kInvalidTicket),
+              "unwind rejects a stale handler ticket before invoking it");
+        Check(run_unwind_failure(false, false, false, 1, kernel::SyntheticUnwindStatus::kUnsupportedDisposition),
+              "unwind rejects a handler disposition outside the unwind contract");
+        Check(run_unwind_failure(false, false, false, 0, kernel::SyntheticUnwindStatus::kInvalidContext, 0x201),
+              "unwind rejects an unaligned target stack outside the continuation contract");
+        Check(run_unwind_failure(false, false, false, 0, kernel::SyntheticUnwindStatus::kInvalidContext, 0x200,
+                                 0xFFFFFFFFu),
+              "unwind rejects unsupported EFLAGS bits in the continuation context");
+    }
+
+    {
+        constexpr uint32_t expected = 0xC0DE5005;
+        kernel::ThreadRef thread;
+        if (!prepare(thread, continuation_start_target, continuation_record, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(continuation_record, 0, 0x40);
+        mem::Fill(continuation_log, 0, 0x20);
+        mem::Fill(continuation_marker, 0, 0x40);
+        const uint32_t inner_target = exception_continuation_handler;
+        const uint32_t outer_target = continuation_outer;
+        const bool data_ready =
+            mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_result_slot, &expected, sizeof(expected)) == mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+        g_exception_handler_tickets[0] = inner_ticket;
+        g_exception_handler_tickets[1] = outer_ticket;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        ResetContinuationAdmission();
+        kernel::SetSyntheticContinuationAdmissionHookForTest(ContinuationAdmissionHook);
+        const bool armed = tickets_ready &&
+                           arm_continuation(continuation_start_target, continuation_record, expected, bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const bool entered = WaitContinuationAdmissionEntered();
+        const bool reset = entered && dispatch::Init(metadata, error);
+        ReleaseContinuationAdmission();
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        uint32_t marker0 = 1;
+        const bool marker_read = mem::Read(continuation_marker, &marker0, sizeof(marker0)) == mem::AccessStatus::kOk;
+        Check(started && entered && reset && wait == kernel::kWait0 && joined && marker_read && marker0 == 0 &&
+                  thread->state.load() == kernel::ThreadState::kCancelled && thread->exit_code.load() == 0 &&
+                  thread->resources_released && !thread->ctx && !thread->kpcr && !thread->ethread &&
+                  !thread->stack_top &&
+                  kernel::LastSyntheticContinuationStatusForTest() ==
+                      kernel::SyntheticContinuationStatus::kStaleDispatch &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "dispatch reset during continuation admission rejects the stale continuation generation");
+        kernel::SetSyntheticContinuationAdmissionHookForTest(nullptr);
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::Init(metadata, error), "stale continuation admission leaves a usable dispatch map");
+    }
+
+    {
+        constexpr uint32_t expected = 0xC0DE6006;
+        kernel::ThreadRef thread;
+        if (!prepare(thread, continuation_start_target, continuation_record, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(continuation_record, 0, 0x40);
+        mem::Fill(continuation_log, 0, 0x20);
+        mem::Fill(continuation_marker, 0, 0x40);
+        const uint32_t inner_target = exception_continuation_handler;
+        const uint32_t outer_target = continuation_outer;
+        const bool data_ready =
+            mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_result_slot, &expected, sizeof(expected)) == mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+        g_exception_handler_tickets[0] = inner_ticket;
+        g_exception_handler_tickets[1] = outer_ticket;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        ResetContinuationAdmission();
+        kernel::SetSyntheticContinuationAdmissionHookForTest(ContinuationAdmissionHook);
+        const bool armed = tickets_ready &&
+                           arm_continuation(continuation_start_target, continuation_record, expected, bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const bool entered = WaitContinuationAdmissionEntered();
+        uint32_t marker_before_shutdown = 1;
+        const bool marker_before_read = entered && mem::Read(continuation_marker, &marker_before_shutdown,
+                                                              sizeof(marker_before_shutdown)) ==
+                                                         mem::AccessStatus::kOk;
+        std::atomic<bool> shutdown_done{false};
+        std::thread shutdown;
+        if (entered) shutdown = std::thread([&] {
+            mem::Shutdown();
+            shutdown_done = true;
+        });
+        const bool shutdown_started = entered && kernel::WaitForKernelWorkersShutdownForTest(std::chrono::seconds(5));
+        const bool waited = entered && shutdown_started && !shutdown_done.load();
+        ReleaseContinuationAdmission();
+        if (shutdown.joinable()) shutdown.join();
+        if (!started) kernel::CancelPreparedThread(thread);
+        Check(started && entered && marker_before_read && marker_before_shutdown == 0 && waited &&
+                  shutdown_done.load() &&
+                  thread->state.load() == kernel::ThreadState::kCancelled && thread->exit_code.load() == 0 &&
+                  thread->resources_released && !thread->ctx && !thread->kpcr && !thread->ethread &&
+                  !thread->stack_top &&
+                  kernel::LastSyntheticContinuationStatusForTest() ==
+                      kernel::SyntheticContinuationStatus::kShutdown &&
+                  kernel::KernelWorkerCountForTest() == 0 && !mem::IsInitialized(),
+              "shutdown during continuation admission cancels the worker without entering the continuation");
+        kernel::SetSyntheticContinuationAdmissionHookForTest(nullptr);
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        kernel::DisarmSyntheticWorker();
+        if (!initialize()) return;
+    }
+
+    {
+        constexpr uint32_t expected = 0xC0DE7007;
+        kernel::ThreadRef thread;
+        if (!prepare(thread, continuation_start_target, continuation_record, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(continuation_record, 0, 0x40);
+        mem::Fill(continuation_log, 0, 0x20);
+        mem::Fill(continuation_marker, 0, 0x40);
+        const uint32_t inner_target = exception_continuation_handler;
+        const uint32_t outer_target = continuation_outer;
+        const bool data_ready =
+            mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_result_slot, &expected, sizeof(expected)) == mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(exception_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+        g_exception_handler_tickets[0] = inner_ticket;
+        g_exception_handler_tickets[1] = outer_ticket;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        ResetContinuationAdmission();
+        kernel::SetSyntheticContinuationAdmissionHookForTest(ContinuationAdmissionHook);
+        const bool armed = tickets_ready &&
+                           arm_continuation(continuation_start_target, continuation_record, expected, bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const bool entered = WaitContinuationAdmissionEntered();
+        uint32_t marker_before_decommit = 1;
+        const bool marker_before_read = entered && mem::Read(continuation_marker, &marker_before_decommit,
+                                                              sizeof(marker_before_decommit)) ==
+                                                         mem::AccessStatus::kOk;
+        const bool decommitted = entered && mem::Decommit(code_page, mem::kPage);
+        ReleaseContinuationAdmission();
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        Check(started && entered && marker_before_read && marker_before_decommit == 0 && decommitted &&
+                  wait == kernel::kWait0 && joined && thread->state.load() == kernel::ThreadState::kCancelled &&
+                  thread->exit_code.load() == 0 && thread->resources_released &&
+                  kernel::LastSyntheticContinuationStatusForTest() ==
+                      kernel::SyntheticContinuationStatus::kLeaseDenied &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "code-page decommit during continuation admission rejects the continuation lease");
+        kernel::SetSyntheticContinuationAdmissionHookForTest(nullptr);
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        kernel::DisarmSyntheticWorker();
+        Check(mem::Commit(code_page, mem::kPage) &&
+                  mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                  dispatch::Init(metadata, error),
+              "continuation code page and dispatch restore after the decommit test");
+    }
+
+    {
+        constexpr uint32_t expected = 0xC0DE8008;
+        kernel::ThreadRef thread;
+        if (!prepare(thread, unwind_start_target, continuation_record, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(continuation_record, 0, 0x40);
+        mem::Fill(continuation_log, 0, 0x20);
+        mem::Fill(continuation_marker, 0, 0x40);
+        mem::Fill(continuation_unwind_log, 0, 0x20);
+        const uint32_t target_esp = thread->stack_top - 0x200;
+        const uint32_t sentinel = 0xFFFFFFF0u;
+        std::array<uint32_t, 16> context_block{};
+        context_block[2] = continuation_target;
+        context_block[3] = target_esp;
+        context_block[4] = thread->stack_top - 0x180;
+        context_block[5] = 0x11111111;
+        context_block[6] = 0x22222222;
+        context_block[7] = 0x33333333;
+        context_block[8] = 0x44444444;
+        context_block[9] = 0x55555555;
+        context_block[10] = 0x66666666;
+        context_block[11] = 0x000008D5u;
+        const uint32_t inner_target = unwind_pause_handler;
+        const uint32_t outer_target = continuation_outer;
+        const bool data_ready =
+            mem::Write(continuation_record, std::array<uint32_t, 2>{0xE042D900u, 0}.data(), 8) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_target_ip_slot, &continuation_target, sizeof(continuation_target)) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(continuation_result_slot, &expected, sizeof(expected)) == mem::AccessStatus::kOk &&
+            mem::Write(target_esp, &sentinel, sizeof(sentinel)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_context, context_block.data(), sizeof(context_block)) ==
+                mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(unwind_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+        g_exception_handler_tickets[0] = inner_ticket;
+        g_exception_handler_tickets[1] = outer_ticket;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        ResetUnwindPause();
+        const bool armed =
+            tickets_ready && arm_continuation(unwind_start_target, continuation_record, expected, bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const bool entered = WaitUnwindPauseEntered();
+        const bool closed = entered && kernel::CloseHandle(handle);
+        const bool retained_active = started && entered && closed &&
+                                     thread->state.load() == kernel::ThreadState::kActive &&
+                                     !thread->resources_released && thread->ethread != 0 && thread->kpcr != 0 &&
+                                     thread->stack_top != 0 && !kernel::FromHandle(handle);
+        ReleaseUnwindPause();
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        std::array<uint32_t, 16> marker{};
+        std::array<uint32_t, 2> frames{};
+        uint32_t post = 1;
+        const bool marker_read = mem::Read(continuation_marker, marker.data(), sizeof(marker)) ==
+                                 mem::AccessStatus::kOk;
+        const bool frames_read = mem::Read(continuation_log, frames.data(), sizeof(frames)) ==
+                                 mem::AccessStatus::kOk;
+        const bool post_read = mem::Read(continuation_post_bridge, &post, sizeof(post)) == mem::AccessStatus::kOk;
+        Check(retained_active && wait == kernel::kWait0 && joined && marker_read && frames_read && post_read &&
+                  thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == expected &&
+                  thread->resources_released && !thread->ctx && !thread->kpcr && !thread->ethread &&
+                  !thread->stack_top && frames[0] && frames[1] && marker[0] == 0x11111111 &&
+                  marker[6] == frames[0] && marker[8] == 0x600D && marker[10] == 0x600D && marker[11] == 0x600D && post == 0 &&
+                  kernel::LastSyntheticContinuationStatusForTest() ==
+                      kernel::SyntheticContinuationStatus::kResumed &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "closing the handle during unwind retains the active worker until the continuation completes");
+        ResetUnwindPause();
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::Init(metadata, error), "handle-closure unwind releases dispatch and page leases");
+    }
+
+    {
+        constexpr uint32_t expected = 0xC0DE9009;
+        kernel::ThreadRef thread;
+        if (!prepare(thread, unwind_start_target, continuation_record, output_page)) return;
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        mem::Fill(continuation_record, 0, 0x40);
+        mem::Fill(continuation_log, 0, 0x20);
+        mem::Fill(continuation_marker, 0, 0x40);
+        const uint32_t target_esp = thread->stack_top - 0x200;
+        const uint32_t sentinel = 0xFFFFFFF0u;
+        std::array<uint32_t, 16> context_block{};
+        context_block[2] = continuation_target;
+        context_block[3] = target_esp;
+        context_block[4] = thread->stack_top - 0x180;
+        context_block[5] = 0x11111111;
+        context_block[6] = 0x22222222;
+        context_block[7] = 0x33333333;
+        context_block[8] = 0x44444444;
+        context_block[9] = 0x55555555;
+        context_block[10] = 0x66666666;
+        context_block[11] = 0x000008D5u;
+        const uint32_t inner_target = unwind_reentry_handler;
+        const uint32_t outer_target = continuation_outer;
+        const bool data_ready =
+            mem::Write(continuation_record, std::array<uint32_t, 2>{0xE042D900u, 0}.data(), 8) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(continuation_outer_slot, &outer_target, sizeof(outer_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_inner_slot, &inner_target, sizeof(inner_target)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_target_ip_slot, &continuation_target, sizeof(continuation_target)) ==
+                mem::AccessStatus::kOk &&
+            mem::Write(continuation_result_slot, &expected, sizeof(expected)) == mem::AccessStatus::kOk &&
+            mem::Write(target_esp, &sentinel, sizeof(sentinel)) == mem::AccessStatus::kOk &&
+            mem::Write(continuation_context, context_block.data(), sizeof(context_block)) ==
+                mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inner_ticket, outer_ticket, bridge_ticket;
+        const bool tickets_ready = data_ready &&
+            kernel::PrepareGuestCallback(inner_target, kernel::GuestCallbackClass::kFixture, inner_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(outer_target, kernel::GuestCallbackClass::kFixture, outer_ticket) ==
+                kernel::GuestCallbackStatus::kReady &&
+            kernel::PrepareGuestCallback(unwind_bridge_target, kernel::GuestCallbackClass::kThreadStart,
+                                         bridge_ticket) == kernel::GuestCallbackStatus::kReady;
+        g_exception_handler_tickets[0] = inner_ticket;
+        g_exception_handler_tickets[1] = outer_ticket;
+        g_exception_dispatch_thread = thread;
+        g_exception_run_negatives = false;
+        g_unwind_reentry_status = kernel::SyntheticUnwindStatus::kInvalidOwner;
+        const bool armed =
+            tickets_ready && arm_continuation(unwind_start_target, continuation_record, expected, bridge_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        if (!started) kernel::CancelPreparedThread(thread);
+        const bool joined = join_workers();
+        std::array<uint32_t, 16> marker{};
+        std::array<uint32_t, 2> frames{};
+        uint32_t post = 1;
+        const bool marker_read = mem::Read(continuation_marker, marker.data(), sizeof(marker)) ==
+                                 mem::AccessStatus::kOk;
+        const bool frames_read = mem::Read(continuation_log, frames.data(), sizeof(frames)) ==
+                                 mem::AccessStatus::kOk;
+        const bool post_read = mem::Read(continuation_post_bridge, &post, sizeof(post)) == mem::AccessStatus::kOk;
+        Check(started && wait == kernel::kWait0 && joined && marker_read && frames_read && post_read &&
+                  g_unwind_reentry_status.load() == kernel::SyntheticUnwindStatus::kReentrant &&
+                  thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == expected &&
+                  thread->resources_released && frames[0] && marker[0] == 0x11111111 &&
+                  marker[6] == frames[0] && marker[8] == 0x600D && marker[10] == 0x600D && marker[11] == 0x600D && post == 0 &&
+                  kernel::LastSyntheticContinuationStatusForTest() ==
+                      kernel::SyntheticContinuationStatus::kResumed &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "recursive unwind admission is rejected while the outer unwind proceeds to its continuation");
+        kernel::CloseHandle(handle);
+        g_exception_dispatch_thread.reset();
+        g_exception_handler_tickets = {};
+        g_exception_run_negatives = true;
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::Init(metadata, error), "re-entry rejection releases dispatch and page leases");
     }
 
     callbacks_before = g_callback_fake_calls.load();

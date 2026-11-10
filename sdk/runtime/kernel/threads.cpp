@@ -8,6 +8,9 @@
 #include "kernel/kernel.h"
 #include "kernel/synthetic_worker.h"
 #include "kernel/thread_memory.h"
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+#include "kernel/guest_exception_chain.h"
+#endif
 #include "kernel/worker_lifecycle.h"
 
 #ifdef _WIN32
@@ -34,6 +37,10 @@ bool g_synthetic_worker_claimed = false;
 bool g_synthetic_worker_callback_entered = false;
 Thread* g_synthetic_worker_owner = nullptr;
 SyntheticWorkerPreCallbackHook g_synthetic_worker_hook = nullptr;
+std::atomic<SyntheticContinuationStatus> g_synthetic_continuation_status{
+    SyntheticContinuationStatus::kNotAuthorized};
+SyntheticContinuationFault g_synthetic_continuation_fault = SyntheticContinuationFault::kNone;
+SyntheticContinuationAdmissionHook g_synthetic_continuation_hook = nullptr;
 #endif
 #ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
 std::atomic<ThreadPreparationFailPoint> g_thread_fail_point{ThreadPreparationFailPoint::kNone};
@@ -356,6 +363,9 @@ bool ArmSyntheticWorker(const SyntheticWorkerAuthorization& authorization) {
     if (authorization.image_identity != kSyntheticWorkerImageIdentity || !authorization.target ||
         !authorization.code_base || authorization.code_end <= authorization.code_base ||
         authorization.target < authorization.code_base || authorization.target >= authorization.code_end ||
+        (authorization.continuation_target &&
+         (authorization.continuation_target < authorization.code_base ||
+          authorization.continuation_target >= authorization.code_end)) ||
         !authorization.dispatch_generation ||
         (authorization.callback_ticket.target &&
          (authorization.callback_ticket.callback_class != GuestCallbackClass::kThreadStart ||
@@ -367,6 +377,8 @@ bool ArmSyntheticWorker(const SyntheticWorkerAuthorization& authorization) {
     if (g_synthetic_worker_armed || g_synthetic_worker_claimed) return false;
     g_synthetic_worker_auth = authorization;
     g_synthetic_worker_armed = true;
+    g_synthetic_continuation_status = SyntheticContinuationStatus::kNotAuthorized;
+    g_synthetic_continuation_fault = SyntheticContinuationFault::kNone;
     return true;
 }
 
@@ -377,6 +389,7 @@ void DisarmSyntheticWorker() {
     g_synthetic_worker_callback_entered = false;
     g_synthetic_worker_owner = nullptr;
     g_synthetic_worker_auth = {};
+    g_synthetic_continuation_fault = SyntheticContinuationFault::kNone;
 }
 
 bool SyntheticWorkerArmed() {
@@ -401,6 +414,42 @@ SyntheticWorkerClaim ClaimSyntheticWorker(uint32_t target, uint32_t context, uin
 bool SyntheticWorkerClaimHeld() {
     std::lock_guard lock(g_synthetic_worker_lock);
     return g_synthetic_worker_claimed && g_synthetic_worker_owner == Current();
+}
+
+bool SyntheticWorkerContinuationAuthorized(uint32_t target, uint64_t dispatch_generation) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_worker_claimed && g_synthetic_worker_owner == Current() &&
+           g_synthetic_worker_auth.continuation_target && target == g_synthetic_worker_auth.continuation_target &&
+           dispatch_generation == g_synthetic_worker_auth.dispatch_generation &&
+           target >= g_synthetic_worker_auth.code_base && target < g_synthetic_worker_auth.code_end;
+}
+
+SyntheticContinuationStatus LastSyntheticContinuationStatusForTest() {
+    return g_synthetic_continuation_status.load();
+}
+
+void SetLastSyntheticContinuationStatusForTest(SyntheticContinuationStatus status) {
+    g_synthetic_continuation_status.store(status);
+}
+
+void SetSyntheticContinuationFaultForTest(SyntheticContinuationFault fault) {
+    g_synthetic_continuation_fault = fault;
+}
+
+SyntheticContinuationFault SyntheticContinuationFaultForTest() { return g_synthetic_continuation_fault; }
+
+void SetSyntheticContinuationAdmissionHookForTest(SyntheticContinuationAdmissionHook hook) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    g_synthetic_continuation_hook = hook;
+}
+
+void CallSyntheticContinuationAdmissionHookForTest() {
+    SyntheticContinuationAdmissionHook hook = nullptr;
+    {
+        std::lock_guard lock(g_synthetic_worker_lock);
+        hook = g_synthetic_continuation_hook;
+    }
+    if (hook) hook();
 }
 
 bool SyntheticWorkerHasNestedCallback() {
@@ -574,13 +623,28 @@ bool StartThread(ThreadRef t) {
                                 synthetic_claimed = true;
                                 CallSyntheticWorkerPreCallbackHookForTest();
                                 mem::ScopedPageLease callback_slot_lease;
+                                auto invoke_synthetic_callback = [&]() {
+                                    try {
+                                        return CallGuestCallbackForTest(
+                                            ctx, t->start_routine_ticket, t->start_routine, start_arguments,
+                                            stack_base, t->stack_size, code);
+                                    } catch (const SyntheticGuestContinuation& continuation) {
+                                        uint32_t continuation_result = 0;
+                                        const SyntheticContinuationStatus status =
+                                            ResumeSyntheticGuestContinuationForTest(ctx, *t, continuation,
+                                                                                    continuation_result);
+                                        if (status == SyntheticContinuationStatus::kResumed) {
+                                            code = continuation_result;
+                                            return GuestCallbackStatus::kInvoked;
+                                        }
+                                        return GuestCallbackStatus::kRejectedTarget;
+                                    }
+                                };
                                 callback_status = SyntheticWorkerHasNestedCallback() &&
                                                           callback_slot_lease.Acquire(t->start_context, sizeof(uint32_t),
                                                                                       mem::kRead) != mem::AccessStatus::kOk
                                                       ? GuestCallbackStatus::kRejectedTarget
-                                                      : CallGuestCallbackForTest(ctx, t->start_routine_ticket,
-                                                                                 t->start_routine, start_arguments,
-                                                                                 stack_base, t->stack_size, code);
+                                                      : invoke_synthetic_callback();
                                 if (callback_status == GuestCallbackStatus::kInvoked &&
                                     !SyntheticWorkerExitMatches(code))
                                     callback_status = GuestCallbackStatus::kRejectedTarget;

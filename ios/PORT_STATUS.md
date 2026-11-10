@@ -3419,3 +3419,61 @@ Debug and Release each built the full recompiler fixture target and passed 637/6
 This is an independently useful search foundation, not a completed unwind mechanism. D9 has no checked guest continuation and does not validate unwind traversal, target-record removal or a restored full guest context. Dispatch-level tests also do not yet cover a protected or decommitted page during handler execution, handle closure while unwinding, cancellation before handler admission, memory allocation reuse, excessive depth, cyclic or unmapped chains, or re-entry; D8 chain-validator tests cover some of those malformed chains without exercising D9 dispatch. The next package needs explicit continuation semantics, precommit validation and deterministic race coverage before claiming synthetic unwind PASS.
 
 The shared `sdk/runtime/cpu/dispatch.cpp` ARM64 object compiled in the Android offline Debug build. The full APK link stopped at the pre-existing generated-mapping references `X86FuncMappingCount` and `X86ContinuationCount`; no Android runtime or iPhone execution was attempted. Protection ordinals 179/182/204 remain fail-closed. Neither retail exception ordinal nor the authentic handler was activated.
+
+## Phase 2D-10 — checked synthetic continuation and bounded unwind
+
+**`PHASE_2D10_CHECKED_CONTINUATION = PASS`.** The synthetic exception dispatcher can now transfer control to an authorized generated continuation with a validated full guest context, and a bounded synthetic `RtlUnwind` removes frames above a reviewed target before resuming an outer-scope continuation. This is test-only synthetic evidence; it is not retail SEH compatibility.
+
+### Continuation architecture
+
+- `SyntheticGuestContinuation` is a small test-only exception carrying a pointer to a thread-local `SyntheticContinuationRequest`. The request holds an `X86Context` snapshot, target EIP, memory generation, dispatch generation and owner. The large aligned context is not thrown by value; the exception unwinds the obsolete generated C++ frames with the normal C++ runtime, without touching the native ARM64 stack.
+- The worker-level synthetic catch is in `StartThread`, inside the claimed-worker scope and before the Phase 2D-2 finalizer. It calls `ResumeSyntheticGuestContinuationForTest`, which validates the owner, claim, thread state, stop state, authorization, memory/dispatch generations, target mapping and kind, stack/sentinel and context subset before assigning the snapshot and invoking the resolved generated function.
+- The destination must be an authorized `continuation_target` on the current synthetic worker authorization, inside the synthetic code range, mapped as a dispatch continuation, with the exact dispatch generation. The continuation's `dispatch::CallLease`, code-page and stack leases are acquired after validation; the continuation RET pops the validated host sentinel and must leave ESP at snapshot ESP + 4 with no checked-call frame.
+- The synthetic context block is guest memory at `+00` saved ESP, `+04` saved EBP, `+08` target EIP, `+0C` target ESP, `+10` target EBP, `+14..+28` EAX/EBX/ECX/EDX/ESI/EDI and `+2C` EFLAGS. Handlers select a continuation by filling this block and returning disposition `2`; the search dispatcher validates it before throwing.
+- `SyntheticRtlUnwindForTest` validates the current owner, active synthetic exception admission, the full chain and exact tickets, the target frame and target IP, and the continuation context before invoking any handler. It calls only frames above the target in inner-to-outer order with the synthetic unwind flag (`4th argument = 2`), requires `RET 16` stack balance and disposition `0`, revalidates the record/context/links after each handler, verifies the target record and current head, then commits `fs:[0] = target_frame` and resumes the continuation.
+- Search and unwind share a thread-local active flag, so recursive admission returns `kReentrant` without invoking another handler. Guest termination still uses `GuestThreadTermination`; it is not reused for ordinary continuation and remains a distinct control-flow path.
+
+### Supported context state
+
+- Preserved: EAX/EBX/ECX/EDX/ESI/EDI/ESP/EBP, CF/PF/AF/ZF/SF/DF/OF, AC/ID, FS base, x87 top/control/status/stack, MMX, XMM and MXCSR. The continuation snapshot starts from the dispatcher's live `X86Context`, so state outside the synthetic guest context block is not silently discarded.
+- Synthetic context block overrides only GP registers, ESP/EBP/EIP and the supported EFLAGS bits. EFLAGS bits outside `0x00240ED7` (supported bits plus IF and the reserved bit) are rejected. FS base must remain the owner KPCR.
+- Not represented by the execution model and explicitly out of contract: CS/DS/SS/ES/GS selectors, debug registers, FPU tag word and control extensions beyond the stored x87 fields, and any non-flat segment state. The fixture is flat-segment synthetic code. Retail segment/FPU context fidelity is not claimed.
+
+### Synthetic evidence
+
+- Normal continuation: generated handler returns disposition `2`, writes target EIP `0x11F00`, registers and flags, and the continuation runs at that target with the preserved register/flag values. EAX/EBX/ECX/EDX/ESI/EDI are marker-verified; ZF, CF and OF are branch-verified. PF, AF, DF and AC/ID are carried in the snapshot but are not separately branch-proven by the fixture. The post-bridge guest instruction remains clear.
+- Nested unwind: two registered frames, target is the outer frame; the inner handler is called once with unwind flags `2`, the outer handler is not called, `fs:[0]` becomes the outer frame, and the continuation runs in the outer scope.
+- Termination during unwind: the inner handler invokes the existing checked ordinal-258 bridge; exit status `0xD9A0` is preserved, the post-termination marker stays clear, and the continuation never runs.
+- Negative continuations: unauthorized target, invalid stack, unsupported flags, stale dispatch generation and stale memory generation all fail before a guest continuation executes; the worker cancels with exit 0 and no continuation marker.
+- Negative unwinds: an invalid target frame, target IP outside the authorized continuation, a stale handler ticket, an unsupported unwind disposition, an unaligned target stack and unsupported EFLAGS bits are rejected; no continuation runs.
+- Concurrency: dispatch reset during continuation admission yields `kStaleDispatch`; shutdown during admission yields `kShutdown` and waits for the worker before memory teardown; code-page decommit during admission yields `kLeaseDenied`; handle closure during an unwind handler retains the active worker and exits with the expected continuation status.
+- Re-entry: an unwind handler recursively requests unwind admission; the nested request returns `kReentrant`, the outer unwind continues and resumes normally.
+- Every success also checks cleared `Thread::ctx`, released ETHREAD/KPCR/stack allocations, cleared callback tickets, zero workers, empty thread registry, restored system-allocation baseline and post-completion `dispatch::Init`.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 681 PASS / 0 FAIL | 681 PASS / 0 FAIL |
+| Deterministic repeats | 3x 681 / 0 | 3x 681 / 0 |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Root `--static-real` | PASS | — |
+| Secondary `--static-real` | PASS | — |
+| Root/secondary/integrated `--preflight` | PASS | — |
+| Android ARM64 syntax, `dispatch.cpp` and `threads.cpp` | PASS | — |
+
+The default secondary CTest remains excluded because its default path executes copied authentic instructions. No authentic XBE instruction, authentic start routine, authentic handler or authentic worker ran.
+
+### Retail SEH compatibility matrix after D10
+
+| Dependency | Synthetic evidence | Remaining gate |
+|---|---|---|
+| Synthetic guest continuation and checked unwind | **Implemented and executed** | No retail ABI claim; fixture context/record layout is synthetic. |
+| SEH prologue `0x00319804`, handler `0x00319858`, epilogue `0x002B5BD3` | **Not executed** | Authentic record/context layouts, handler results and epilogue stack rules remain unverified. |
+| Retail `RtlRaiseException` 302 | **Unchanged, unsafe for this route** | Raw `R32/W32/HostPtr` traversal and unticketed `CallGuest`; needs retail record/context/disposition validation before use. |
+| Retail `RtlUnwind` 312 | **Unchanged, unsafe for this route** | Raw traversal, no target-record proof, no context restore and no checked continuation; synthetic unwind does not satisfy it. |
+| `ETHREAD+0x250` and start-routine dependencies | **Static only** | Not exercised; callback-table provenance and protection ABI 179/182/204 remain open. |
+| Apple production callback / `Boot()` | **Intentionally disabled** | `kExecutionDisabled` and the production trap remain; no iPhone install or authentic worker. |
+
+**Next:** authoritative protection-import ABI research and callback-table provenance are the blockers for authentic startup, not another synthetic continuation variant. R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
