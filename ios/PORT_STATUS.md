@@ -3477,3 +3477,126 @@ The default secondary CTest remains excluded because its default path executes c
 | Apple production callback / `Boot()` | **Intentionally disabled** | `kExecutionDisabled` and the production trap remain; no iPhone install or authentic worker. |
 
 **Next:** authoritative protection-import ABI research and callback-table provenance are the blockers for authentic startup, not another synthetic continuation variant. R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-11 — retail protection ABI and startup callback provenance
+
+**`PHASE_2D11_RETAIL_ABI_AND_CALLBACKS = PASS`.** The investigation established the authentic ABI for `MmQueryAddressProtect` (179) and `MmSetAddressProtect` (182), confirmed that ordinal 204 is not imported by this XBE, mapped every initial callback-table target and the dynamic list registration, and showed that the protection block is skipped by the prepared image's kernel build. No protection bridge was added: the evidence supports the ABI but not the retail physical-window behaviour, and the current fail-closed traps are not on the immediate startup path. No authentic instruction ran.
+
+### Protection imports: evidence ledger
+
+| Claim | Source | Grade |
+|---|---|---|
+| Ordinals 179/182/204 are `MmQueryAddressProtect`, `MmSetAddressProtect`, `NtProtectVirtualMemory` | Local `sdk/runtime/kernel/ordinals.cpp`; [nxdk `xboxkrnl.h`](https://github.com/XboxDev/nxdk/blob/master/lib/xboxkrnl/xboxkrnl.h) | **Verified name/ordinal mapping** (local export table + independent SDK declaration). |
+| 179: `ULONG NTAPI MmQueryAddressProtect(PVOID VirtualAddress)` | nxdk declaration; [Cxbx `EmuKrnlMm.cpp`](https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/blob/master/src/core/kernel/exports/EmuKrnlMm.cpp) `EXPORTNUM(179)`; local call site `002B5942` passes ESI and reads EAX | **Strongly corroborated ABI** (declaration + emulator implementation + guest call site). |
+| 182: `VOID NTAPI MmSetAddressProtect(PVOID BaseAddress, ULONG NumberOfBytes, ULONG NewProtect)` | nxdk; [OpenXDK `mm.h`](https://github.com/XboxDev/OpenXDK/blob/master/include/xboxkrnl/mm.h) (VOID, 3 args); Cxbx `EXPORTNUM(182)`; local `002B5955`/`002B5963` push three dwords | **Strongly corroborated ABI**; OpenXDK alone is not retail proof. |
+| 204: `NTSTATUS NTAPI NtProtectVirtualMemory(PVOID *BaseAddress, PSIZE_T RegionSize, ULONG NewProtect, PULONG OldProtect)` | nxdk declaration; local ordinal table. The XBE import table contains 157 ordinals and **not 204** | **ABI strongly corroborated; unused by this image.** No local call site exists. |
+| Protection constants `PAGE_NOACCESS 1`, `PAGE_READONLY 2`, `PAGE_READWRITE 4`, `PAGE_EXECUTE 0x10`, `PAGE_EXECUTE_READ 0x20`, `PAGE_EXECUTE_READWRITE 0x40`, `PAGE_GUARD 0x100`, `PAGE_NOCACHE 0x200`, `PAGE_WRITECOMBINE 0x400` | nxdk `xboxkrnl.h` | **Corroborated constant set**, not proof of retail validation/rounding. |
+| Page-granular query/set behavior | Cxbx `VMManager.QueryProtection`/`Protect` wrappers | **Emulator-specific semantics**; useful as a model, not retail evidence. |
+| Retail range alignment, reserved/unmapped behavior, guard/cache effects, old-protection write rules, failure returns | None found | **Unresolved.** |
+
+### Authentic protection path and gate
+
+`002B58B8` is the start routine's first callee. Its protection block is gated by data imports, not by a constant:
+
+```
+002B58B8  mov eax,[003C9E34]   ; ordinal 322 XboxHardwareInfo
+002B58BD  mov eax,[eax]        ; Flags
+002B58BF  mov ecx,[003C9E3C]   ; ordinal 324 XboxKrnlVersion
+002B58C5  movzx ecx,[ecx+4]    ; Build
+002B58CF  cmp ecx,0xF68 ... 0x12D2
+```
+
+- The local import slots hold `80000142` (322) and `80000144` (324); `kernel_data_init.cpp` writes `XboxHardwareInfo = {0x20,0,0,0,0xD3,0xB1}` and `XboxKrnlVersion = {1,0,5838,1}`. Build `5838 = 0x16CE` is greater than `0x12D2`, so `002B58F6 JNLE 002B5967` skips the block. The authentic prepared image therefore does **not** reach `002B5942`/`002B5955`/`002B5963`.
+- The block would run only for build `0x0F68`, `0x0FC2`, `0x0FC7`, `0x12D1` or `0x12D2`. For those builds it calls `MmQueryAddressProtect(ESI)`, saves EAX, calls `MmSetAddressProtect(ESI,4,4)`, writes `[ESI]=0x28C5048D` between `CLI`/`STI`, then restores `MmSetAddressProtect(ESI,4,saved EAX)`.
+- The candidate `ESI` values are `8003838F`/`800299A0`, `800398CD`/`8002AB98`, `8002AB88`, and `80039749`/`8002ABBA` — all in the contiguous physical window (`80000000..84000000`).
+
+**Decision: keep the checked traps.** `mem::Protect` rejects physical ranges (`OverlapsPhysical`), and `mem::CheckAccessLocked` treats the physical windows as unconditionally readable/writable. A bridge would have to add a physical-window protection model that no evidence justifies, and it would still not establish retail guard/cache/alignment semantics. An unconditional-success or no-op bridge is explicitly rejected. The traps remain correct for the only builds that can reach them.
+
+### Startup callback tables: initial provenance
+
+The four `CALL EAX` sites are no-argument table walks, not ticketed callbacks:
+
+| Site | Table | Entries | Initial targets | Observations |
+|---|---|---|---|---|
+| `002B57DC` | `004720C8` | 1 slot (+ `004720CC`, `004720D0`) | `00316DA8`; `004720CC=00326A43`, `004720D0=00326A43` | `00316DA8` calls `00316D70` (EH4/FPU vector install), then reads `[esp+4]` and conditionally calls `0031A9FE`. It is **not** a plain no-argument callback; the call site pushes nothing, so `[esp+4]` is the caller's frame slot. |
+| `002B582B`/`002B5848` | `0041E7E0..0041E7EC` | 3 | `{0, 0031BBA5, 0031F04D}` | `0031BBA5` allocates a 0x88 object, sets `[004E87E0]=0032062A`, and calls `002B5B8A(004E87D8,1)` to register a list node. `0031F04D` calls `0031A133(0x500)`. |
+| `002B57FB` | `0041F94C..0041F964` | 6 | `{0, 003B0C6B, 00317EFB, 003195F1, 00320602, 0031BD3E}` | `003B0C6B` installs three function pointers at `004DF780..`. |
+| `002B581F` | `0041E7F0..0041F948` | 1110 (867 live, 243 zero/-1) | first `0031BEAE`, last live `003702D0` | C/C++ static-initializer chain; every live target lies in an executable section. This is the largest startup execution surface. |
+
+All four tables are in writable sections (`0x41E7E0` section flags `0x7`; slot table `004720C8` is also initialized file data). No statically identifiable writer exists beyond the initial file contents and the registration helper's node stores; runtime mutation cannot be excluded. A blanket "no arguments" ABI policy is unsafe because `00316DA8` demonstrably reads its caller's frame.
+
+### Dynamic list callback and the critical ordering
+
+The critical-section object is `0046C8B0`, 0x1C bytes: dispatcher header, `LockCount=0046C8C0`, `RecursionCount=0046C8C4`, `OwningThread=0046C8C8`; the list sentinel is `0046C8CC` and is self-linked in the file. The registration helper `002B5B8A(node, insert)` takes two arguments and `RET 8`, enters/leaves the same critical section, and inserts at the tail or removes an entry. Its only static caller is `0031BC0F` inside `0031BBA5`.
+
+List node layout is `LIST_ENTRY` at `+0` and callback at `+8`. The walker `002B597D(arg)` calls `push [esp+0x10]`; with the reviewed stdcall enter/leave cleanup this is exactly the helper argument (`1` from `002B5C76`, `0` from `002B5C86`), and callback `0032062A` reads it at `[esp+4]` and returns with `RET 4`.
+
+The ordering is decisive:
+
+1. `002B5C74 push 1; 002B5C76 call 002B597D` — the system routine's **first** list walk. The file's sentinel is empty, the only static registration call (`0031BC0F`) is inside the start routine, and no earlier reviewed startup code registers a node, so this is the authenticated empty-list path already exercised by Phase 2C-41.
+2. `002B5C7B push [ebp+0xC]; 002B5C7E call [ebp+8]` — the start routine `002B38A2`.
+3. During `002B38EE` the start routine calls `002B582B`, whose table entry `0031BBA5` registers node `004E87D8` with callback `0032062A`.
+4. If the start routine returns, `002B5C84 push 0; 002B5C86 call 002B597D` walks a **one-node** list and calls `0032062A(0)`; `0032062A` calls `00326A43` (a bare `RET`) and then `0031BB53(0)`. The routine then jumps to `002B5C99` and terminates the guest thread through `PsTerminateSystemThread` (ordinal 258) at `002B5CA0`.
+
+Thus the Phase 2C-41 empty-list result is correct for the pre-start call, but it is **not** representative of the post-start call. The authentic post-start callback target chain is statically mapped; the missing piece is a checked dispatch policy, not an unknown pointer. Other runtime registrations are not statically visible.
+
+### Synthetic-versus-authentic callback architecture
+
+| Requirement | Existing synthetic mechanism | Authentic startup |
+|---|---|---|
+| Target binding | One-use `callback_ticket`, exact dispatch generation, memory generation, owner | Persistent writable tables; 1110 entries; no tickets |
+| Repetition | One callback per worker authorization | List callback is invoked with `1` then `0`; tables are walked in sequence |
+| Pre-registration | Registration and invocation in one gate | Node `004E87D8` is registered earlier, then invoked on the post-start path |
+| Re-entrancy | Recursive admission returns `kReentrant` | Initializer callbacks call ordinary guest code; exact re-entry depth unreviewed |
+| Workers | Exactly one synthetic worker | System routine runs on a new guest thread; the parent may continue |
+| Lifetime | Callback returns promptly to a host sentinel | Start routine may run the entire game loop and terminate through ordinal 258 |
+| Target policy | Authorised synthetic function range | Per-entry target/ABI allowlist needed; table A's target has a caller-frame-sensitive contract |
+
+Reusable: owner/memory-generation checks, stack and page leases, checked stack access, target-range validation, the unified Phase 2D-2 finalizer, and the single-worker gate. Not reusable as-is: ticket-per-call, synthetic-image identity authorization, the "no second thread" restriction, the short callback-return assumption, and the absence of a persistent target policy.
+
+### Readiness matrix after D11
+
+| Dependency | Evidence | Implementation | Validation | Blocker |
+|---|---|---|---|---|
+| Frozen 143-instruction route (72 root + 71 secondary) | Phase 2C-41 evidence; current preflight | Frozen | 143/143 generated instructions supported; self-test PASS | Do not rerun without new authorization. |
+| Critical-section helper and empty-list walk | Phase 2C-40R/2C-41 | Checked test-only enter/leave and list checks | PASS | None for the empty arm. |
+| Ordinals 277/294 enter/leave | Import slots `003C9E44=80000115`, `003C9E40=80000126`; nxdk | Checked services with ETHREAD owner checks | PASS | None. |
+| Protection 179/182 | ABI strongly corroborated; local gate and call sites | Fail-closed trap | Static preflight only | Physical-window protection model and retail flags/edge behavior unresolved. Not reached at build 5838. |
+| Protection 204 | nxdk 4-arg declaration; not imported by this XBE | Fail-closed trap remains | Static | None for this image; unused. |
+| Callback table A `004720C8` | Initial `00316DA8`; call site has no pushed args; target reads `[esp+4]` | None | Static | Target contract and runtime mutation unresolved. |
+| Callback tables B/C/D | Initial values and call sites mapped; 3/6/1110 entries | None | Static | 867-entry initializer chain; writable tables; no runtime target policy. |
+| List registration `002B5B8A` / node `004E87D8` | Registration path and node layout mapped | None | Static | No authentic activation; callback `0032062A` policy missing. |
+| Dynamic list callback `002B59A1` | Post-start target chain mapped | Route marks `002B59A1` forbidden | Synthetic rejection only | Needs checked dynamic dispatch and target policy; only on the post-start return path. |
+| Start routine `002B38A2` | Static decode; first callee `002B58B8` | None | Static | `fs:[0x20]+0x250` / `[8001003C]` layout, KPCR/ETHREAD model, 867-entry init chain, many imports/instructions. |
+| System routine `002B5C0F` | 71-instruction prefix executed | Route stops before `002B5C7B` | PASS | Dynamic start-routine call and ordinal-258 termination beyond the stop. |
+| SEH prologue/handler/epilogue; 302/312 | Synthetic only | Synthetic; retail unchanged | PASS synthetic | Retail record/context/handler and unwind contracts unverified. |
+| Guest worker activation | One synthetic worker | Test-only | PASS synthetic | Production `kExecutionDisabled`; no authentic authorization. |
+| Production `Boot()` / `main` | Disabled | Unchanged | Static | Not authorized. |
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 681 PASS / 0 FAIL | 681 PASS / 0 FAIL |
+| Integrated self-test | 67 PASS / 0 FAIL | 67 PASS / 0 FAIL |
+| Root / secondary self-tests | PASS | PASS |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Root `--static-real` | PASS | PASS |
+| Secondary `--static-real` | PASS | PASS |
+| Root/secondary/integrated `--preflight` | PASS | PASS |
+| Android ARM64 syntax (`dispatch.cpp`, `threads.cpp`) | PASS | — |
+
+The integrated preflight still reports `PREFLIGHT reachable generated instructions: 143/143 supported`, 11 functions, 0 continuations, 156 hooks and root hash `6FBF924DD2C56F08`; its route validation still checks the secondary hash `B3408A252D44C99D`. Four imports are restored, the import page is read-only, and zero workers/resources remain. The standalone secondary preflight still matches its 54-instruction prefix with hash `EF9505E0CE8AE719`. The default secondary CTest remains excluded because its default path executes copied authentic instructions. No authentic XBE instruction, authentic callback or authentic worker ran.
+
+### Remaining blockers, ranked
+
+1. **No authentic callback-target policy.** The four tables and the list need reviewed per-entry targets, ABIs and runtime-write checks. Table A's initial target is not a plain no-argument function, and table D is an 867-live-entry initializer chain.
+2. **No production guest-worker authorization.** `StartThread` still requires the test-only synthetic identity/ticket path; the Apple `kExecutionDisabled` guard and production `CallGuestCallback` trap remain. A real worker would need a separately reviewed authentic authorization and lifecycle.
+3. **KPCR/ETHREAD and start-routine layout.** The start routine's first helper reads `fs:[0x20]+0x250` and `[8001003C]`; the runtime's KPCR/ETHREAD are simplified (0x400/0x200) and the kernel-data pointer is uninitialized. The resulting path is benign under the prepared image but is not a validated retail layout.
+4. **Authentic ordinal-258 termination and retail SEH.** The post-start routine reaches `PsTerminateSystemThread` at `002B5CA0`; the authentic bridge is not enabled. The system routine's exception path still uses the unvalidated `002B5BD3` epilogue and retail SEH.
+5. **Protection edge semantics.** ABI is sufficient for a checked bridge only if a physical-window protection model and retail flag/rounding/failure rules are established; neither exists. The block is skipped at build 5838, so this is not the first startup gate.
+
+**Next package recommendation:** implement a bounded, static-only **authentic callback-table target policy** first: enumerate the initial targets of `004720C8`, `0041E7E0`, `0041F94C` and `0041E7F0`, classify their call contracts, and add a preflight audit that rejects any table entry whose live target is not in the reviewed executable set. Only then consider a supervised run that enters `002B38A2`; that run must stop before `002B5C86` (the post-start list walk) and before `002B5CA0` (ordinal 258), or explicitly authorize those targets. This is **NO-GO** for authentic startup execution now: the 143-instruction route is complete and frozen, but the start-routine dependency closure is not.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
