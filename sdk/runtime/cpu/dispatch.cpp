@@ -302,8 +302,33 @@ void CheckedCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t retur
     if (!frame.returned) x86_checked_trap(ctx, call_pc, "direct CALL target returned without checked RET");
 }
 
-void CheckedIndirectCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
+void CheckedIndirectCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc,
+                         uint32_t slot_address) {
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    if (kernel::SyntheticSessionArmed()) {
+        dispatch::CallLease resolution;
+        const dispatch::ResolvedTarget resolved = resolution.Resolve(target);
+        if (resolved.kind == dispatch::TargetKind::kGeneratedFunction) {
+            uint32_t expected_esp = 0;
+            const kernel::SyntheticCallbackAdmission admission = kernel::AdmitSyntheticCallback(
+                slot_address ? kernel::SyntheticCallbackEntry::kIndirectSlot
+                             : kernel::SyntheticCallbackEntry::kRegisterTarget,
+                slot_address, target, call_pc, resolution.Generation(), ctx.esp, &expected_esp);
+            if (admission != kernel::SyntheticCallbackAdmission::kAdmitted) {
+                char reason[160];
+                std::snprintf(reason, sizeof(reason), "synthetic callback admission rejected: %s",
+                              kernel::SyntheticCallbackAdmissionName(admission));
+                x86_checked_trap(ctx, call_pc, reason);
+            }
+            struct ReleaseAdmission {
+                ~ReleaseAdmission() { kernel::ReleaseSyntheticCallbackAdmission(); }
+            } release;
+            CheckedCall(ctx, base, target, return_address, call_pc);
+            if (ctx.esp != expected_esp)
+                x86_checked_trap(ctx, call_pc, "synthetic callback ABI stack cleanup mismatch");
+            return;
+        }
+    }
     mem::ScopedPageLease callback_code_lease;
     if (kernel::SyntheticWorkerClaimHeld()) {
         dispatch::CallLease lease;
@@ -322,18 +347,42 @@ void CheckedIndirectCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32
 }  // namespace
 
 void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    if (kernel::SyntheticSessionArmed()) {
+        dispatch::CallLease resolution;
+        if (resolution.Resolve(target).kind == dispatch::TargetKind::kGeneratedFunction) {
+            uint32_t expected_esp = 0;
+            const kernel::SyntheticCallbackAdmission admission = kernel::AdmitSyntheticCallback(
+                kernel::SyntheticCallbackEntry::kDirectCall, 0, target, call_pc, resolution.Generation(), ctx.esp,
+                &expected_esp);
+            if (admission != kernel::SyntheticCallbackAdmission::kAdmitted) {
+                char reason[160];
+                std::snprintf(reason, sizeof(reason), "synthetic callback admission rejected: %s",
+                              kernel::SyntheticCallbackAdmissionName(admission));
+                x86_checked_trap(ctx, call_pc, reason);
+            }
+            struct ReleaseAdmission {
+                ~ReleaseAdmission() { kernel::ReleaseSyntheticCallbackAdmission(); }
+            } release;
+            CheckedCall(ctx, base, target, return_address, call_pc);
+            if (ctx.esp != expected_esp)
+                x86_checked_trap(ctx, call_pc, "synthetic callback ABI stack cleanup mismatch");
+            return;
+        }
+    }
+#endif
     CheckedCall(ctx, base, target, return_address, call_pc);
 }
 
 void x86_checked_register_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address,
                                uint32_t call_pc) {
-    CheckedIndirectCall(ctx, base, target, return_address, call_pc);
+    CheckedIndirectCall(ctx, base, target, return_address, call_pc, 0);
 }
 
 void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t return_address,
                                uint32_t call_pc) {
     const uint32_t target = x86_mem_read<uint32_t>(call_pc, operand_address);
-    CheckedIndirectCall(ctx, base, target, return_address, call_pc);
+    CheckedIndirectCall(ctx, base, target, return_address, call_pc, operand_address);
 }
 
 void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {

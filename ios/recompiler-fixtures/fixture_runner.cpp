@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 
 #if defined(__APPLE__)
 #include <pthread.h>
@@ -111,6 +112,41 @@ void ReleaseSyntheticHook() {
         g_synthetic_hook_release = true;
     }
     g_synthetic_hook_cv.notify_all();
+}
+
+std::mutex g_session_pause_lock;
+std::condition_variable g_session_pause_cv;
+bool g_session_pause_used = false;
+bool g_session_pause_entered = false;
+bool g_session_pause_release = false;
+
+void SessionAdmissionPauseHook() {
+    std::unique_lock lock(g_session_pause_lock);
+    if (g_session_pause_used) return;
+    g_session_pause_used = true;
+    g_session_pause_entered = true;
+    g_session_pause_cv.notify_all();
+    g_session_pause_cv.wait(lock, [] { return g_session_pause_release; });
+}
+
+void ResetSessionPause() {
+    std::lock_guard lock(g_session_pause_lock);
+    g_session_pause_used = false;
+    g_session_pause_entered = false;
+    g_session_pause_release = false;
+}
+
+bool WaitSessionPauseEntered() {
+    std::unique_lock lock(g_session_pause_lock);
+    return g_session_pause_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_session_pause_entered; });
+}
+
+void ReleaseSessionPause() {
+    {
+        std::lock_guard lock(g_session_pause_lock);
+        g_session_pause_release = true;
+    }
+    g_session_pause_cv.notify_all();
 }
 
 std::atomic<uint32_t> g_kernel258_calls{0};
@@ -1131,6 +1167,470 @@ void CheckGuestThreadLifecycle() {
 }
 
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+constexpr uint32_t kSessionSlot0 = 0xA5300;
+constexpr uint32_t kSessionLeafTarget = 0x11E8D;
+
+void SessionMutationHook() {
+    const uint32_t value = kSessionLeafTarget;
+    mem::Write(kSessionSlot0, &value, sizeof(value));
+}
+
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+void CheckPersistentSyntheticCallbacks() {
+    constexpr uint32_t code_page = 0x11000;
+    constexpr uint32_t output_page = 0xA5000;
+    constexpr uint32_t session_simple = 0x11E80;
+    constexpr uint32_t session_writer = 0x11E86;
+    constexpr uint32_t session_leaf = 0x11E8D;
+    constexpr uint32_t session_node1 = 0x11E99;
+    constexpr uint32_t session_node2 = 0x11EB6;
+    constexpr uint32_t session_nested_b = 0x11ED3;
+    constexpr uint32_t session_nested_a = 0x11ED9;
+    constexpr uint32_t session_terminate = 0x11EEE;
+    constexpr uint32_t session_nested_terminate_a = 0x11F06;
+    constexpr uint32_t session_terminate_walker = 0x11F28;
+    constexpr uint32_t session_start = 0x11F40;
+    constexpr uint32_t session_direct_caller = 0x11F8D;
+
+    constexpr uint32_t slot0 = 0xA5300, slot1 = 0xA5304, slot2 = 0xA5308, slot3 = 0xA530C;
+    constexpr uint32_t slot4 = 0xA5310, slot5 = 0xA5314, slot6 = 0xA5318, slot7 = 0xA531C;
+    constexpr uint32_t marker = 0xA5340, simple_out = 0xA5344, nested_out = 0xA5348;
+    constexpr uint32_t head_copy = 0xA534C, list_head = 0xA5350, writer_count = 0xA5354;
+    constexpr uint32_t leaf_count = 0xA5358, node1 = 0xA5360, node2 = 0xA5368;
+    constexpr uint32_t nested_argument_out = 0xA5370, terminate_post = 0xA5378;
+    constexpr uint32_t nested_terminate_marker = 0xA537C, nested_terminate_post = 0xA5380;
+    constexpr uint32_t terminate_walker_post = 0xA5384;
+    constexpr uint32_t start_context = 0x5EA51000;
+    constexpr uint32_t direct_result = 0x33333333;
+    constexpr uint32_t handle_out = output_page + 0x20;
+
+    std::string error;
+    auto initialize = [&] {
+        const bool ready = mem::Init() && mem::Commit(code_page, mem::kPage) && mem::Commit(output_page, mem::kPage) &&
+                           mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                           dispatch::Init(error) && kernel::RestartKernelWorkers();
+        Check(ready, "persistent callback fixture memory, dispatch and workers initialize");
+        return ready;
+    };
+    auto generation = [] {
+        dispatch::CallLease lease;
+        return lease.Generation();
+    };
+    auto wait_thread = [](const kernel::ThreadRef& thread) {
+        return kernel::Wait({std::static_pointer_cast<kernel::Object>(thread)}, false, -100'000'000, false);
+    };
+    auto join_workers = [] { return kernel::StopKernelWorkers() && kernel::RestartKernelWorkers(); };
+    auto write_slots = [&] {
+        if (mem::Fill(output_page + 0x300, 0, 0x90) != mem::AccessStatus::kOk) return false;
+        const std::array<std::pair<uint32_t, uint32_t>, 8> slots{{
+            {slot0, session_simple}, {slot1, session_writer}, {slot2, session_node1}, {slot3, session_node2},
+            {slot4, session_nested_a}, {slot5, session_nested_b}, {slot6, session_nested_terminate_a},
+            {slot7, session_terminate}}};
+        for (const auto& [address, value] : slots) {
+            if (mem::Write(address, &value, sizeof(value)) != mem::AccessStatus::kOk) return false;
+        }
+        const uint32_t node1_callback = session_leaf, node2_callback = session_leaf;
+        const uint32_t terminate_thunk = dispatch::KernelThunkAddress(258);
+        const uint32_t zero = 0;
+        return mem::Write(0xA5100, &terminate_thunk, sizeof(terminate_thunk)) == mem::AccessStatus::kOk &&
+               mem::Write(list_head, &zero, sizeof(zero)) == mem::AccessStatus::kOk &&
+               mem::Write(writer_count, &zero, sizeof(zero)) == mem::AccessStatus::kOk &&
+               mem::Write(leaf_count, &zero, sizeof(zero)) == mem::AccessStatus::kOk &&
+               mem::Write(node1 + 4, &node1_callback, sizeof(node1_callback)) == mem::AccessStatus::kOk &&
+               mem::Write(node2 + 4, &node2_callback, sizeof(node2_callback)) == mem::AccessStatus::kOk;
+    };
+    auto arm_worker = [&](uint32_t start, uint32_t context, uint32_t expected_exit) {
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.context = context;
+        authorization.expected_exit = expected_exit;
+        authorization.code_base = code_page;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = generation();
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        return kernel::ArmSyntheticWorker(authorization);
+    };
+    auto add_slot = [](kernel::SyntheticSessionPolicy& policy, kernel::SyntheticCallbackEntry entry,
+                       uint32_t slot_address, uint32_t target, uint32_t call_pc, uint32_t argument_count,
+                       bool callee_cleanup) {
+        kernel::SyntheticCallbackSlotPolicy& slot = policy.slots[policy.slot_count++];
+        slot.entry = entry;
+        slot.slot_address = slot_address;
+        slot.target = target;
+        slot.call_pc = call_pc;
+        slot.argument_count = argument_count;
+        slot.callee_cleanup = callee_cleanup;
+    };
+    auto make_policy = [&](uint64_t dispatch_generation) {
+        kernel::SyntheticSessionPolicy policy;
+        policy.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        policy.code_base = code_page;
+        policy.code_end = X86CodeEnd;
+        policy.max_depth = 3;
+        policy.dispatch_generation = dispatch_generation;
+        add_slot(policy, kernel::SyntheticCallbackEntry::kIndirectSlot, slot0, session_simple, 0x11F4D, 0, false);
+        add_slot(policy, kernel::SyntheticCallbackEntry::kIndirectSlot, slot1, session_writer, 0x11F58, 0, false);
+        add_slot(policy, kernel::SyntheticCallbackEntry::kIndirectSlot, slot2, session_node1, 0x11F5E, 0, false);
+        add_slot(policy, kernel::SyntheticCallbackEntry::kIndirectSlot, slot3, session_node2, 0x11F64, 0, false);
+        add_slot(policy, kernel::SyntheticCallbackEntry::kIndirectSlot, slot4, session_nested_a, 0x11F6F, 1, true);
+        add_slot(policy, kernel::SyntheticCallbackEntry::kIndirectSlot, slot5, session_nested_b, 0x11EE2, 0, false);
+        add_slot(policy, kernel::SyntheticCallbackEntry::kRegisterTarget, 0, session_leaf, 0x11EB3, 0, false);
+        add_slot(policy, kernel::SyntheticCallbackEntry::kRegisterTarget, 0, session_leaf, 0x11ED0, 0, false);
+        return policy;
+    };
+    auto make_termination_policy = [&](uint64_t dispatch_generation) {
+        kernel::SyntheticSessionPolicy policy;
+        policy.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        policy.code_base = code_page;
+        policy.code_end = X86CodeEnd;
+        policy.max_depth = 3;
+        policy.dispatch_generation = dispatch_generation;
+        add_slot(policy, kernel::SyntheticCallbackEntry::kIndirectSlot, slot6, session_nested_terminate_a, 0x11F2D, 1,
+                 true);
+        add_slot(policy, kernel::SyntheticCallbackEntry::kIndirectSlot, slot7, session_terminate, 0x11F15, 1, true);
+        return policy;
+    };
+    auto read_word = [](uint32_t address, uint32_t& value) {
+        return mem::Read(address, &value, sizeof(value)) == mem::AccessStatus::kOk;
+    };
+    auto prepare_thread = [&](kernel::ThreadRef& thread, uint32_t start, uint32_t context) {
+        return kernel::PrepareSystemThreadEx(handle_out, 0x10000, 0x20, handle_out + 4, start, context, false, 0,
+                                             thread) == kernel::kSuccess &&
+               bool(thread);
+    };
+
+    if (!initialize()) return;
+    const mem::Stats baseline = mem::Query();
+
+    if (!write_slots()) {
+        Check(false, "persistent callback fixture slots initialize");
+        return;
+    }
+    {
+        kernel::ThreadRef thread;
+        const uint64_t dispatch_generation = generation();
+        const bool prepared = prepare_thread(thread, session_start, start_context);
+        const bool armed = prepared && arm_worker(session_start, start_context, start_context);
+        const kernel::SyntheticSessionPolicy policy = make_policy(dispatch_generation);
+        const bool session = armed && kernel::ArmSyntheticSession(policy);
+        const bool started = session && kernel::StartThread(thread);
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        const bool joined = wait == kernel::kWait0 && join_workers();
+        uint32_t handle = 0;
+        mem::Read(handle_out, &handle, sizeof(handle));
+        uint32_t simple = 0, nested = 0, head = 0, head_seen = 0, writes = 0, leaves = 0, echoed = 0;
+        uint32_t node1_next = 1, node2_next = 1, set_marker = 0;
+        const bool read_back = read_word(simple_out, simple) && read_word(nested_out, nested) &&
+                               read_word(head_copy, head_seen) && read_word(list_head, head) &&
+                               read_word(writer_count, writes) && read_word(leaf_count, leaves) &&
+                               read_word(nested_argument_out, echoed) && read_word(node1, node1_next) &&
+                               read_word(node2, node2_next) && read_word(marker, set_marker);
+        Check(prepared && armed && session && started && wait == kernel::kWait0 && joined && read_back && set_marker == 1 &&
+                  simple == 0x11111111 && writes == 1 && leaves == 2 && echoed == 0x87654321 &&
+                  nested == 0x22222229 && head == node2 && head_seen == node2 && node2_next == node1 &&
+                  node1_next == 0 && thread->state.load() == kernel::ThreadState::kExited &&
+                  thread->exit_code.load() == start_context && thread->resources_released && !thread->ctx &&
+                  !kernel::SyntheticSessionArmed() && kernel::SyntheticSessionDepthForTest() == 0 &&
+                  kernel::SyntheticSessionAdmissionsForTest() == 8 && kernel::SyntheticSessionMaxDepthForTest() == 2 &&
+                  kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used,
+              "one persistent session executes seven admitted generated callbacks, a nested call and a two-node list");
+        kernel::CloseHandle(handle);
+        kernel::DisarmSyntheticWorker();
+    }
+
+    if (!initialize()) return;
+    {
+        kernel::ThreadRef thread;
+        const uint64_t dispatch_generation = generation();
+        const bool prepared = prepare_thread(thread, session_direct_caller, 0);
+        const bool armed = prepared && arm_worker(session_direct_caller, 0, direct_result);
+        kernel::SyntheticSessionPolicy policy;
+        policy.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        policy.code_base = code_page;
+        policy.code_end = X86CodeEnd;
+        policy.max_depth = 2;
+        policy.dispatch_generation = dispatch_generation;
+        add_slot(policy, kernel::SyntheticCallbackEntry::kDirectCall, 0, session_leaf, 0x11F8D, 0, false);
+        const bool session = armed && kernel::ArmSyntheticSession(policy);
+        const bool started = session && kernel::StartThread(thread);
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        const bool joined = wait == kernel::kWait0 && join_workers();
+        uint32_t handle = 0;
+        mem::Read(handle_out, &handle, sizeof(handle));
+        uint32_t leaves = 0;
+        Check(prepared && armed && session && started && wait == kernel::kWait0 && joined && read_word(leaf_count, leaves) &&
+                  leaves == 3 && thread->exit_code.load() == direct_result && thread->resources_released &&
+                  kernel::SyntheticSessionAdmissionsForTest() == 1 &&
+                  kernel::SyntheticSessionDepthForTest() == 0 && kernel::KernelWorkerCountForTest() == 0,
+              "a reviewed direct call in the session policy is admitted and returns through the checked frame");
+        kernel::CloseHandle(handle);
+        kernel::DisarmSyntheticWorker();
+    }
+
+    if (!initialize()) return;
+    {
+        ResetKernel258Gate(false);
+        kernel::RegisterExport(258, "PsTerminateSystemThread", Kernel258FixtureHandler);
+        const bool bridge = dispatch::SetKernel258FixtureBridge(true);
+        const uint32_t termination_calls_before = g_kernel258_calls.load();
+        kernel::ThreadRef thread;
+        constexpr uint32_t exit_status = 0xC0DE2001;
+        const uint64_t dispatch_generation = generation();
+        const bool prepared = bridge && prepare_thread(thread, session_terminate_walker, exit_status);
+        const bool armed = prepared && arm_worker(session_terminate_walker, exit_status, exit_status);
+        const kernel::SyntheticSessionPolicy policy = make_termination_policy(dispatch_generation);
+        const bool session = armed && kernel::ArmSyntheticSession(policy);
+        const bool started = session && kernel::StartThread(thread);
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        const bool joined = wait == kernel::kWait0 && join_workers();
+        uint32_t handle = 0;
+        mem::Read(handle_out, &handle, sizeof(handle));
+        uint32_t entered = 0, after_a = 0, after_walker = 0, callback_post = 0;
+        Check(prepared && armed && session && started && wait == kernel::kWait0 && joined &&
+                  thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == exit_status &&
+                  thread->resources_released && !thread->ctx &&
+                  read_word(nested_terminate_marker, entered) && entered == 1 &&
+                  read_word(terminate_post, callback_post) && callback_post == 0 &&
+                  read_word(nested_terminate_post, after_a) && after_a == 0 &&
+                  read_word(terminate_walker_post, after_walker) && after_walker == 0 &&
+                  !kernel::SyntheticSessionArmed() && kernel::SyntheticSessionDepthForTest() == 0 &&
+                  kernel::SyntheticSessionAdmissionsForTest() == 2 &&
+                  g_kernel258_calls.load() == termination_calls_before + 1 &&
+                  kernel::KernelWorkerCountForTest() == 0,
+              "guest-requested termination inside a nested admitted callback unwinds both frames and preserves its exit status");
+        kernel::CloseHandle(handle);
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::SetKernel258FixtureBridge(false), "persistent session termination bridge disables after quiescence");
+        ResetKernel258Gate(false);
+    }
+
+    if (!initialize()) return;
+    {
+        kernel::Thread owner_identity;
+        kernel::SetSyntheticWorkerThreadIdentityForTest(&owner_identity);
+        const uint64_t dispatch_generation = generation();
+        const bool armed = arm_worker(session_start, start_context, start_context);
+        const kernel::SyntheticSessionPolicy policy = make_policy(dispatch_generation);
+        const bool session = armed && kernel::ArmSyntheticSession(policy);
+        const auto claim = kernel::ClaimSyntheticWorker(session_start, start_context, dispatch_generation);
+        uint32_t expected = 0;
+        const bool first = kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                          session_simple, 0x11F4D, dispatch_generation, 0x1000,
+                                                          &expected) == kernel::SyntheticCallbackAdmission::kAdmitted &&
+                           expected == 0x1000;
+        kernel::ReleaseSyntheticCallbackAdmission();
+        const bool repeated = kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                             session_simple, 0x11F4D, dispatch_generation, 0x1000,
+                                                             &expected) == kernel::SyntheticCallbackAdmission::kAdmitted;
+        kernel::ReleaseSyntheticCallbackAdmission();
+        const bool wrong_site = kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                               session_simple, 0x11F4E, dispatch_generation, 0x1000,
+                                                               &expected) == kernel::SyntheticCallbackAdmission::kAbiMismatch;
+        uint32_t changed = session_leaf;
+        mem::Write(slot0, &changed, sizeof(changed));
+        const bool changed_rejected = kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot,
+                                                                     slot0, session_simple, 0x11F4D,
+                                                                     dispatch_generation, 0x1000, &expected) ==
+                                       kernel::SyntheticCallbackAdmission::kSlotChanged;
+        const uint32_t simple_value = session_simple;
+        mem::Write(slot0, &simple_value, sizeof(simple_value));
+        const bool unauthorized = kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                                  session_leaf, 0x11F4D, dispatch_generation, 0x1000,
+                                                                  &expected) ==
+                                  kernel::SyntheticCallbackAdmission::kUnauthorizedTarget;
+        std::atomic<bool> foreign_owner{false};
+        std::thread foreign([&] {
+            uint32_t local_expected = 0;
+            foreign_owner = kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                           session_simple, 0x11F4D, dispatch_generation, 0x1000,
+                                                           &local_expected) ==
+                             kernel::SyntheticCallbackAdmission::kInvalidOwner;
+        });
+        foreign.join();
+        Check(armed && session && claim == kernel::SyntheticWorkerClaim::kClaimed && first && repeated &&
+                  wrong_site && changed_rejected && unauthorized && foreign_owner.load(),
+              "per-call admission re-reads the slot, rejects a changed target or call site and a foreign owner");
+
+        kernel::SetSyntheticSessionAdmissionHookForTest(SessionMutationHook);
+        const bool mutation_rejected = kernel::AdmitSyntheticCallback(
+                                           kernel::SyntheticCallbackEntry::kIndirectSlot, slot0, session_simple,
+                                           0x11F4D, dispatch_generation, 0x1000, &expected) ==
+                                       kernel::SyntheticCallbackAdmission::kSlotChanged;
+        kernel::SetSyntheticSessionAdmissionHookForTest(nullptr);
+        mem::Write(slot0, &simple_value, sizeof(simple_value));
+        Check(mutation_rejected,
+              "a slot mutation between the policy read and admission commit is detected before guest execution");
+
+        uint32_t depth_ok = 0;
+        for (uint32_t i = 0; i < policy.max_depth; ++i)
+            if (kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0, session_simple,
+                                               0x11F4D, dispatch_generation, 0x1000, &expected) ==
+                kernel::SyntheticCallbackAdmission::kAdmitted)
+                ++depth_ok;
+        const bool depth_rejected = kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                                   session_simple, 0x11F4D, dispatch_generation,
+                                                                   0x1000, &expected) ==
+                                     kernel::SyntheticCallbackAdmission::kDepthExceeded;
+        for (uint32_t i = 0; i < depth_ok; ++i) kernel::ReleaseSyntheticCallbackAdmission();
+        Check(depth_ok == policy.max_depth && depth_rejected && kernel::SyntheticSessionDepthForTest() == 0,
+              "nested admission honours the explicit recursion limit and releases every depth slot");
+
+        kernel::DisarmSyntheticSession();
+        const bool revoked = kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                            session_simple, 0x11F4D, dispatch_generation, 0x1000,
+                                                            &expected) == kernel::SyntheticCallbackAdmission::kNoSession;
+        Check(revoked, "a revoked session admits no further callback");
+        kernel::DisarmSyntheticWorker();
+        kernel::SetSyntheticWorkerThreadIdentityForTest(nullptr);
+
+        const bool rearmed = arm_worker(session_start, start_context, start_context) &&
+                             kernel::ArmSyntheticSession(make_policy(dispatch_generation)) &&
+                             kernel::ClaimSyntheticWorker(session_start, start_context, dispatch_generation) ==
+                                 kernel::SyntheticWorkerClaim::kClaimed;
+        const bool dispatch_reinitialized = dispatch::Init(error);
+        const uint64_t regenerated_dispatch = generation();
+        const bool stale_dispatch = rearmed && dispatch_reinitialized &&
+                                    kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                                   session_simple, 0x11F4D, regenerated_dispatch,
+                                                                   0x1000, &expected) ==
+                                        kernel::SyntheticCallbackAdmission::kStaleDispatch;
+        kernel::DisarmSyntheticWorker();
+        Check(stale_dispatch, "a dispatch regeneration invalidates the persistent session before execution");
+    }
+
+    if (!initialize()) return;
+    {
+        ResetKernel258Gate(true);
+        kernel::RegisterExport(258, "PsTerminateSystemThread", Kernel258FixtureHandler);
+        const bool bridge = dispatch::SetKernel258FixtureBridge(true);
+        kernel::ThreadRef thread;
+        constexpr uint32_t exit_status = 0xC0DE2002;
+        const uint64_t dispatch_generation = generation();
+        const bool prepared = bridge && prepare_thread(thread, session_terminate_walker, exit_status);
+        uint32_t handle = 0;
+        mem::Read(handle_out, &handle, sizeof(handle));
+        const bool armed = prepared && arm_worker(session_terminate_walker, exit_status, exit_status);
+        const bool session = armed && kernel::ArmSyntheticSession(make_termination_policy(dispatch_generation));
+        const bool started = session && kernel::StartThread(thread);
+        const bool entered = started && WaitKernel258Entered();
+        const bool active_resources_retained = started && !thread->resources_released &&
+                                               kernel::SyntheticSessionDepthForTest() == 2;
+        std::atomic<bool> shutdown_done{false};
+        std::thread shutdown([&] {
+            kernel::StopKernelWorkers();
+            shutdown_done = true;
+        });
+        for (int i = 0; i < 1000 && !shutdown_done.load(); ++i) std::this_thread::yield();
+        const bool shutdown_waited = entered && !shutdown_done.load();
+        ReleaseKernel258Gate();
+        shutdown.join();
+        const uint32_t wait = wait_thread(thread);
+        kernel::CloseHandle(handle);
+        uint32_t callback_post = 1, after_a = 1, after_walker = 1;
+        Check(prepared && armed && session && started && entered && active_resources_retained && shutdown_waited &&
+                  shutdown_done.load() && wait == kernel::kWait0 &&
+                  thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == exit_status &&
+                  thread->resources_released && !thread->ctx && !thread->start_routine_ticket.target &&
+                  !kernel::SyntheticSessionArmed() && kernel::SyntheticSessionDepthForTest() == 0 &&
+                  read_word(terminate_post, callback_post) && callback_post == 0 &&
+                  read_word(nested_terminate_post, after_a) && after_a == 0 &&
+                  read_word(terminate_walker_post, after_walker) && after_walker == 0 &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty(),
+              "shutdown during a nested termination callback waits for quiescence and preserves the exact exit status");
+        Check(kernel::RestartKernelWorkers(), "persistent callback workers restart after the shutdown experiment");
+        kernel::DisarmSyntheticWorker();
+        Check(dispatch::SetKernel258FixtureBridge(false),
+              "shutdown termination bridge disables after quiescence");
+        ResetKernel258Gate(false);
+    }
+
+    if (!initialize()) return;
+    {
+        if (!write_slots()) return;
+        kernel::ThreadRef thread;
+        const uint64_t dispatch_generation = generation();
+        const bool prepared = prepare_thread(thread, session_start, start_context);
+        uint32_t handle = 0;
+        mem::Read(handle_out, &handle, sizeof(handle));
+        const bool armed = prepared && arm_worker(session_start, start_context, start_context);
+        const bool session = armed && kernel::ArmSyntheticSession(make_policy(dispatch_generation));
+        ResetSessionPause();
+        kernel::SetSyntheticSessionAdmissionHookForTest(SessionAdmissionPauseHook);
+        const bool started = session && kernel::StartThread(thread);
+        const bool entered = started && WaitSessionPauseEntered();
+        {
+            std::lock_guard lock(g_callback_fake_lock);
+            g_callback_page_mutation_waits = 0;
+        }
+        mem::SetPageMutationWaitHookForTest(CallbackPageMutationWaiting);
+        std::atomic<bool> decommit_done{false};
+        std::atomic<bool> decommit_ok{false};
+        std::thread decommitter([&] {
+            decommit_ok = mem::Decommit(code_page, mem::kPage);
+            decommit_done = true;
+        });
+        bool mutation_waited = false;
+        {
+            std::unique_lock lock(g_callback_fake_lock);
+            mutation_waited = g_callback_fake_changed.wait_for(lock, std::chrono::seconds(5), [] {
+                return g_callback_page_mutation_waits >= 1;
+            });
+        }
+        const bool resources_retained = started && !thread->resources_released;
+        ReleaseSessionPause();
+        decommitter.join();
+        mem::SetPageMutationWaitHookForTest(nullptr);
+        kernel::SetSyntheticSessionAdmissionHookForTest(nullptr);
+        const bool code_restored = decommit_ok.load() && mem::Commit(code_page, mem::kPage) &&
+                                   mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) ==
+                                       mem::AccessStatus::kOk;
+        const uint32_t wait = wait_thread(thread);
+        const bool joined = join_workers();
+        kernel::CloseHandle(handle);
+        uint32_t marker_value = 0, simple = 0, writes = 0, leaves = 0;
+        const bool read_back = read_word(marker, marker_value) && read_word(simple_out, simple) &&
+                               read_word(writer_count, writes) && read_word(leaf_count, leaves);
+        Check(entered && mutation_waited && decommit_done.load() && resources_retained && code_restored &&
+                  wait == kernel::kWait0 && joined && read_back && marker_value == 1 && simple == 0x11111111 &&
+                  writes == 1 && leaves == 2 && thread->state.load() == kernel::ThreadState::kExited &&
+                  thread->exit_code.load() == start_context && thread->resources_released && !thread->ctx &&
+                  !kernel::SyntheticSessionArmed() && kernel::SyntheticSessionDepthForTest() == 0 &&
+                  kernel::SyntheticSessionAdmissionsForTest() == 8 && kernel::KernelWorkerCountForTest() == 0 &&
+                  kernel::Threads().empty(),
+              "code decommit during session admission waits for the callback lease, then the complete session still executes");
+        kernel::DisarmSyntheticWorker();
+    }
+
+    if (!initialize()) return;
+    {
+        const uint64_t dispatch_generation = generation();
+        const bool armed = arm_worker(session_start, start_context, start_context) &&
+                           kernel::ArmSyntheticSession(make_policy(dispatch_generation)) &&
+                           kernel::ClaimSyntheticWorker(session_start, start_context, dispatch_generation) ==
+                               kernel::SyntheticWorkerClaim::kClaimed;
+        kernel::StopKernelWorkers();
+        mem::Shutdown();
+        mem::Init();
+        const bool memory_reinitialized = mem::Commit(code_page, mem::kPage) && mem::Commit(output_page, mem::kPage) &&
+                                          mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) ==
+                                              mem::AccessStatus::kOk &&
+                                          dispatch::Init(error) && kernel::RestartKernelWorkers();
+        uint32_t expected = 0;
+        const bool stale_memory = armed && memory_reinitialized &&
+                                  kernel::AdmitSyntheticCallback(kernel::SyntheticCallbackEntry::kIndirectSlot, slot0,
+                                                                 session_simple, 0x11F4D, dispatch_generation,
+                                                                 0x1000, &expected) ==
+                                      kernel::SyntheticCallbackAdmission::kStaleMemory;
+        kernel::DisarmSyntheticWorker();
+        kernel::DisarmSyntheticSession();
+        Check(stale_memory,
+              "a memory regeneration invalidates the persistent session and no stale guest allocation is reused");
+    }
+    Check(kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() && mem::Query().system_used == baseline.system_used,
+          "persistent callback fixture returns to its worker and allocation baseline");
+}
+#endif
+
 void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t code_page = 0x11000;
     constexpr uint32_t target = code_page + 0x10;
@@ -5936,6 +6436,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckGuestCallbackContract();
     CheckGuestThreadLifecycle();
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    CheckPersistentSyntheticCallbacks();
     CheckSyntheticWorkerLifecycle();
 #endif
     mem::Shutdown();

@@ -3703,3 +3703,77 @@ The integrated self-test grew from the Phase 2D-11 baseline of 67 cases to 68; t
 Implement a **persistent callback admission policy** (still without authentic execution): a per-call slot re-read and target revalidation API that binds the manifest record, the observed slot value, the full generated mapping entry, the owner, memory/dispatch generations and page/stack leases; supports repeated calls to the same target; and stops before the first target whose status is not `VERIFIED_STATIC`. Then add an explicitly bounded supervised entry at `002B38A2` that stops before `002B5C86` (post-start list walk) and `002B5CA0` (ordinal 258). Do not authorize authentic execution yet.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-13 — persistent checked callback session
+
+**`PHASE_2D13_PERSISTENT_CALLBACKS = PASS`.** A synthetic-only persistent callback session now supports multiple successive and nested generated guest callbacks inside one managed worker. Each admitted call is revalidated against the session policy, the live owner, the memory generation, the dispatch generation, the reviewed call site and (for a table entry) the current slot contents. The frozen authentic route remains 143 instructions; no authentic instruction, callback or start-routine address ran.
+
+### Persistent session architecture
+
+- `sdk/runtime/kernel/synthetic_worker.h` adds `SyntheticSessionPolicy`, `SyntheticCallbackSlotPolicy` and `SyntheticCallbackAdmission`. A policy is copied on arm; no caller pointer survives. Entry kinds are `kIndirectSlot` (`call [slot]`, slot re-read at admission), `kRegisterTarget` (`call reg`, captured target must match exactly) and `kDirectCall` (`call rel32`, call site and target must match).
+- `sdk/runtime/kernel/threads.cpp` owns `ArmSyntheticSession`, `DisarmSyntheticSession`, `AdmitSyntheticCallback` and `ReleaseSyntheticCallbackAdmission`. Arm validates image identity, worker authorization, code range, dispatch generation and every declared indirect slot against checked guest memory. Admission checks the claimed owner, memory generation, dispatch generation, recursion depth, exact policy entry, slot value and a second slot read after the test admission hook; it returns an explicit rejection status instead of executing.
+- `sdk/runtime/cpu/dispatch.cpp` gates generated indirect and direct calls while a session is armed. A rejected admission is a checked trap before the target runs. The caller's ESP is captured before `CheckedCall`; after the callback returns, the observed stack cleanup must equal the policy's declared `argument_count`/`callee_cleanup`, otherwise the call traps. Kernel-thunk calls keep their existing checked bridge path.
+- Sessions are bound to one armed synthetic worker, are revoked by `DisarmSyntheticSession`, `DisarmSyntheticWorker` and `FinishSyntheticWorker`, and carry a finite nesting depth (`kMaximumSyntheticSessionDepth`). The Phase 2D-12 manifest is untouched: every authentic target remains `auth=0`; this mechanism is a test-only policy adapter, not a manifest permission.
+
+### Generated execution evidence
+
+The checked fixture gained generated functions at `0x11E80..0x11F93`:
+
+| Function | Address | Role |
+|---|---|---|
+| simple return | `11E80` | zero-argument cdecl callback |
+| writer | `11E86` | increments a checked guest global |
+| leaf | `11E8D` | increments a second global and returns `33333333` |
+| node 1 / node 2 | `11E99` / `11EB6` | link a node into the synthetic list, then `call ecx` to the node's callback pointer |
+| nested leaf / nested caller | `11ED3` / `11ED9` | stdcall one-argument callback that invokes another admitted function |
+| ordinal-258 callback | `11EEE` | guest-requested termination through the checked test bridge |
+| nested terminator | `11F06` | calls the ordinal-258 callback and must not reach its post marker |
+| termination walker | `11F28` | one-argument start routine for the termination path |
+| session start | `11F40` | five table calls, one nested call, two list-node callback calls |
+| direct caller | `11F8D` | reviewed `call rel32` admitted by `kDirectCall` |
+
+The session start executed **eight admissions** on one worker: five table entries, one nested entry and two register-target entries. The two node callbacks produced head `A5368 -> A5360 -> 0`, and both post-termination markers stayed untouched. The nested stdcall path returned `22222229`; the direct call returned `33333333`. Worker exit retained the exact start context, all guest allocations were released after quiescence, and nesting peaked at depth 2. The termination session admitted two frames and exited with the exact guest status `C0DE2001`; the shutdown session waited for the nested callback and preserved `C0DE2002`.
+
+### Negative and deterministic concurrency results
+
+- Rejected before execution: changed slot target, wrong call site (`kAbiMismatch`), target absent from the policy, foreign owner thread, slot mutation injected between the two admission reads, recursion limit, revoked session, stale dispatch generation and stale memory generation.
+- A code-page `mem::Decommit` during the first admission waited on the callback's code lease (mutation hook observed), then the complete eight-admission session executed and the page was restored.
+- Shutdown during the nested termination callback waited for worker quiescence; the retained thread and handle remained valid until completion, then resources, tickets, the session depth and the worker list returned to baseline.
+- The fault and mutation tests use the production admission function and the production worker finalizer; no test manually frees guest allocations or bypasses the callback gates.
+
+### Authentic startup readiness after D13
+
+| Dependency | Evidence after D13 | Status |
+|---|---|---|
+| Persistent callback authorization | Session policy, per-call slot re-read, generations, owner, depth, ABI cleanup | implemented, synthetic-only |
+| 867 initializer targets | Static manifest only; D13 does not authorize any authentic target | unresolved |
+| 34 `PROHIBITED` targets | Trap/ABI findings unchanged | unresolved |
+| Frame-sensitive `00316DA8` | Static mismatch documented in D12 | unresolved |
+| Writable tables and dynamic list | Synthetic equivalents executed; authentic slots still require runtime revalidation | synthetic evidence only |
+| Guest-worker scheduling | One managed synthetic worker per session | authentic activation prohibited |
+| Ordinal 258 | Test-only bridge exercised, including nested termination | authentic bridge prohibited |
+| Retail SEH 302/312, `00319858`, `002B5BD3` | No change | prohibited / unresolved |
+| Protection 179/182 | ABI corroborated in D11; retail physical semantics unresolved | fail-closed |
+| `CLI`/`STI`, remaining traps | No change | unresolved |
+
+D13 closes the "one-use ticket" architectural gap and demonstrates repeated, nested, slot-validated synthetic callback execution. It does **not** establish that the 867-entry authentic initializer chain, multiple authentic workers, retail SEH or the authentic start routine can run safely.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 703 PASS / 0 FAIL | 703 PASS / 0 FAIL |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Integrated self-test | 68 PASS / 0 FAIL | 68 PASS / 0 FAIL |
+| Root / secondary `--static-real` | PASS | PASS |
+| Root / secondary / integrated preflight | PASS | PASS |
+| Android ARM64 syntax (`dispatch.cpp`, `threads.cpp`) | PASS | — |
+
+The checked fixture grew from 681 to 703 assertions (+22). The integrated preflight is unchanged: 143/143 reachable generated instructions, 72 root + 71 secondary, root hash `6FBF924DD2C56F08`, secondary `B3408A252D44C99D`, 11 functions, 0 continuations, 156 hooks, four imports restored and zero retained resources. Apple `kExecutionDisabled`, production `Boot()`, the authentic start routine and all authentic callbacks remain disabled.
+
+### Remaining blockers and next package
+
+The largest remaining gap is no longer repeated callback admission; it is **authentic worker and initializer readiness**. The next substantial package should be a static-plus-synthetic **start-routine memory/TLS layout review** that binds the 143-instruction frozen route to the initializer chain: validate the guest stack, TLS block, KPCR/ETHREAD fields and the `002B5C76`/`002B5C86` list-walk preconditions against the authentic image, and extend the session policy only where that review identifies a concrete missing admission contract. Authentic execution must remain separately authorized.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

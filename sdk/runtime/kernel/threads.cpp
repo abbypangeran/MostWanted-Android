@@ -22,9 +22,14 @@
 
 namespace kernel {
 
+struct Thread;
+
 namespace {
 
 thread_local ThreadRef t_current;
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+thread_local Thread* t_synthetic_identity = nullptr;
+#endif
 struct GuestThreadTermination {};
 std::mutex g_threads_lock;
 std::vector<ThreadRef> g_threads;
@@ -41,6 +46,21 @@ std::atomic<SyntheticContinuationStatus> g_synthetic_continuation_status{
     SyntheticContinuationStatus::kNotAuthorized};
 SyntheticContinuationFault g_synthetic_continuation_fault = SyntheticContinuationFault::kNone;
 SyntheticContinuationAdmissionHook g_synthetic_continuation_hook = nullptr;
+SyntheticSessionPolicy g_synthetic_session_policy;
+bool g_synthetic_session_armed = false;
+uint64_t g_synthetic_session_memory_generation = 0;
+uint32_t g_synthetic_session_depth = 0;
+uint32_t g_synthetic_session_admissions = 0;
+uint32_t g_synthetic_session_max_depth = 0;
+SyntheticSessionAdmissionHook g_synthetic_session_hook = nullptr;
+
+void ClearSyntheticSessionLocked() {
+    g_synthetic_session_armed = false;
+    g_synthetic_session_policy = {};
+    g_synthetic_session_memory_generation = 0;
+    g_synthetic_session_depth = 0;
+    g_synthetic_session_hook = nullptr;
+}
 #endif
 #ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
 std::atomic<ThreadPreparationFailPoint> g_thread_fail_point{ThreadPreparationFailPoint::kNone};
@@ -233,7 +253,12 @@ void NameHostThread(const char* name) {
 
 }  // namespace
 
-Thread* Current() { return t_current.get(); }
+Thread* Current() {
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    if (t_synthetic_identity) return t_synthetic_identity;
+#endif
+    return t_current.get();
+}
 ThreadRef CurrentRef() { return t_current; }
 X86Context& CurrentContext() { return *t_current->ctx; }
 
@@ -390,6 +415,7 @@ void DisarmSyntheticWorker() {
     g_synthetic_worker_owner = nullptr;
     g_synthetic_worker_auth = {};
     g_synthetic_continuation_fault = SyntheticContinuationFault::kNone;
+    ClearSyntheticSessionLocked();
 }
 
 bool SyntheticWorkerArmed() {
@@ -477,12 +503,208 @@ void FinishSyntheticWorker() {
     g_synthetic_worker_owner = nullptr;
     g_synthetic_worker_armed = false;
     g_synthetic_worker_auth = {};
+    ClearSyntheticSessionLocked();
 }
 
 bool SyntheticWorkerExitMatches(uint32_t code) {
     std::lock_guard lock(g_synthetic_worker_lock);
     return g_synthetic_worker_claimed && code == g_synthetic_worker_auth.expected_exit;
 }
+
+const char* SyntheticCallbackAdmissionName(SyntheticCallbackAdmission admission) {
+    switch (admission) {
+        case SyntheticCallbackAdmission::kAdmitted: return "admitted";
+        case SyntheticCallbackAdmission::kNoSession: return "no active session";
+        case SyntheticCallbackAdmission::kInvalidOwner: return "not the session owner";
+        case SyntheticCallbackAdmission::kStaleMemory: return "stale memory generation";
+        case SyntheticCallbackAdmission::kStaleDispatch: return "stale dispatch generation";
+        case SyntheticCallbackAdmission::kUnknownEntry: return "call site is not in the session policy";
+        case SyntheticCallbackAdmission::kSlotChanged: return "callback slot changed";
+        case SyntheticCallbackAdmission::kUnauthorizedTarget: return "target is not in the session policy";
+        case SyntheticCallbackAdmission::kInvalidPolicy: return "invalid session policy";
+        case SyntheticCallbackAdmission::kAbiMismatch: return "callback ABI does not match the policy";
+        case SyntheticCallbackAdmission::kDepthExceeded: return "callback nesting limit reached";
+    }
+    return "unknown admission status";
+}
+
+bool ArmSyntheticSession(const SyntheticSessionPolicy& policy) {
+    if (policy.image_identity != kSyntheticWorkerImageIdentity || !policy.code_base ||
+        policy.code_end <= policy.code_base || !policy.dispatch_generation || !policy.max_depth ||
+        policy.max_depth > kMaximumSyntheticSessionDepth || !policy.slot_count ||
+        policy.slot_count > kMaximumSyntheticSessionSlots) {
+        LOGE("session: basic policy rejected");
+        return false;
+    }
+    for (uint32_t i = 0; i < policy.slot_count; ++i) {
+        const SyntheticCallbackSlotPolicy& slot = policy.slots[i];
+        if (!slot.target || slot.target < policy.code_base || slot.target >= policy.code_end || !slot.call_pc ||
+            slot.call_pc < policy.code_base || slot.call_pc >= policy.code_end || slot.argument_count > 4) {
+            LOGE("session: slot %u range rejected", i);
+            return false;
+        }
+        if (slot.entry == SyntheticCallbackEntry::kIndirectSlot) {
+            if (!slot.slot_address) {
+                LOGE("session: slot %u indirect address rejected", i);
+                return false;
+            }
+        } else if (slot.slot_address) {
+            LOGE("session: slot %u address rejected", i);
+            return false;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            const SyntheticCallbackSlotPolicy& other = policy.slots[j];
+            if (other.call_pc == slot.call_pc && other.target == slot.target) {
+                LOGE("session: slot %u duplicate", i);
+                return false;
+            }
+        }
+    }
+    if (!mem::IsInitialized() || !mem::Generation()) {
+        LOGE("session: memory not initialized");
+        return false;
+    }
+    std::lock_guard lock(g_synthetic_worker_lock);
+    if (g_synthetic_session_armed) {
+        LOGE("session: already armed");
+        return false;
+    }
+    if (!g_synthetic_worker_armed && !g_synthetic_worker_claimed) {
+        LOGE("session: no worker authorization");
+        return false;
+    }
+    if (policy.dispatch_generation != g_synthetic_worker_auth.dispatch_generation ||
+        policy.code_base != g_synthetic_worker_auth.code_base || policy.code_end != g_synthetic_worker_auth.code_end) {
+        LOGE("session: worker authorization mismatch %llX/%llX %X/%X %X/%X",
+             (unsigned long long)policy.dispatch_generation, (unsigned long long)g_synthetic_worker_auth.dispatch_generation,
+             policy.code_base, g_synthetic_worker_auth.code_base, policy.code_end, g_synthetic_worker_auth.code_end);
+        return false;
+    }
+    for (uint32_t i = 0; i < policy.slot_count; ++i) {
+        const SyntheticCallbackSlotPolicy& slot = policy.slots[i];
+        if (slot.entry != SyntheticCallbackEntry::kIndirectSlot) continue;
+        uint32_t value = 0;
+        if (mem::Read(slot.slot_address, &value, sizeof(value)) != mem::AccessStatus::kOk || value != slot.target) {
+            LOGE("session: slot %u contents %08X expected %08X", i, value, slot.target);
+            return false;
+        }
+    }
+    g_synthetic_session_policy = policy;
+    g_synthetic_session_memory_generation = mem::Generation();
+    g_synthetic_session_depth = 0;
+    g_synthetic_session_admissions = 0;
+    g_synthetic_session_max_depth = 0;
+    g_synthetic_session_hook = nullptr;
+    g_synthetic_session_armed = true;
+    return true;
+}
+
+void DisarmSyntheticSession() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    ClearSyntheticSessionLocked();
+}
+
+bool SyntheticSessionArmed() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_session_armed;
+}
+
+SyntheticCallbackAdmission AdmitSyntheticCallback(SyntheticCallbackEntry entry_kind, uint32_t slot_address,
+                                                  uint32_t target, uint32_t call_pc, uint64_t dispatch_generation,
+                                                  uint32_t esp, uint32_t* expected_esp) {
+    if (expected_esp) *expected_esp = esp;
+    SyntheticCallbackSlotPolicy entry;
+    SyntheticSessionAdmissionHook hook = nullptr;
+    {
+        std::lock_guard lock(g_synthetic_worker_lock);
+        if (!g_synthetic_session_armed) return SyntheticCallbackAdmission::kNoSession;
+        if (!g_synthetic_worker_claimed || g_synthetic_worker_owner != Current())
+            return SyntheticCallbackAdmission::kInvalidOwner;
+        if (dispatch_generation != g_synthetic_session_policy.dispatch_generation)
+            return SyntheticCallbackAdmission::kStaleDispatch;
+        if (mem::Generation() != g_synthetic_session_memory_generation)
+            return SyntheticCallbackAdmission::kStaleMemory;
+        if (g_synthetic_session_depth >= g_synthetic_session_policy.max_depth)
+            return SyntheticCallbackAdmission::kDepthExceeded;
+        bool found = false;
+        bool abi_mismatch = false;
+        for (uint32_t i = 0; i < g_synthetic_session_policy.slot_count; ++i) {
+            const SyntheticCallbackSlotPolicy& candidate = g_synthetic_session_policy.slots[i];
+            if (candidate.entry != entry_kind || candidate.target != target) continue;
+            if (entry_kind == SyntheticCallbackEntry::kIndirectSlot && candidate.slot_address != slot_address) continue;
+            if (candidate.call_pc != call_pc) {
+                abi_mismatch = true;
+                continue;
+            }
+            entry = candidate;
+            found = true;
+            break;
+        }
+        if (!found) return abi_mismatch ? SyntheticCallbackAdmission::kAbiMismatch
+                                        : SyntheticCallbackAdmission::kUnauthorizedTarget;
+        if (entry.entry == SyntheticCallbackEntry::kIndirectSlot) {
+            if (slot_address != entry.slot_address) return SyntheticCallbackAdmission::kUnknownEntry;
+            uint32_t value = 0;
+            if (mem::Read(entry.slot_address, &value, sizeof(value)) != mem::AccessStatus::kOk || value != target)
+                return SyntheticCallbackAdmission::kSlotChanged;
+        } else if (slot_address) {
+            return SyntheticCallbackAdmission::kUnknownEntry;
+        }
+        hook = g_synthetic_session_hook;
+    }
+    if (hook) hook();
+    {
+        std::lock_guard lock(g_synthetic_worker_lock);
+        if (!g_synthetic_session_armed) return SyntheticCallbackAdmission::kNoSession;
+        if (!g_synthetic_worker_claimed || g_synthetic_worker_owner != Current())
+            return SyntheticCallbackAdmission::kInvalidOwner;
+        if (dispatch_generation != g_synthetic_session_policy.dispatch_generation)
+            return SyntheticCallbackAdmission::kStaleDispatch;
+        if (mem::Generation() != g_synthetic_session_memory_generation)
+            return SyntheticCallbackAdmission::kStaleMemory;
+        if (g_synthetic_session_depth >= g_synthetic_session_policy.max_depth)
+            return SyntheticCallbackAdmission::kDepthExceeded;
+        if (entry.entry == SyntheticCallbackEntry::kIndirectSlot) {
+            uint32_t value = 0;
+            if (mem::Read(entry.slot_address, &value, sizeof(value)) != mem::AccessStatus::kOk || value != target)
+                return SyntheticCallbackAdmission::kSlotChanged;
+        }
+        ++g_synthetic_session_depth;
+        ++g_synthetic_session_admissions;
+        if (g_synthetic_session_depth > g_synthetic_session_max_depth)
+            g_synthetic_session_max_depth = g_synthetic_session_depth;
+        if (expected_esp)
+            *expected_esp = esp + (entry.callee_cleanup ? entry.argument_count * sizeof(uint32_t) : 0);
+    }
+    return SyntheticCallbackAdmission::kAdmitted;
+}
+
+void ReleaseSyntheticCallbackAdmission() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    if (g_synthetic_session_depth) --g_synthetic_session_depth;
+}
+
+uint32_t SyntheticSessionDepthForTest() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_session_depth;
+}
+
+uint32_t SyntheticSessionAdmissionsForTest() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_session_admissions;
+}
+
+uint32_t SyntheticSessionMaxDepthForTest() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_session_max_depth;
+}
+
+void SetSyntheticSessionAdmissionHookForTest(SyntheticSessionAdmissionHook hook) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    g_synthetic_session_hook = hook;
+}
+
+void SetSyntheticWorkerThreadIdentityForTest(Thread* thread) { t_synthetic_identity = thread; }
 
 void SetSyntheticWorkerPreCallbackHookForTest(SyntheticWorkerPreCallbackHook hook) {
     std::lock_guard lock(g_synthetic_worker_lock);
