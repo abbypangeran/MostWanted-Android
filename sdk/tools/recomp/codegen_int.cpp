@@ -165,8 +165,9 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             return true;
         case ZYDIS_MNEMONIC_SBB:
             rmw(F("%s b = %s; uint32_t c0 = cf;", T.c_str(), rd(1).c_str()), "a - b - c0",
-                F("cf = (uint64_t)a < (uint64_t)b + c0; of = (uint32_t)(((a ^ b) & (a ^ r)) >> %u) & 1; %s", W - 1,
-                  Szp(W).c_str()));
+                F("cf = (uint64_t)a < (uint64_t)b + c0; af = ((a ^ b ^ r) >> 4) & 1; "
+                  "of = (uint32_t)(((a ^ b) & (a ^ r)) >> %u) & 1; %s",
+                  W - 1, Szp(W).c_str()));
             return true;
         case ZYDIS_MNEMONIC_CMP:
             if (an_.cfg.checked_memory && mem) Line("\tX86_SAVE_FLAGS();");
@@ -195,7 +196,8 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
             rmw("", "a - 1", F("of = a == (%s)(1u << %u); %s", T.c_str(), W - 1, Szp(W).c_str()));
             return true;
         case ZYDIS_MNEMONIC_NEG:
-            rmw("", "0 - a", F("cf = a != 0; of = a == (%s)(1u << %u); %s", T.c_str(), W - 1, Szp(W).c_str()));
+            rmw("", "0 - a", F("cf = a != 0; af = (a & 0xFu) != 0; of = a == (%s)(1u << %u); %s",
+                                 T.c_str(), W - 1, Szp(W).c_str()));
             return true;
         case ZYDIS_MNEMONIC_NOT:
             rmw("", "~a", "");

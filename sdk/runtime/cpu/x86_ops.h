@@ -62,6 +62,8 @@ struct X86CheckedCallFrame {
     bool returned;
 };
 void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc);
+void x86_checked_register_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address,
+                               uint32_t call_pc);
 void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t return_address,
                                uint32_t call_pc);
 void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes);

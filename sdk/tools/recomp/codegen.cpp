@@ -314,6 +314,11 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         bool checked_rmw = ((m == ZYDIS_MNEMONIC_ADD || m == ZYDIS_MNEMONIC_SUB) && is_binary_rmw()) ||
                            (m == ZYDIS_MNEMONIC_INC && in.operand_count_visible == 1 &&
                             (is_scalar_register(ops[0]) || is_scalar_memory(ops[0])));
+        bool checked_sbb = m == ZYDIS_MNEMONIC_SBB && in.operand_count_visible == 2 &&
+                           is_register32(ops[0]) && is_register32(ops[1]);
+        bool checked_neg_al = m == ZYDIS_MNEMONIC_NEG && in.operand_count_visible == 1 &&
+                              ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                              ops[0].reg.value == ZYDIS_REGISTER_AL && ops[0].size == 8;
         bool checked_cmp = m == ZYDIS_MNEMONIC_CMP && is_binary_rmw();
         bool checked_and = m == ZYDIS_MNEMONIC_AND && is_binary_rmw();
         bool checked_push_memory = m == ZYDIS_MNEMONIC_PUSH && in.operand_count_visible == 1 &&
@@ -336,8 +341,7 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         bool checked_xor = m == ZYDIS_MNEMONIC_XOR && in.operand_count_visible == 2 && is_register32(ops[0]) &&
                            is_register32(ops[1]);
         bool checked_test = m == ZYDIS_MNEMONIC_TEST && in.operand_count_visible == 2 && is_register32(ops[0]) &&
-                            is_register32(ops[1]) && ops[0].reg.value == ops[1].reg.value &&
-                            (ops[0].reg.value == ZYDIS_REGISTER_EAX || ops[0].reg.value == ZYDIS_REGISTER_ECX);
+                            is_register32(ops[1]) && ops[0].reg.value == ops[1].reg.value;
         bool checked_shr = m == ZYDIS_MNEMONIC_SHR && in.operand_count_visible == 2 && in.operand_width == 32 &&
                            is_register32(ops[0]) && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[1].size == 8;
         bool checked_not_al = m == ZYDIS_MNEMONIC_NOT && in.operand_count_visible == 1 &&
@@ -374,15 +378,18 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                                      in.operand_width == 32 && in.stack_width == 32 && in.address_width == 32 &&
                                      ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[0].size == 32 &&
                                      is_flat_guest_memory(ops[0]);
+        bool checked_indirect_register_call = m == ZYDIS_MNEMONIC_CALL && in.operand_count_visible == 1 &&
+                                              in.operand_width == 32 && in.stack_width == 32 &&
+                                              is_register32(ops[0]);
         bool checked_ret = m == ZYDIS_MNEMONIC_RET && in.operand_count_visible <= 1 &&
                            in.operand_width == 32 && in.stack_width == 32 &&
                            (!in.operand_count_visible || (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
                                                           ops[0].imm.value.u <= 0xFFFF));
         bool locked = in.attributes & ZYDIS_ATTRIB_HAS_LOCK;
-        if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_cmp || checked_and || checked_push ||
-              checked_pop || checked_cdq || checked_idiv || checked_xor || checked_test || checked_shr || checked_lea ||
-              checked_not_al || checked_rep_string || checked_branch || checked_call || checked_indirect_call ||
-              checked_jmp || checked_ret) || locked) {
+        if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_sbb || checked_neg_al || checked_cmp ||
+              checked_and || checked_push || checked_pop || checked_cdq || checked_idiv || checked_xor || checked_test ||
+              checked_shr || checked_lea || checked_not_al || checked_rep_string || checked_branch || checked_call ||
+              checked_indirect_call || checked_indirect_register_call || checked_jmp || checked_ret) || locked) {
             Unimpl(va, in, ops);
             pending_.valid = false;
             return;
@@ -397,6 +404,9 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                     const uint32_t target = uint32_t(next + ops[0].imm.value.s);
                     Line(Fmt("\t{ X86_SAVE_FLAGS(); x86_checked_call(ctx, base, 0x%Xu, 0x%Xu, 0x%Xu); ", target,
                              next, va));
+                } else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    Line(Fmt("\t{ X86_SAVE_FLAGS(); x86_checked_register_call(ctx, base, %s, 0x%Xu, 0x%Xu); ",
+                             Read(ops[0], "").c_str(), next, va));
                 } else if (ops[0].mem.base == ZYDIS_REGISTER_NONE && ops[0].mem.index == ZYDIS_REGISTER_NONE) {
                     const uint32_t operand_address = uint32_t(ops[0].mem.disp.value);
                     Line(Fmt("\t{ X86_SAVE_FLAGS(); x86_checked_indirect_call(ctx, base, 0x%Xu, 0x%Xu, 0x%Xu); ",

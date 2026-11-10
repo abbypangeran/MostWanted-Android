@@ -97,7 +97,7 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xC7, 0x04, 0x24, 0xEF, 0xBE, 0xAD, 0xDE, 0xC3, // corrupt return address; ret
         0xE8, 0xF3, 0xFF, 0xFF, 0xFF, 0xC3, // call corrupting callee; ret
         0xB9, 0x78, 0x56, 0x34, 0x12, 0xC3, // continuation target for dispatch tests
-        0xFF, 0xD0, 0xC3,                   // indirect CALL remains unsupported
+        0xFF, 0xD0, 0xC3,                   // checked register-indirect CALL EAX
         0xE8, 0xBC, 0x1E, 0x00, 0x00, 0xC3, // direct CALL to unmapped target remains blocked
         0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3, // CALL $+5 remains blocked in checked mode
         0x89, 0xDC, 0xC3,                   // RET read-fault callee: mov esp, ebx; ret
@@ -212,7 +212,37 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xC2, 0x04, 0x00                                            // ret 4 (stdcall callback)
     });
     code.insert(code.end(), {0xFF, 0x55, 0x08, 0xC3});              // checked CALL [EBP+8]; ret
-    if (code.size() != 0x307) return false;
+    code.insert(code.end(), {
+        0xF6, 0xD8, 0xC3,                         // NEG AL
+        0x19, 0xC0, 0xC3,                         // SBB EAX, EAX
+        0x85, 0xF6, 0xC3,                         // TEST ESI, ESI
+        0x19, 0xD8, 0xC3                          // SBB EAX, EBX
+    });
+    auto append_register_worker = [&](uint8_t call_operand) {
+        code.insert(code.end(), {
+            0x57,                                                       // preserve EDI
+            0x55,                                                       // push ebp
+            0x8B, 0xEC,                                                 // mov ebp, esp
+            0x39, 0xC0,                                                 // cmp eax, eax; seed ZF
+            0xA1, 0x00, 0x60, 0x0A, 0x00,                               // mov eax, [0xA6000]
+            0x89, 0xC7,                                                 // mov edi, eax
+            0xBB, 0x89, 0x67, 0x45, 0x23,                               // mov ebx, 0x23456789
+            0x89, 0x25, 0x20, 0x50, 0x0A, 0x00,                         // save pre-call ESP
+            0x68, 0xE0, 0xAC, 0x68, 0x24,                               // push 0x2468ACE0
+            0xFF, call_operand,                                         // ticket-authorized CALL EAX or EDI
+            0x89, 0x25, 0x24, 0x50, 0x0A, 0x00,                         // save post-call ESP
+            0x89, 0x1D, 0x28, 0x50, 0x0A, 0x00,                         // save callee-preserved EBX
+            0xA3, 0x10, 0x50, 0x0A, 0x00,                               // save callback result
+            0x75, 0x0A,                                                 // jnz over the success marker
+            0xC7, 0x05, 0x14, 0x50, 0x0A, 0x00, 0xBE, 0xBA, 0xFE, 0xCA, // success marker
+            0x5D,                                                       // pop ebp
+            0x5F,                                                       // restore EDI
+            0xC2, 0x04, 0x00                                            // ret 4
+        });
+    };
+    append_register_worker(0xD0);  // CALL EAX
+    append_register_worker(0xD7);  // CALL EDI
+    if (code.size() != 0x395) return false;
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
     std::copy_n("XBEH", 4, image.begin());
@@ -591,7 +621,13 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "\n[[function]]\nat = 0x11283\nend = 0x11299\n"
               "\n[[function]]\nat = 0x11299\nend = 0x112DF\n"
               "\n[[function]]\nat = 0x112DF\nend = 0x11303\n"
-              "\n[[function]]\nat = 0x11303\nend = 0x11307\n";
+              "\n[[function]]\nat = 0x11303\nend = 0x11307\n"
+              "\n[[function]]\nat = 0x11307\nend = 0x1130A\n"
+              "\n[[function]]\nat = 0x1130A\nend = 0x1130D\n"
+              "\n[[function]]\nat = 0x1130D\nend = 0x11310\n"
+              "\n[[function]]\nat = 0x11310\nend = 0x11313\n"
+              "\n[[function]]\nat = 0x11313\nend = 0x11354\n"
+              "\n[[function]]\nat = 0x11354\nend = 0x11395\n";
     return bool(config);
 }
 

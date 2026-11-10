@@ -302,15 +302,7 @@ void CheckedCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t retur
     if (!frame.returned) x86_checked_trap(ctx, call_pc, "direct CALL target returned without checked RET");
 }
 
-}  // namespace
-
-void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
-    CheckedCall(ctx, base, target, return_address, call_pc);
-}
-
-void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t return_address,
-                               uint32_t call_pc) {
-    const uint32_t target = x86_mem_read<uint32_t>(call_pc, operand_address);
+void CheckedIndirectCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
     mem::ScopedPageLease callback_code_lease;
     if (kernel::SyntheticWorkerClaimHeld()) {
@@ -325,6 +317,23 @@ void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_
     }
 #endif
     CheckedCall(ctx, base, target, return_address, call_pc);
+}
+
+}  // namespace
+
+void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
+    CheckedCall(ctx, base, target, return_address, call_pc);
+}
+
+void x86_checked_register_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address,
+                               uint32_t call_pc) {
+    CheckedIndirectCall(ctx, base, target, return_address, call_pc);
+}
+
+void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t return_address,
+                               uint32_t call_pc) {
+    const uint32_t target = x86_mem_read<uint32_t>(call_pc, operand_address);
+    CheckedIndirectCall(ctx, base, target, return_address, call_pc);
 }
 
 void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {

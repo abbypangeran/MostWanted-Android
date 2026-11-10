@@ -1280,23 +1280,23 @@ void CheckSyntheticWorkerLifecycle() {
                   mem::Protect(fixture_base, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
                   dispatch::Init(error),
               "dynamic callback uses the checked synthetic fixture dispatch map");
-        auto prepare_dynamic = [&](kernel::ThreadRef& thread, uint32_t context) {
-            return prepare(thread, dynamic_start, context, output_page);
+        auto prepare_dynamic = [&](kernel::ThreadRef& thread, uint32_t context, uint32_t start) {
+            return prepare(thread, start, context, output_page);
         };
         auto dynamic_ticket = [&](uint32_t callback, kernel::GuestCallbackTicket& ticket) {
             return kernel::PrepareGuestCallback(callback, kernel::GuestCallbackClass::kThreadStart, ticket) ==
                    kernel::GuestCallbackStatus::kReady;
         };
-        auto rejected_dynamic = [&](const char* description, uint32_t slot_target, uint32_t authorized_target,
-                                    bool has_ticket, uint32_t context, bool write_only_stack,
-                                    bool write_only_context) {
+        auto rejected_dynamic = [&](uint32_t start, const char* description, uint32_t slot_target,
+                                    uint32_t authorized_target, bool has_ticket, uint32_t context,
+                                    bool write_only_stack, bool write_only_context) {
             if (!clear_dynamic_output() ||
                 mem::Write(dynamic_callback_slot, &slot_target, sizeof(slot_target)) != mem::AccessStatus::kOk) {
                 Check(false, description);
                 return false;
             }
             kernel::ThreadRef thread;
-            if (!prepare_dynamic(thread, context)) {
+            if (!prepare_dynamic(thread, context, start)) {
                 Check(false, description);
                 return false;
             }
@@ -1304,7 +1304,7 @@ void CheckSyntheticWorkerLifecycle() {
             mem::Read(output_page, &handle, sizeof(handle));
             kernel::GuestCallbackTicket ticket;
             const bool ticket_ready = !has_ticket || dynamic_ticket(authorized_target, ticket);
-            const bool armed = ticket_ready && arm_nested(dynamic_start, context, dynamic_result, ticket);
+            const bool armed = ticket_ready && arm_nested(start, context, dynamic_result, ticket);
             const bool stack_protected = !write_only_stack ||
                                          mem::Protect(thread->stack_top - mem::kPage, mem::kPage, mem::kWrite) ==
                                              mem::AccessStatus::kOk;
@@ -1346,7 +1346,7 @@ void CheckSyntheticWorkerLifecycle() {
         }
         kernel::ThreadRef dynamic_thread;
         kernel::GuestCallbackTicket callback_ticket;
-        const bool prepared = prepare_dynamic(dynamic_thread, dynamic_callback_slot) &&
+        const bool prepared = prepare_dynamic(dynamic_thread, dynamic_callback_slot, dynamic_start) &&
                               dynamic_ticket(dynamic_callback, callback_ticket);
         const bool armed = prepared && arm_nested(dynamic_start, dynamic_callback_slot, dynamic_result, callback_ticket);
         uint32_t dynamic_handle = 0;
@@ -1376,23 +1376,71 @@ void CheckSyntheticWorkerLifecycle() {
                   !kernel::SyntheticWorkerArmed(),
               "a callback ticket from a finalized worker cannot be rearmed after dispatch reset");
 
-        rejected_dynamic("null dynamic target is rejected before callback entry", 0, dynamic_callback, true,
-                         dynamic_callback_slot, false, false);
-        rejected_dynamic("an in-range generated target without a ticket is rejected before callback entry",
-                         dynamic_callback, 0, false, dynamic_callback_slot, false, false);
-        rejected_dynamic("a different in-range generated target fails the exact callback ticket check",
+        struct RegisterCallCase {
+            uint32_t start, return_address;
+        };
+        const RegisterCallCase register_calls[] = {
+            {0x11313, 0x11332},
+            {0x11354, 0x11373},
+        };
+        for (const RegisterCallCase test : register_calls) {
+            if (!clear_dynamic_output() ||
+                mem::Write(dynamic_callback_slot, &dynamic_callback, sizeof(dynamic_callback)) !=
+                    mem::AccessStatus::kOk) {
+                Check(false, "register-indirect callback output and guest target slot initialize");
+                return;
+            }
+            kernel::ThreadRef thread;
+            kernel::GuestCallbackTicket ticket;
+            const bool prepared = prepare_dynamic(thread, dynamic_callback_slot, test.start) &&
+                                  dynamic_ticket(dynamic_callback, ticket);
+            const bool armed = prepared && arm_nested(test.start, dynamic_callback_slot, dynamic_result, ticket);
+            uint32_t handle = 0;
+            if (prepared) mem::Read(output_page, &handle, sizeof(handle));
+            const bool register_started = armed && kernel::StartThread(thread);
+            const uint32_t register_wait = register_started ? wait_thread(thread) : kernel::kTimeout;
+            const bool register_joined = register_started && join_workers();
+            uint32_t result = 0, marker = 0, callee_ebp = 0, pre_call_esp = 0, post_call_esp = 0;
+            uint32_t ebx_after = 0, return_address = 0, argument = 0;
+            const bool output_read = read_dynamic_word(0x10, result) && read_dynamic_word(0x14, marker) &&
+                                     read_dynamic_word(0x18, callee_ebp) && read_dynamic_word(0x20, pre_call_esp) &&
+                                     read_dynamic_word(0x24, post_call_esp) && read_dynamic_word(0x28, ebx_after) &&
+                                     read_dynamic_word(0x2C, return_address) && read_dynamic_word(0x30, argument);
+            Check(register_started && register_wait == kernel::kWait0 && register_joined && output_read &&
+                      thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == dynamic_result &&
+                      result == dynamic_result && marker == success_marker && callee_ebp == pre_call_esp &&
+                      pre_call_esp == post_call_esp && ebx_after == 0x23456789 &&
+                      return_address == test.return_address && argument == dynamic_argument &&
+                      thread->resources_released && !thread->ctx && !thread->stack_top &&
+                      !thread->start_routine_ticket.target && !kernel::SyntheticWorkerArmed() &&
+                      kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                      mem::Query().system_used == baseline.system_used,
+                  "generated register-indirect CALL dispatches its ticketed target and releases the worker");
+            if (handle) kernel::CloseHandle(handle);
+            Check(dispatch::Init(error), "register-indirect callback dispatch lease releases after worker completion");
+        }
+
+        rejected_dynamic(0x11313, "CALL EAX rejects a different mapped target before callee entry",
                          unauthorized_mapped_target, dynamic_callback, true, dynamic_callback_slot, false, false);
-        rejected_dynamic("an unmapped target inside the synthetic image is rejected before dispatch", unmapped_target,
+        rejected_dynamic(0x11354, "CALL EDI rejects a different mapped target before callee entry",
+                         unauthorized_mapped_target, dynamic_callback, true, dynamic_callback_slot, false, false);
+        rejected_dynamic(dynamic_start, "null dynamic target is rejected before callback entry", 0, dynamic_callback, true,
+                         dynamic_callback_slot, false, false);
+        rejected_dynamic(dynamic_start, "an in-range generated target without a ticket is rejected before callback entry",
+                         dynamic_callback, 0, false, dynamic_callback_slot, false, false);
+        rejected_dynamic(dynamic_start, "a different in-range generated target fails the exact callback ticket check",
+                         unauthorized_mapped_target, dynamic_callback, true, dynamic_callback_slot, false, false);
+        rejected_dynamic(dynamic_start, "an unmapped target inside the synthetic image is rejected before dispatch", unmapped_target,
                          dynamic_callback, true, dynamic_callback_slot, false, false);
-        rejected_dynamic("a target outside the synthetic range is rejected before dispatch", outside_target,
+        rejected_dynamic(dynamic_start, "a target outside the synthetic range is rejected before dispatch", outside_target,
                          dynamic_callback, true, dynamic_callback_slot, false, false);
-        rejected_dynamic("the authentic Xbox start routine is rejected without being entered", authentic_start_target,
+        rejected_dynamic(dynamic_start, "the authentic Xbox start routine is rejected without being entered", authentic_start_target,
                          dynamic_callback, true, dynamic_callback_slot, false, false);
-        rejected_dynamic("an uncommitted dynamic callback slot is rejected before generated caller entry",
+        rejected_dynamic(dynamic_start, "an uncommitted dynamic callback slot is rejected before generated caller entry",
                          dynamic_callback, dynamic_callback, true, 0x14000, false, false);
-        rejected_dynamic("a read-protected callback target source is rejected before generated caller entry",
+        rejected_dynamic(dynamic_start, "a read-protected callback target source is rejected before generated caller entry",
                          dynamic_callback, dynamic_callback, true, dynamic_callback_slot, false, true);
-        rejected_dynamic("a read-protected [EBP+8] target slot faults after caller entry and before callee entry",
+        rejected_dynamic(dynamic_start, "a read-protected [EBP+8] target slot faults after caller entry and before callee entry",
                          dynamic_callback, dynamic_callback, true, dynamic_callback_slot, true, false);
 
         // Pause after the worker has claimed its ticket, then alter the guest slot
@@ -1404,7 +1452,7 @@ void CheckSyntheticWorkerLifecycle() {
         }
         kernel::ThreadRef changed_target_thread;
         kernel::GuestCallbackTicket changed_ticket;
-        const bool changed_prepared = prepare_dynamic(changed_target_thread, dynamic_callback_slot) &&
+        const bool changed_prepared = prepare_dynamic(changed_target_thread, dynamic_callback_slot, dynamic_start) &&
                                       dynamic_ticket(dynamic_callback, changed_ticket) &&
                                       arm_nested(dynamic_start, dynamic_callback_slot, dynamic_result, changed_ticket);
         uint32_t changed_handle = 0;
@@ -1438,7 +1486,7 @@ void CheckSyntheticWorkerLifecycle() {
         const bool stale_thread_prepared = stale_prepared && clear_dynamic_output() &&
                                            mem::Write(dynamic_callback_slot, &dynamic_callback,
                                                       sizeof(dynamic_callback)) == mem::AccessStatus::kOk &&
-                                           prepare_dynamic(stale_thread, dynamic_callback_slot);
+                                           prepare_dynamic(stale_thread, dynamic_callback_slot, dynamic_start);
         kernel::GuestCallbackTicket current_start_ticket;
         const bool current_start_ready = stale_thread_prepared &&
                                          kernel::PrepareGuestCallback(dynamic_start,
@@ -2236,9 +2284,18 @@ void CheckCallTests(uint32_t destination) {
 
     ctx = X86Context{};
     ctx.esp = top;
-    Check(ThrowsTrap(sub_0001113C, ctx) && last_trap_pc == 0x1113C &&
-              last_trap_reason.find("unimplemented: call") != std::string::npos && ctx.esp == top,
-          "indirect CALL remains trapped without changing guest stack");
+    ctx.eax = 0x111B2;
+    ctx.cf = 1;
+    ctx.zf = 0;
+    ctx.sf = 1;
+    ctx.of = 1;
+    ctx.pf = 0;
+    ctx.af = 1;
+    const bool register_call_ran = Runs(sub_0001113C, ctx);
+    Check(register_call_ran && ctx.eax == 0x111B3 && ctx.esp == top + 4 &&
+              ctx.last_icall == 0x111B2 && ctx.cf == 0 && ctx.zf == 0 && ctx.sf == 0 && ctx.of == 0 &&
+              ctx.pf == 0 && ctx.af == 0,
+          "generated CALL EAX resolves a mapped target, validates its return, and exposes callee flags");
 
     ctx = X86Context{};
     ctx.esp = top;
@@ -2360,6 +2417,20 @@ void CheckIndirectCallTests() {
     reject_target(0x13000, "unknown", "checked indirect CALL rejects unknown target before stack mutation");
     reject_target(dispatch::KernelThunkAddress(255), "kernel", "checked indirect CALL rejects kernel export thunk");
     reject_target(dispatch::HostThunk(sub_000111B2), "host", "checked indirect CALL rejects registered host thunk");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.eax = 0x13000;
+    SeedFlags(ctx);
+    const X86Context before_register_reject = ctx;
+    traps = 0;
+    try {
+        sub_0001113C(ctx, nullptr);
+    } catch (const FixtureStop&) {
+    }
+    Check(traps == 1 && last_trap_pc == 0x1113C && SameCoreState(ctx, before_register_reject) &&
+              ctx.checked_call == before_register_reject.checked_call,
+          "checked register CALL rejects an unmapped target before changing guest state");
 
     const uint32_t continuation = 0x111B2;
     const dispatch::Metadata continuation_metadata{
@@ -2869,6 +2940,75 @@ void CheckPostCallInstructionTests() {
     Check(Runs(sub_000111D8, ctx) && ctx.cf == 0 && ctx.of == 0 && ctx.sf == 1 && ctx.zf == 0 &&
               ctx.pf == 1 && ctx.af == 1,
           "checked TEST ECX,ECX sets defined flags and preserves undefined AF");
+
+    struct NegAlCase {
+        uint32_t input, result, cf, zf, sf, of, pf, af;
+    };
+    for (const NegAlCase test : {NegAlCase{0xA1B2C3D4, 0xA1B2C32C, 1, 0, 0, 0, 0, 1},
+                                 NegAlCase{0x11223300, 0x11223300, 0, 1, 0, 0, 1, 0},
+                                 NegAlCase{0x55667780, 0x55667780, 1, 0, 1, 1, 0, 0}}) {
+        ctx = X86Context{};
+        ctx.esp = 0x74000;
+        ctx.eax = test.input;
+        ctx.ebx = 0x23456789;
+        ctx.ecx = 0x3456789A;
+        ctx.edx = 0x456789AB;
+        ctx.esi = 0x56789ABC;
+        ctx.edi = 0x6789ABCD;
+        ctx.ebp = 0x789ABCDE;
+        SeedFlags(ctx);
+        Check(Runs(sub_00011307, ctx) && ctx.eax == test.result && ctx.ebx == 0x23456789 &&
+                  ctx.ecx == 0x3456789A && ctx.edx == 0x456789AB && ctx.esi == 0x56789ABC &&
+                  ctx.edi == 0x6789ABCD && ctx.ebp == 0x789ABCDE && ctx.cf == test.cf && ctx.zf == test.zf &&
+                  ctx.sf == test.sf && ctx.of == test.of && ctx.pf == test.pf && ctx.af == test.af,
+              "generated NEG AL preserves high EAX bits and computes byte result and arithmetic flags");
+    }
+
+    struct SbbSelfCase {
+        uint32_t input, carry, result, cf, af, zf, sf, pf;
+    };
+    for (const SbbSelfCase test : {SbbSelfCase{0xFFFFFFFF, 0, 0, 0, 0, 1, 0, 1},
+                                   SbbSelfCase{0, 1, 0xFFFFFFFF, 1, 1, 0, 1, 1},
+                                   SbbSelfCase{0x80000000, 1, 0xFFFFFFFF, 1, 1, 0, 1, 1}}) {
+        ctx = X86Context{};
+        ctx.esp = 0x74000;
+        ctx.eax = test.input;
+        ctx.cf = test.carry;
+        ctx.of = 1;
+        ctx.af = 0;
+        ctx.pf = 0;
+        ctx.zf = 0;
+        ctx.sf = 0;
+        Check(Runs(sub_0001130A, ctx) && ctx.eax == test.result && ctx.cf == test.cf && ctx.of == 0 &&
+                  ctx.af == test.af && ctx.zf == test.zf && ctx.sf == test.sf && ctx.pf == test.pf,
+              "generated SBB EAX,EAX honors input carry and computes result and arithmetic flags");
+    }
+
+    ctx = X86Context{};
+    ctx.esp = 0x74000;
+    ctx.eax = 0x80000001;
+    ctx.ebx = 0x7FFFFFFF;
+    ctx.cf = 1;
+    SeedFlags(ctx);
+    ctx.cf = 1;
+    Check(Runs(sub_00011310, ctx) && ctx.eax == 1 && ctx.ebx == 0x7FFFFFFF && ctx.cf == 0 && ctx.of == 1 &&
+              ctx.af == 1 && ctx.zf == 0 && ctx.sf == 0 && ctx.pf == 0,
+          "generated SBB EAX,EBX honors borrow-in and signed overflow across the sign boundary");
+
+    struct TestEsiCase {
+        uint32_t input, zf, sf, pf;
+    };
+    for (const TestEsiCase test : {TestEsiCase{0, 1, 0, 1}, TestEsiCase{0x80000001, 0, 1, 0},
+                                   TestEsiCase{3, 0, 0, 1}}) {
+        ctx = X86Context{};
+        ctx.esp = 0x74000;
+        ctx.esi = test.input;
+        ctx.ebx = 0x23456789;
+        SeedFlags(ctx);
+        Check(Runs(sub_0001130D, ctx) && ctx.esi == test.input && ctx.ebx == 0x23456789 && ctx.cf == 0 &&
+                  ctx.of == 0 && ctx.zf == test.zf && ctx.sf == test.sf && ctx.pf == test.pf && ctx.af == 1,
+              "generated TEST ESI,ESI updates defined flags and preserves register and undefined AF");
+    }
 
     constexpr uint32_t top = 0x75000;
     const uint32_t saved_ebp = 0xAABBCCDD;
