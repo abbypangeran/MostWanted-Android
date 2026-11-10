@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -243,6 +244,55 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
     append_register_worker(0xD0);  // CALL EAX
     append_register_worker(0xD7);  // CALL EDI
     if (code.size() != 0x395) return false;
+    struct FunctionRange {
+        uint32_t start;
+        uint32_t end;
+    };
+    std::vector<FunctionRange> appended_functions;
+    auto append_function = [&](std::initializer_list<uint8_t> bytes) {
+        const uint32_t start = kEntry + uint32_t(code.size());
+        code.insert(code.end(), bytes.begin(), bytes.end());
+        appended_functions.push_back({start, kEntry + uint32_t(code.size())});
+    };
+    append_function({
+        0x55,                                                       // push ebp
+        0x8B, 0xEC,                                                 // mov ebp, esp
+        0x6A, 0x00,                                                 // push 0
+        0x83, 0x4D, 0xFC, 0xFF,                                     // or dword [ebp-4], -1
+        0xB9, 0xC0, 0x00, 0x00, 0x00,                               // mov ecx, 0xC0
+        0xC1, 0xE1, 0x10,                                           // shl ecx, 16
+        0x81, 0xC9, 0x00, 0x9B, 0xC0, 0x00,                         // or ecx, 0xC09B00
+        0x89, 0x0D, 0x34, 0x50, 0x0A, 0x00,                         // save ECX
+        0x8B, 0x55, 0xFC,                                           // mov edx, [ebp-4]
+        0x89, 0x15, 0x38, 0x50, 0x0A, 0x00,                         // save local
+        0xC9,                                                       // leave
+        0x89, 0x2D, 0x3C, 0x50, 0x0A, 0x00,                         // save restored EBP
+        0x8B, 0x04, 0x24,                                           // mov eax, [esp]
+        0xA3, 0x2C, 0x50, 0x0A, 0x00,                               // save return address
+        0x8B, 0x44, 0x24, 0x04,                                     // mov eax, [esp+4]
+        0xA3, 0x30, 0x50, 0x0A, 0x00,                               // save callback argument
+        0x8B, 0x15, 0x40, 0x60, 0x0A, 0x00,                         // load synthetic termination mode
+        0x85, 0xD2,                                                 // test edx, edx
+        0x75, 0x08,                                                 // jnz termination path
+        0x83, 0xC0, 0x35,                                           // add eax, 0x35
+        0x39, 0xC0,                                                 // cmp eax, eax; preserve result, set ZF
+        0xC2, 0x04, 0x00,                                           // ret 4
+        0x50,                                                       // termination: push eax
+        0xFF, 0x15, 0x00, 0x51, 0x0A, 0x00,                         // call [ordinal-258 slot]
+        0xC7, 0x05, 0x04, 0x51, 0x0A, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, // must not run after termination
+        0xC3
+    });
+    append_function({0x09, 0xC0, 0xC3});  // OR EAX, EAX; RET
+    append_function({0x0C, 0xF0, 0xC3});  // OR AL, 0xF0; RET
+    append_function({0xC1, 0xE1, 0x00, 0xC3});  // SHL ECX, 0; RET
+    append_function({0xC1, 0xE1, 0x01, 0xC3});  // SHL ECX, 1; RET
+    append_function({0xC1, 0xE1, 0x10, 0xC3});  // SHL ECX, 16; RET
+    append_function({0xC1, 0xE1, 0x1F, 0xC3});  // SHL ECX, 31; RET
+    append_function({0xC1, 0xE1, 0x20, 0xC3});  // SHL ECX, 32; RET
+    append_function({0x83, 0x4D, 0xFC, 0xFF, 0xC3});  // OR dword [EBP-4], -1; RET
+    append_function({0xC9, 0xC3});  // LEAVE; RET
+    append_function({0x66, 0x0D, 0xF0, 0x00, 0xC3});  // OR AX, 0x00F0; RET
+    append_function({0x66, 0x83, 0x4D, 0xFE, 0xFF, 0xC3});  // OR word [EBP-2], -1; RET
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
     std::copy_n("XBEH", 4, image.begin());
@@ -628,6 +678,8 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "\n[[function]]\nat = 0x11310\nend = 0x11313\n"
               "\n[[function]]\nat = 0x11313\nend = 0x11354\n"
               "\n[[function]]\nat = 0x11354\nend = 0x11395\n";
+    for (const FunctionRange range : appended_functions)
+        config << "\n[[function]]\nat = 0x" << std::hex << range.start << "\nend = 0x" << range.end << "\n";
     return bool(config);
 }
 

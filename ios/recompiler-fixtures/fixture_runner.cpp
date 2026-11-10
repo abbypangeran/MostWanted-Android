@@ -934,7 +934,9 @@ void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t start_context = 0x13572468;
     constexpr uint32_t dynamic_start = 0x11299;
     constexpr uint32_t dynamic_callback = 0x112DF;
+    constexpr uint32_t integrated_callback = 0x11395;
     constexpr uint32_t dynamic_callback_slot = 0xA6000;
+    constexpr uint32_t integrated_mode_slot = 0xA6040;
     constexpr uint32_t dynamic_argument = 0x2468ACE0;
     constexpr uint32_t dynamic_result = dynamic_argument + 0x35;
     static const X86FuncMapping functions[] = {{target, sub_0001127E}, {other_target, sub_000110EF}};
@@ -1420,6 +1422,51 @@ void CheckSyntheticWorkerLifecycle() {
             Check(dispatch::Init(error), "register-indirect callback dispatch lease releases after worker completion");
         }
 
+        const uint32_t normal_mode = 0;
+        if (!clear_dynamic_output() ||
+            mem::Write(dynamic_callback_slot, &integrated_callback, sizeof(integrated_callback)) != mem::AccessStatus::kOk ||
+            mem::Write(integrated_mode_slot, &normal_mode, sizeof(normal_mode)) != mem::AccessStatus::kOk) {
+            Check(false, "integrated instruction callback fixture data initializes");
+            return;
+        }
+        kernel::ThreadRef integrated_thread;
+        kernel::GuestCallbackTicket integrated_ticket;
+        const bool integrated_prepared = prepare_dynamic(integrated_thread, dynamic_callback_slot, 0x11313) &&
+                                         dynamic_ticket(integrated_callback, integrated_ticket);
+        const bool integrated_armed = integrated_prepared &&
+                                      arm_nested(0x11313, dynamic_callback_slot, dynamic_result, integrated_ticket);
+        uint32_t integrated_handle = 0;
+        if (integrated_prepared) mem::Read(output_page, &integrated_handle, sizeof(integrated_handle));
+        const uint32_t integrated_stack = integrated_prepared ? integrated_thread->stack_top : 0;
+        const bool integrated_started = integrated_armed && kernel::StartThread(integrated_thread);
+        const uint32_t integrated_wait = integrated_started ? wait_thread(integrated_thread) : kernel::kTimeout;
+        const bool integrated_joined = integrated_started && join_workers();
+        uint32_t integrated_result = 0, integrated_marker = 0;
+        uint32_t shifted = 0, local = 0, restored_ebp = 0, call_return = 0, callback_argument = 0;
+        const bool integrated_output = read_dynamic_word(0x10, integrated_result) &&
+                                       read_dynamic_word(0x14, integrated_marker) &&
+                                       read_dynamic_word(0x34, shifted) && read_dynamic_word(0x38, local) &&
+                                       read_dynamic_word(0x3C, restored_ebp) &&
+                                       read_dynamic_word(0x2C, call_return) &&
+                                       read_dynamic_word(0x30, callback_argument);
+        Check(integrated_started && integrated_wait == kernel::kWait0 && integrated_joined && integrated_output &&
+                  integrated_thread->state.load() == kernel::ThreadState::kExited &&
+                  integrated_thread->exit_code.load() == dynamic_result && integrated_result == dynamic_result &&
+                  integrated_marker == success_marker && restored_ebp >= integrated_stack - 0x10000 &&
+                  restored_ebp <= integrated_stack &&
+                  shifted == 0x00C09B00 && local == UINT32_MAX && call_return == 0x11332 &&
+                  callback_argument == dynamic_argument && integrated_thread->resources_released &&
+                  !integrated_thread->ctx && !integrated_thread->stack_top &&
+                  !integrated_thread->start_routine_ticket.target && !kernel::SyntheticWorkerArmed() &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "synthetic CALL EAX worker combines checked SHL, OR, LEAVE, nested callback return, and finalization");
+        if (integrated_handle) kernel::CloseHandle(integrated_handle);
+        Check(dispatch::Init(error) &&
+                  mem::Protect(0x11000, mem::kPage, mem::kRead | mem::kWrite) == mem::AccessStatus::kOk &&
+                  mem::Protect(0x11000, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+              "integrated callback releases dispatch and code-page leases before protection changes");
+
         rejected_dynamic(0x11313, "CALL EAX rejects a different mapped target before callee entry",
                          unauthorized_mapped_target, dynamic_callback, true, dynamic_callback_slot, false, false);
         rejected_dynamic(0x11354, "CALL EDI rejects a different mapped target before callee entry",
@@ -1756,16 +1803,19 @@ void CheckSyntheticWorkerLifecycle() {
         // Termination quiesces before memory teardown completes.
         {
             ResetKernel258Gate(true);
+            const uint32_t terminate_mode = 1;
             const bool fixture_ready = write_marker(0) && clear_dynamic_output() &&
-                                       mem::Write(dynamic_callback_slot, &termination_target,
-                                                  sizeof(termination_target)) == mem::AccessStatus::kOk;
+                                       mem::Write(dynamic_callback_slot, &integrated_callback,
+                                                  sizeof(integrated_callback)) == mem::AccessStatus::kOk &&
+                                       mem::Write(integrated_mode_slot, &terminate_mode,
+                                                  sizeof(terminate_mode)) == mem::AccessStatus::kOk;
             Check(fixture_ready, "nested termination fixture data initializes for shutdown");
             if (!fixture_ready) {
                 ResetKernel258Gate(false);
                 return;
             }
             kernel::ThreadRef shutdown_thread;
-            const bool shutdown_prepared = prepare(shutdown_thread, dynamic_start, dynamic_callback_slot, output_page);
+            const bool shutdown_prepared = prepare(shutdown_thread, 0x11313, dynamic_callback_slot, output_page);
             Check(shutdown_prepared, "nested termination worker prepares for shutdown");
             if (!shutdown_prepared) {
                 ResetKernel258Gate(false);
@@ -1777,11 +1827,11 @@ void CheckSyntheticWorkerLifecycle() {
             const uint32_t calls_before = g_kernel258_calls.load();
             kernel::GuestCallbackTicket nested_termination_ticket;
             const bool nested_ticket_ready =
-                kernel::PrepareGuestCallback(termination_target, kernel::GuestCallbackClass::kThreadStart,
+                kernel::PrepareGuestCallback(integrated_callback, kernel::GuestCallbackClass::kThreadStart,
                                             nested_termination_ticket) == kernel::GuestCallbackStatus::kReady;
             Check(nested_ticket_ready &&
-                      arm_nested(dynamic_start, dynamic_callback_slot, dynamic_argument, nested_termination_ticket),
-                  "nested termination ticket arms before the worker enters ordinal 258");
+                      arm_nested(0x11313, dynamic_callback_slot, dynamic_argument, nested_termination_ticket),
+                  "ticketed CALL EAX worker arms integrated instruction and termination callback");
             const bool started = kernel::StartThread(shutdown_thread);
             const bool entered = WaitKernel258Entered();
 
@@ -1826,6 +1876,10 @@ void CheckSyntheticWorkerLifecycle() {
                                     shutdown_thread->exit_code.load() == dynamic_argument &&
                                     shutdown_thread->resources_released && !shutdown_thread->ctx &&
                                     !shutdown_thread->ethread && !shutdown_thread->kpcr && !shutdown_thread->stack_top;
+            uint32_t post_shutdown_word = 0;
+            const bool post_shutdown_read_rejected =
+                mem::Read(dynamic_callback_slot, &post_shutdown_word, sizeof(post_shutdown_word)) ==
+                mem::AccessStatus::kNotInitialized;
             const auto retained = kernel::FromHandle(handle);
             kernel::CloseHandle(handle);
             Check(started && entered && mutations_waited && waited && shutdown_done.load() && terminated &&
@@ -1833,8 +1887,9 @@ void CheckSyntheticWorkerLifecycle() {
                       stack_mutation.load() == mem::AccessStatus::kOk &&
                       slot_decommit.load() &&
                       calls_before + 1 == g_kernel258_calls.load() && retained.get() == shutdown_thread.get() &&
-                      kernel::KernelWorkerCountForTest() == 0 && !mem::IsInitialized(),
-                  "shutdown and code/stack/slot mutations wait for nested callback quiescence before teardown");
+                      kernel::KernelWorkerCountForTest() == 0 && !mem::IsInitialized() &&
+                      post_shutdown_read_rejected,
+                  "shutdown waits for nested callback quiescence and checked memory rejects reads after deallocation");
             ResetKernel258Gate(false);
             Check(dispatch::SetKernel258FixtureBridge(false),
                   "ordinal-258 checked bridge disables after the shutdown test");
@@ -3716,6 +3771,154 @@ void CheckCalleeInstructionTests() {
           "segment-overridden memory-source PUSH remains unsupported in checked mode");
 }
 
+void CheckOrShiftLeaveTests() {
+    X86Context ctx{};
+    ctx.eax = 0x80000000;
+    SeedFlags(ctx);
+    Check(Runs(sub_000113F7, ctx) && ctx.eax == 0x80000000 && ctx.cf == 0 && ctx.of == 0 && ctx.zf == 0 &&
+              ctx.sf == 1 && ctx.pf == 1 && ctx.af == 1,
+          "checked OR EAX,EAX updates defined flags and preserves undefined AF");
+
+    ctx = X86Context{};
+    ctx.eax = 0x12345605;
+    SeedFlags(ctx);
+    Check(Runs(sub_000113FA, ctx) && ctx.eax == 0x123456F5 && ctx.cf == 0 && ctx.of == 0 && ctx.zf == 0 &&
+              ctx.sf == 1 && ctx.pf == 1 && ctx.af == 1,
+          "checked OR AL,imm8 preserves upper EAX and computes byte flags");
+
+    ctx = X86Context{};
+    ctx.eax = 0x12345605;
+    SeedFlags(ctx);
+    Check(Runs(sub_00011418, ctx) && ctx.eax == 0x123456F5 && ctx.cf == 0 && ctx.of == 0 && ctx.zf == 0 &&
+              ctx.sf == 0 && ctx.pf == 1 && ctx.af == 1,
+          "checked OR AX,imm16 preserves upper EAX and computes word flags");
+
+    struct ShiftCase {
+        X86Func* function;
+        uint32_t input, result, cf, of, zf, sf, pf;
+        bool preserve_flags;
+    };
+    const ShiftCase shifts[] = {
+        {sub_000113FD, 0xD0000003, 0xD0000003, 1, 1, 0, 1, 0, true},
+        {sub_00011401, 0x80000000, 0, 1, 1, 1, 0, 1, false},
+        {sub_00011405, 0x0000C09B, 0xC09B0000, 0, 1, 0, 1, 1, false},
+        {sub_00011409, 3, 0x80000000, 1, 1, 0, 1, 1, false},
+        {sub_0001140D, 0xA5A55A5A, 0xA5A55A5A, 1, 1, 0, 1, 0, true},
+    };
+    for (const ShiftCase test : shifts) {
+        ctx = X86Context{};
+        ctx.ecx = test.input;
+        SeedFlags(ctx);
+        const X86Context before = ctx;
+        const bool ran = Runs(test.function, ctx);
+        const bool flags_ok = test.preserve_flags
+                                  ? ctx.cf == before.cf && ctx.of == before.of && ctx.zf == before.zf &&
+                                        ctx.sf == before.sf && ctx.pf == before.pf
+                                  : ctx.cf == test.cf && ctx.of == test.of && ctx.zf == test.zf &&
+                                        ctx.sf == test.sf && ctx.pf == test.pf;
+        Check(ran && ctx.ecx == test.result && flags_ok &&
+                  ctx.af == 1,
+              "checked SHL handles masked counts, result, defined flags, and preserved undefined flags");
+    }
+
+    constexpr uint32_t memory_page = 0xB6000;
+    constexpr uint32_t cross_page = 0xB7000;
+    constexpr uint32_t stack = 0xB9000;
+    Check(mem::Commit(memory_page, mem::kPage) && mem::Commit(cross_page, mem::kPage) &&
+              mem::Commit(stack, mem::kPage),
+          "checked OR and LEAVE fixture pages commit");
+    uint32_t value = 0x12345678;
+    Check(mem::Write(memory_page, &value, sizeof(value)) == mem::AccessStatus::kOk,
+          "checked OR memory operand initializes");
+    ctx = X86Context{};
+    ctx.ebp = memory_page + 4;
+    ctx.esp = stack + 0x100;
+    SeedFlags(ctx);
+    Check(Runs(sub_00011411, ctx) && ctx.esp == stack + 0x104 &&
+              mem::Read(memory_page, &value, sizeof(value)) == mem::AccessStatus::kOk && value == UINT32_MAX &&
+              ctx.cf == 0 && ctx.of == 0 && ctx.zf == 0 && ctx.sf == 1 && ctx.pf == 1 && ctx.af == 1,
+          "checked OR [EBP-4],-1 sign-extends imm8 and checks guest read/write");
+
+    value = 0xA1B21234;
+    Check(mem::Write(memory_page, &value, sizeof(value)) == mem::AccessStatus::kOk,
+          "checked word OR memory operand initializes");
+    ctx = X86Context{};
+    ctx.ebp = memory_page + 2;
+    ctx.esp = stack + 0x100;
+    SeedFlags(ctx);
+    Check(Runs(sub_0001141D, ctx) &&
+              mem::Read(memory_page, &value, sizeof(value)) == mem::AccessStatus::kOk && value == 0xA1B2FFFF &&
+              ctx.cf == 0 && ctx.of == 0 && ctx.zf == 0 && ctx.sf == 1 && ctx.pf == 1 && ctx.af == 1,
+          "checked OR word [EBP-2],-1 sign-extends imm8 and preserves neighboring word");
+
+    value = 0x12345678;
+    Check(mem::Write(memory_page, &value, sizeof(value)) == mem::AccessStatus::kOk &&
+              mem::Protect(memory_page, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
+          "checked OR write-fault page becomes read-only");
+    ctx = X86Context{};
+    ctx.ebp = memory_page + 4;
+    ctx.esp = stack + 0x100;
+    SeedFlags(ctx);
+    const X86Context before_or_write_fault = ctx;
+    Check(ThrowsMemoryFault(sub_00011411, ctx) && last_fault.instruction == 0x11411 &&
+              last_fault.address == memory_page && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              last_fault.write && SameCoreState(ctx, before_or_write_fault) &&
+              mem::Read(memory_page, &value, sizeof(value)) == mem::AccessStatus::kOk && value == 0x12345678,
+          "checked OR write fault preserves flags, registers, and memory");
+    Check(mem::Protect(memory_page, mem::kPage, mem::kWrite) == mem::AccessStatus::kOk,
+          "checked OR read-fault page becomes write-only");
+    ctx = X86Context{};
+    ctx.ebp = memory_page + 4;
+    ctx.esp = stack + 0x100;
+    SeedFlags(ctx);
+    const X86Context before_or_read_fault = ctx;
+    Check(ThrowsMemoryFault(sub_00011411, ctx) && last_fault.instruction == 0x11411 &&
+              last_fault.address == memory_page && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              !last_fault.write && SameCoreState(ctx, before_or_read_fault),
+          "checked OR read fault reports guest access and preserves state");
+
+    Check(mem::Protect(memory_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              mem::Decommit(cross_page, mem::kPage),
+          "checked OR boundary fixture leaves second page uncommitted");
+    const uint16_t prefix = 0x1234;
+    Check(mem::Write(memory_page + mem::kPage - 2, &prefix, sizeof(prefix)) == mem::AccessStatus::kOk,
+          "checked OR boundary prefix initializes");
+    ctx = X86Context{};
+    ctx.ebp = memory_page + mem::kPage + 2;
+    ctx.esp = stack + 0x100;
+    SeedFlags(ctx);
+    const X86Context before_or_boundary = ctx;
+    Check(ThrowsMemoryFault(sub_00011411, ctx) && last_fault.instruction == 0x11411 &&
+              last_fault.address == memory_page + mem::kPage && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_or_boundary),
+          "checked OR reports the first uncommitted byte across a page boundary");
+
+    const uint32_t saved_ebp = 0x13579BDF;
+    Check(mem::Write(stack + 0x200, &saved_ebp, sizeof(saved_ebp)) == mem::AccessStatus::kOk,
+          "LEAVE saved frame pointer initializes");
+    ctx = X86Context{};
+    ctx.ebp = stack + 0x200;
+    ctx.esp = stack + 0x100;
+    SeedFlags(ctx);
+    Check(Runs(sub_00011416, ctx) && ctx.ebp == saved_ebp && ctx.esp == stack + 0x208 &&
+              ctx.cf == 1 && ctx.of == 1 && ctx.zf == 0 && ctx.sf == 1 && ctx.pf == 0 && ctx.af == 1,
+          "checked LEAVE restores EBP and ESP without changing flags");
+
+    constexpr uint32_t uncommitted_frame = 0xBA000;
+    ctx = X86Context{};
+    ctx.ebp = uncommitted_frame;
+    ctx.esp = stack + 0x100;
+    SeedFlags(ctx);
+    Check(ThrowsMemoryFault(sub_00011416, ctx) && last_fault.instruction == 0x11416 &&
+              last_fault.address == uncommitted_frame && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && ctx.ebp == uncommitted_frame && ctx.esp == uncommitted_frame && ctx.cf == 1 &&
+              ctx.of == 1 && ctx.zf == 0 && ctx.sf == 1 && ctx.pf == 0 && ctx.af == 1,
+          "checked LEAVE reports stack fault after setting ESP from EBP, preserving EBP and flags");
+    Check(mem::Protect(memory_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
+              mem::Decommit(memory_page, mem::kPage) && mem::Decommit(stack, mem::kPage),
+          "checked OR and LEAVE fixture allocations release");
+}
+
 void CheckPushLeaAndTests() {
     constexpr uint32_t stack = 0x60000;
     Check(mem::Commit(stack, mem::kPage), "checked PUSH fixture stack page commits");
@@ -4135,6 +4338,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckCallTests(destination);
     CheckEntryChainTests();
     CheckCalleeInstructionTests();
+    CheckOrShiftLeaveTests();
     CheckIndirectCallTests();
     CheckKernel255AbiAndPreparationTests();
     CheckPostCallInstructionTests();

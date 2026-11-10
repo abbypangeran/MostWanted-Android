@@ -23,7 +23,7 @@ The generated-code scan found `X86_MEM*` in 128 translation units, raw `X86_PTR`
 
 Changing `X86_MEM*` alone is insufficient. It misses `X86_PTR`, string helpers, kernel references and raw pointers, graphics/audio buffers, host I/O, and boot copies. The static recompiler must change and generated code must be regenerated outside tracked source. Host-side callers must also stop retaining unchecked guest pointers. `memcpy` in generated code is not automatically a guest access: several matches only pack local SIMD lanes.
 
-The current memory manager stores commit bits at 4 KB granularity, but `IsCommitted()` is not a checked span operation. `NtProtectVirtualMemory` reports success without applying protection, `MmSetAddressProtect` is a no-op, and `MmQueryAddressProtect` always reports read/write. The Darwin backend therefore does not currently enforce guest permissions. A 16 KB host mapping cannot independently hardware-protect four 4 KB guest pages.
+The current memory manager stores commit and software-permission state at 4 KB granularity. `mem::Protect` validates committed ranges, applies page-rounded guest permissions, and waits for active page leases; it does not call host `mprotect`, and `mem::QueryVirtual` reports allocation/reservation metadata rather than current page permissions. Xbox imports `MmQueryAddressProtect` (179), `MmSetAddressProtect` (182), and `NtProtectVirtualMemory` (204) fail closed before reading arguments or changing memory because the retail ABI and side effects remain unverified. The Darwin backend still cannot hardware-protect four 4 KB guest pages independently within one 16 KB host mapping.
 
 ## Architecture choices
 

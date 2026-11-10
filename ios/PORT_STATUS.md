@@ -3103,3 +3103,129 @@ The preflights restored all patched imports and ended with zero workers/resource
 **Blockers:** Protection semantics, four EAX target families, the SEH handler/unwind path, imports with host-visible effects, system termination/epilogue, and the unbounded `0x001C8C20` descendants.
 **Next packages, ranked:** (1) review `0x002B58B8` protection/import and privileged-instruction contracts; (2) resolve and classify the four EAX target families and establish a production-safe indirect-target policy; (3) validate SEH registration/handler/unwind with synthetic exception fixtures; (4) implement and test the exact system epilogue OR and authentic ordinal-258 ABI; (5) expand only the `0x001C8C20` dependency needed to close these paths.
 **Customer release:** Not performed. No game boot, authentic start routine, authentic guest worker, multiple-worker concurrency, or iPhone install is claimed.
+
+## Phase 2D-7 — startup dependency closure and checked instruction support
+
+**`PHASE_2D7_STARTUP_BLOCKERS = PARTIAL`.** This phase resolves the initial static values behind the four `CALL EAX` sites, adds checked `OR`, `SHL`, and `LEAVE` forms, and integrates them with the existing test-only single-worker lifecycle. Retail protection ABI, callback-table mutation, SEH, privileged instructions, and authentic execution remain blocked. The Phase 2C-41 experiment remains frozen at 143 instructions and was not rerun.
+
+### Scope, image, and execution boundary
+
+The local `assets/default.xbe` SHA-1 remains `f636a16af04171089f879a4bed646e185c734233`. Static translation outputs and dependency configs are in ignored `.local/ios-port/phase2d7-static-after/`. The start map remains 141 functions and 8,680 instructions; the separate system map remains six functions and 111 instructions. `0x001C8C20` remains bounded to one instruction. Relevant source is in `sdk/tools/recomp/codegen.cpp`, `codegen_int.cpp`, `ios/recompiler-fixtures/fixture_builder.cpp`, and `fixture_runner.cpp`; import traps are in `sdk/runtime/kernel/memory_protection.cpp`, synthetic worker admission in `sdk/runtime/kernel/threads.cpp`, and the Apple callback boundary in `sdk/runtime/cpu/dispatch.cpp`. No generated XBE code or game asset was added to the worktree.
+
+No authentic instruction, start routine `0x002B38A2`, authentic guest worker, list callback, or SEH handler ran. The Apple production `CallGuestCallback` still validates then returns `kExecutionDisabled`; Apple `CallGuest` and indirect execution remain fail-closed. Synthetic worker activation requires the fixture-only `MOSTWANTED_SYNTHETIC_WORKER_TESTS` authorization plus a synthetic image identity, one matching ticket, dispatch generation, callback target, and current worker owner. `Boot()` and production execution guards were not changed.
+
+### Updated dependency graph
+
+```mermaid
+graph TD
+    SYS[002B5C0F system routine] -->|002B5C16| SEH[00319804 registration prolog / 00319858 handler]
+    SYS -->|002B5C7E CALL [EBP+8]| START[002B38A2 start routine]
+    START --> A[002B58B8 startup / protection path]
+    START --> B[002B5664 shutdown and DPC setup]
+    START --> C[002B582B callback table]
+    START --> D[002B57D3 callback tables]
+    START --> E[001C8C20 bounded fan-out]
+    START --> F[002B55EE firmware-related path]
+    A -->|002B5942| Q[003C9D30 MmQueryAddressProtect 179]
+    A -->|002B5955, 002B5963| P[003C9D28 MmSetAddressProtect 182]
+    D -->|002B57DC, 002B57FB, 002B581F| T[Writable function-pointer tables]
+    C -->|002B5848| T
+    SYS -->|002B597D / 002B59A1| L[Critical section and dynamic list callback]
+    SYS -->|002B5C99 / 002B5CA0| TERM[OR frame word / PsTerminateSystemThread 258]
+    SYS -->|002B5CA6| TRAP[INT3 remains fail-closed]
+```
+
+These are static call and data relationships, not proof of runtime branch reachability. Direct callees from `0x002B38A2` remain `0x002B58B8`, `0x002B5664`, `0x002B582B`, `0x002B57D3`, `0x001C8C20`, and `0x002B55EE`. The existing Phase 2D-6 graph records the subordinate import and direct-call edges; this section updates its indirect-target and instruction findings.
+
+### Indirect-call audit
+
+| Call PC and predecessor block | Target source and initial static values | Result and confidence | Remaining contract |
+|---|---|---|---|
+| `0x002B57DC`; load/test/branch block `0x002B57D3–0x002B57DA` | Reads `[0x004720C8]`; zero skips. Initial nonzero value is `0x00316DA8`. Return PC `0x002B57DE`. | Exact value maps to an XBE function. High confidence for the file-backed initial value. | `.data` is writable; no direct writes to the slot bounds were found, but aliased/computed writes remain possible. Runtime target not proven. |
+| `0x002B57FB`; loop body `0x002B57F0–0x002B57F9`, back edge `0x002B5802` | Loads `[ESI]` from scan `[0x0041F94C,0x0041F964)` by dword: `0x003B0C6B`, `0x00317EFB`, `0x003195F1`, `0x00320602`, `0x0031BD3E`, and one zero. Zero and `0xFFFFFFFF` skip. Return PC `0x002B57FD`. | All five initial targets map to exact XBE functions. High confidence for initial table contents. | Writable table; callback signatures, argument layouts, order, mutation, and reachable values are unverified. |
+| `0x002B581F`; loop body `0x002B5814–0x002B581D`, back edge `0x002B5826` | Loads `[ESI]` from 1,110 dwords in `[0x0041E7F0,0x0041F948)`, skipping zero and `0xFFFFFFFF`. Return PC `0x002B5821`. | 867 unique nonzero initial values map to exact XBE functions; 243 entries are zero; none is `0xFFFFFFFF`. High confidence for the initial table scan and mapping. | Table is writable. Complete target enumeration is intentionally summarized rather than copied into the status file; runtime mutation and callback contracts remain unknown. |
+| `0x002B5848`; loop body `0x002B583D–0x002B5846`, back edge `0x002B584F` | Loads `[ESI]` from `[0x0041E7E0,0x0041E7EC)`; initial active values are `0x0031BBA5` and `0x0031F04D`, plus one zero. Return PC `0x002B584A`. | Both active values map to exact XBE functions. High confidence for initial file contents. | Writable table; runtime target set and callback contracts remain unverified. |
+
+The exact initial table values are now statically mapped, so the former “unknown initial target” finding is closed. Authentic target authorization is not: these ranges are writable, no complete table-write proof exists, and none of the nonzero initial table values was executed. Checked register-indirect dispatch already exists and was tested with one-shot synthetic callback tickets, generation checks, active-worker ownership, and page/dispatch leases. It is not authorization to dispatch these authentic targets.
+
+### Protection-import decision
+
+`MmQueryAddressProtect` ordinal 179, `MmSetAddressProtect` ordinal 182, and `NtProtectVirtualMemory` ordinal 204 remain fail-closed before guest argument reads, output writes, or permission changes. Available non-retail declarations do not establish retail argument/result ABI, protection constants, range rounding, reserved/committed behavior, physical-alias handling, prior-protection output, or failure rules. Do not treat an unconditional-success bridge as compatible.
+
+Static callers at `0x002B5942`, `0x002B5955`, and `0x002B5963` pass ESI and then call the ordinal-182 import with `(ESI, 4, 4)` and `(ESI, 4, saved EAX)`. This suggests a query/change/restore sequence, but does not prove what the values mean. Internal `mem::Protect` is independently implemented: 4 KB software permissions, page-range validation, committed-page requirement, and waiting for active page leases. It does not invoke host `mprotect`; `mem::QueryVirtual` reports allocation/reservation metadata, not current page permissions. Existing memory and worker tests validate the internal primitive, not the authentic import ABI.
+
+### Dependency readiness matrix
+
+| Dependency | Classification | Evidence and remaining limit |
+|---|---|---|
+| `CALL EAX` at `0x002B57DC`, `0x002B57FB`, `0x002B581F`, `0x002B5848` | **Implemented, not validated for authentic execution** | Initial file-backed values map to XBE functions; checked register dispatch and ticket/generation/lease checks pass synthetic tests. Mutable table contents and callback ABIs remain unproven. |
+| `CALL [EAX+8]` at `0x002B59A1` | **Implemented, not validated for authentic execution** | Checked memory-indirect form and synthetic ticket dispatch exist. The authentic list and callback contract remain unreviewed. |
+| `CALL [EBP+8]` at `0x002B5C7E` | **Implemented, not validated for authentic execution** | Same form passes synthetic worker/ticket tests. Authentic system routine and start callback were not entered. |
+| Critical-section imports 277/294 at `0x002B5986`/`0x002B59A9` | **Already supported and verified** | The frozen Phase 2C-41 prefix validates critical-section ABI and ETHREAD ownership through its 143 authentic instructions. This does not validate the later list callback. |
+| `MmQueryAddressProtect` 179, `MmSetAddressProtect` 182, `NtProtectVirtualMemory` 204 | **Intentionally forbidden** | All three HLE exports fail closed before guest argument/output access or permission mutation. Retail ABI and effects are unknown. |
+| `HalRegisterShutdownNotification` 47, `IoCreateSymbolicLink` 67, `MmFreeContiguousMemory` 171, `KeInitializeDpc` 107, `KeInitializeTimerEx` 113 | **Implemented, not validated for authentic execution** | Host implementations exist. Guest object/argument contracts and side effects are not validated for this route; see the Phase 2D-6 import notes above. |
+| `HalReturnToFirmware` 49 | **Intentionally forbidden** | Existing HLE can shut down/relaunch the host app and mutate launch data. |
+| `PsTerminateSystemThread` 258 | **Implemented for synthetic tests; authentic ABI unvalidated** | Ticket-bound synthetic termination unwinds through managed worker cleanup. Authentic system-routine import and post-call `INT3` behavior remain blocked. |
+| SEH prolog `0x00319804`, handler `0x00319858`, `RtlRaiseException`/`RtlUnwind` | **Missing contract; handler execution intentionally forbidden** | Stack/return contract, bounded checked chain, full context semantics, and unwind target validation are incomplete. |
+| `CLI`/`STI`, `INT3` | **Intentionally forbidden** | No no-op interrupt model or trap continuation was introduced. |
+| `0x001C8C20` and descendants | **Missing from bounded map** | Static analysis caps this fan-out at one instruction; further dependencies and side effects are unknown. |
+| Apple production callback / `Boot()` | **Intentionally forbidden** | Apple callback remains `kExecutionDisabled`; production boot and execution gates are unchanged. |
+
+### Checked instruction inventory
+
+| Form | Checked behavior and coverage |
+|---|---|
+| `OR` at `0x002B5898`, `0x002B5C06`, `0x002B5C99` and other mapped forms | Supports 8/16/32-bit register or flat checked-memory destination with same-width register or immediate source. Signed narrower immediates extend to destination width. Memory RMW uses checked read/write and preserves state on reported read/write faults. CF/OF clear; SZP follows result; undefined AF is preserved. Fixtures cover `OR EAX,EAX`, partial `OR AL,imm8`, `OR AX,imm16`, sign-extended `OR word [EBP-2],-1` and `OR [EBP-4],-1`, read/write permission faults, and an uncommitted page boundary. |
+| `SHL ECX,0x10` at `0x002B5895` | Checked 32-bit GPR/immediate form. Count is masked to five bits; zero count preserves result and flags; CF updates for valid nonzero counts; OF updates only for count one; SZP updates for nonzero count; undefined AF/OF are preserved where required. Fixtures cover masked counts 0, 1, 16, 31, and 32. |
+| `LEAVE` at `0x002B58B6` | Checked 32-bit form. Sets ESP from EBP, reads saved EBP through checked guest memory, then advances ESP by four without changing flags. Fault fixture verifies ESP has architectural MOV-ESP,EBP state while EBP and flags remain unchanged. |
+| `OR EAX,EAX` at `0x002B5C06`, `OR [EBP-4],-1` at `0x002B5C99` | Both system-map forms now lower to checked operations. The latter has a generated checked-memory RMW and sign-extended immediate. |
+| `CLI`/`STI` at `0x002B5957`/`0x002B595E` | Still fail-closed. Xbox interrupt-state behavior is not established; no no-op substitution was made. |
+| `INT3` at `0x002B5CA6` | Still traps. No continuation or trap suppression was added. |
+
+For the same bounded maps, unimplemented `OR` decreased from 125 to 2, `SHL` from 48 to 17, and `LEAVE` from 52 to 0 in the 141-function start map. The six-function system map's two OR traps are now checked; its `INT3` trap remains. These are static translation counts only, not proof of reachable execution or global startup progress.
+
+### SEH and system termination contract
+
+`InitContext` points FS to the synthetic KPCR. It initializes `FS:[0]` to `0xFFFFFFFF`, stack bounds, and `FS:[0x20]` to KPCR+`0x28` (ETHREAD). The prolog at `0x00319804` links the previous `FS:[0]`, builds a record at EBP-`0x10`, installs the record, and copies its return address to an adjusted stack location before `RET`. The checked-return contract has not been reconciled with this stack transformation and the caller's expected return `0x002B5C1B`; the prolog has no synthetic ABI fixture.
+
+Only the first handler instruction at `0x00319858` is mapped; its body and disposition ABI are unreviewed. `RtlRaiseException` uses unchecked guest reads/pointers, has no bounded or cycle-checked chain walk, does not capture a complete context, and restores only ESP on continue-execution. `RtlUnwind` does not establish that a target record is reachable or transfer a validated target context/IP. The `0x002B5BD3` path reads `FS:[0x20]` and `[EAX+0x250]`, then may call `[EAX+0x14]`; its branch is not proven after context initialization. No handler or authentic unwind ran.
+
+Before any SEH execution, contract must define checked/bounded record and handler validation, LIFO/sentinel and cycle limits, code/stack/dispatch/page leases, full context capture/restore, explicit dispositions, nested exception ownership, reachable-target validation for unwind, and retention of KPCR/ETHREAD/stack until unwind quiesces. Separately, the system path at `0x002B5CA0` calls `PsTerminateSystemThread` ordinal 258 after the now-supported frame OR; the synthetic ordinal-258 bridge and `GuestThreadTermination` unwinding work, but authentic import ABI and the `INT3` continuation remain unvalidated.
+
+### Synthetic single-worker lifecycle and evidence
+
+The fixture uses generated synthetic start `0x11313` (`CALL EAX`) and callback `0x11395`. The callback runs the new checked `OR [EBP-4],-1`, `SHL ECX,16`, `OR ECX,0xC09B00`, and `LEAVE` forms, then either returns normally or calls the test-only ordinal-258 bridge. This uses the existing worker path, not a substitute production dispatcher.
+
+```text
+Prepared
+  -> StartThread validates and registers callback tickets; state Active
+  -> exactly one managed worker launches
+  -> worker sets current ETHREAD and initializes context/KPCR/TLS
+  -> matching synthetic authorization is claimed once
+  -> ticket-bound callback and nested CALL EAX run under leases
+  -> normal return marks Exited, or ordinal 258 unwinds via GuestThreadTermination
+  -> worker clears context, unregisters, finalizes owned guest resources
+  -> host joins; tickets/authorization clear; dispatch can reinitialize
+
+Launch/admission failure or cancellation -> unregister/rollback -> join if launched -> finalize.
+```
+
+Normal return verifies result, marker, callback return PC/argument, restored frame state, exited thread metadata, cleared tickets/authorization, zero worker count, empty thread registry, released allocations, and successful code-page permission change after lease release. The termination race blocks inside the nested ordinal-258 path with deterministic gates; host teardown, callback/code decommit, and stack protection change wait for worker/page-lease quiescence. After shutdown deallocates guest memory, a checked read is explicitly rejected as `kNotInitialized`. Existing retained lifecycle tests cover stale/invalid tickets, failed launch, cancellation before activation, shutdown during preparation, double cancellation/exit, waiter and handle lifetime, and worker completion versus host teardown. Resource checks return system allocations to baseline; preflights end with zero workers and zero guest resources.
+
+### Validation, comparison, and delivery
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Generated checked fixture assertions | 605 PASS / 0 FAIL | 605 PASS / 0 FAIL |
+| Recompiler/callback/startup/VBlank/execution-probe CTests | 6/6 passed | 6/6 passed |
+| Memory/worker CTest | 1/1 passed | 1/1 passed |
+| Root, secondary, integrated static XBE preflights | 3/3 passed | 3/3 passed |
+| Integrated frozen route | 143/143; stop before `0x002B5C7B` | 143/143; stop before `0x002B5C7B` |
+
+The integrated static preflight in each configuration reports 72 root plus 71 secondary instructions, four direct calls, four kernel calls, four import reads, and the unchanged pre-instruction stop at `0x002B5C7B`. All root, secondary, and integrated preflights pass; import restoration succeeds, and teardown reports `system_used=0`, `contiguous_used=0`, `virtual_committed=0`, and `workers=0`. These preflights prepare and inspect mappings only; they do not execute authentic guest instructions. The baseline asset SHA-1 is unchanged. One existing generated comparison-parentheses warning remains non-fatal. No Android ARM64 check was repeated because this patch changes recompiler lowering and test fixtures only; no shared runtime source changed.
+
+**Critical-path comparison:** D6 had missing startup `SHL`, two startup `OR` forms, `LEAVE`, and two system-map OR forms. D7 translates those forms through checked operations, while leaving `CLI`/`STI`, protection imports, mutable callback targets, SEH, `INT3`, and other host-visible import effects unresolved. The static route still stops at 143 instructions; no authentic startup barrier was executed or claimed as cleared.
+
+**Next packages, ranked by dependency and risk:** (1) review the system-routine SEH prolog's checked-call stack contract and design a bounded, fully synthetic exception contract before entering the callback at `0x002B5C7E`; (2) establish authoritative retail ABI/effects for ordinals 179/182/204, then add only evidence-backed import fixtures; (3) trace write paths and callback ABIs for the mutable tables at `0x004720C8`, `0x0041F94C`, `0x0041E7F0`, and `0x0041E7E0`, then define an authentic target authorization policy; (4) validate authentic ordinal-258 ABI, epilogue, and `CLI`/`STI` semantics while keeping `INT3` trapped; (5) expand only required descendants of `0x001C8C20` and review host-visible import side effects. No full-game boot, graphics/audio work, device install, or `main` merge is in scope.
+
+**Development:** Checked lowering and synthetic lifecycle integration implemented. **Validation:** Debug/Release suites and all six static preflights passed. **Integration:** scoped to `feature/ios-port`; no `main` merge. Before this milestone commit, the feature branch was 80 commits ahead of and 0 behind `origin/main`; `main` remains untouched. **Customer release:** not performed; game boot and authentic guest-thread concurrency are not claimed.

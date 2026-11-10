@@ -139,7 +139,13 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
                   W - 1, Szp(W).c_str()));
             return true;
         case ZYDIS_MNEMONIC_OR:
-            rmw(F("%s b = %s;", T.c_str(), rd(1).c_str()), "a | b", "cf = 0; of = 0; " + Szp(W));
+            if (an_.cfg.checked_memory && mem) Line("\tX86_SAVE_FLAGS();");
+            {
+                std::string source = rd(1);
+                if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[1].imm.is_signed && ops[1].size < W)
+                    source = "(" + T + ")(" + CType(ops[1].size, true) + ")(" + Read(ops[1], ea) + ")";
+                rmw(F("%s b = %s;", T.c_str(), source.c_str()), "a | b", "cf = 0; of = 0; " + Szp(W));
+            }
             return true;
         case ZYDIS_MNEMONIC_AND:
             if (an_.cfg.checked_memory && mem) Line("\tX86_SAVE_FLAGS();");
@@ -205,7 +211,7 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
 
         case ZYDIS_MNEMONIC_SHL:
             emit(F("%s a = %s; uint32_t c = (uint32_t)(%s) & 31; if (c) { %s r = (%s)((uint32_t)a << c); "
-                   "cf = c <= %u ? ((uint32_t)a >> (%u - c)) & 1 : 0; of = ((uint32_t)(r >> %u) & 1) ^ cf; %s %s }",
+                   "if (c <= %u) cf = ((uint32_t)a >> (%u - c)) & 1; if (c == 1) of = ((uint32_t)(r >> %u) & 1) ^ cf; %s %s }",
                    T.c_str(), rd(0).c_str(), Read(ops[1], ea).c_str(), T.c_str(), T.c_str(), W, W, W - 1,
                    Szp(W).c_str(), wr(0, "r").c_str()));
             return true;
@@ -509,7 +515,11 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
                  "ctx.df = (f >> 10) & 1; of = (f >> 11) & 1; ctx.xflags = f & 0x240000u; }");
             return true;
         case ZYDIS_MNEMONIC_LEAVE:
-            Line("\tctx.esp = ctx.ebp; ctx.ebp = X86_MEM32(ctx.esp); ctx.esp += 4;");
+            if (an_.cfg.checked_memory)
+                Line(F("\t{ X86_SAVE_FLAGS(); ctx.esp = ctx.ebp; uint32_t v = x86_mem_read<uint32_t>(0x%Xu, ctx.esp); "
+                       "ctx.ebp = v; ctx.esp += 4; }", va));
+            else
+                Line("\tctx.esp = ctx.ebp; ctx.ebp = X86_MEM32(ctx.esp); ctx.esp += 4;");
             return true;
         case ZYDIS_MNEMONIC_ENTER:
             if (ops[1].imm.value.u != 0) return false;
