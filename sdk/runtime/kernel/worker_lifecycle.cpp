@@ -288,6 +288,7 @@ void WorkerLifecycle::BeginShutdown() {
     }
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
     activation_changed_.notify_all();
+    changed_.notify_all();
 #endif
 }
 
@@ -413,6 +414,11 @@ bool WorkerLifecycle::WaitForJoinInProgressForTest(std::chrono::milliseconds tim
     std::unique_lock lock(lock_);
     return changed_.wait_for(lock, timeout, [this] { return joining_workers_for_test_; });
 }
+
+bool WorkerLifecycle::WaitForShutdownStartedForTest(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(lock_);
+    return changed_.wait_for(lock, timeout, [this] { return !accepting_.load(); });
+}
 #endif
 
 namespace {
@@ -442,6 +448,9 @@ std::size_t KernelWorkerCountForTest() { return g_kernel_workers.OwnedCount(); }
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
 void HoldKernelWorkerActivationForTest(bool hold) { g_kernel_workers.HoldActivationForTest(hold); }
 void FailNextKernelWorkerStartForTest() { g_kernel_workers.FailNextStartForTest(); }
+bool WaitForKernelWorkersShutdownForTest(std::chrono::milliseconds timeout) {
+    return g_kernel_workers.WaitForShutdownStartedForTest(timeout);
+}
 #endif
 
 GuestDispatchLease::GuestDispatchLease() {

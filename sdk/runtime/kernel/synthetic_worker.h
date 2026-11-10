@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "kernel/guest_callback.h"
+
 namespace kernel {
 
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
@@ -20,6 +22,7 @@ struct SyntheticWorkerAuthorization {
     uint32_t code_end = 0;
     uint64_t dispatch_generation = 0;
     uint32_t image_identity = 0;
+    GuestCallbackTicket callback_ticket{};
 };
 
 inline constexpr uint32_t kSyntheticWorkerImageIdentity = 0x4C4C5632u;  // "LLV2"
@@ -30,6 +33,8 @@ bool ArmSyntheticWorker(const SyntheticWorkerAuthorization& authorization);
 void DisarmSyntheticWorker();
 SyntheticWorkerClaim ClaimSyntheticWorker(uint32_t target, uint32_t context, uint64_t dispatch_generation);
 bool SyntheticWorkerClaimHeld();
+bool SyntheticWorkerHasNestedCallback();
+bool SyntheticWorkerAuthorizesNestedCallback(uint32_t target, uint64_t dispatch_generation);
 bool SyntheticWorkerExitMatches(uint32_t code);
 void FinishSyntheticWorker();
 bool SyntheticWorkerArmed();

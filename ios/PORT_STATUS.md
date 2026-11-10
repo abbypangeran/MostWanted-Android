@@ -2931,3 +2931,51 @@ Guest-originated `PsTerminateSystemThread`/ordinal-258 was not implemented in th
 - No authentic start routine, `002B38A2`, `002B5C7B` continuation, SEH handler, production `Boot()` change, iPhone install or `main` merge occurred.
 
 **Customer release:** Not performed. R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-5 — ticket-bound dynamic synthetic callback
+
+**PHASE_2D5_DYNAMIC_CALLBACK = PASS.** This adds a test-only single-worker path through an actual generated x86 stack-relative indirect `CALL`. The Phase 2C-41 run remains frozen at 143 authentic instructions and was not rerun.
+
+### Checked call and authorization
+
+- The checked recompiler accepts flat 32-bit `CALL r/m32` operands using DS/SS/default memory, including runtime base/index addressing. It emits the effective address from the current guest registers; absolute operands retain their prior checked-address lowering.
+- `x86_checked_indirect_call` reads the operand with `x86_mem_read` before checked stack mutation. `CheckedCall` resolves the generated function, writes the guest return address, and keeps its dispatch lease through the call. The callback code page and the worker's stack and target-slot pages remain leased while the generated callback runs.
+- A nested target runs only under the compile-time synthetic-worker test gate, with synthetic image identity, a supported generated mapping, an in-range exact `ThreadStart` callback ticket, matching dispatch generation and current worker ownership. The target ticket is consumed once. A changed slot cannot substitute another mapped function.
+- Only the checked fixture target is built with `MOSTWANTED_SYNTHETIC_WORKER_TESTS`; callback and worker test APIs remain compile-time gated. The Apple production `CallGuestCallback` path still validates then returns `kExecutionDisabled`. `Boot()` and production execution gates are unchanged.
+
+### Synthetic route and ABI evidence
+
+- Worker start callback `0x11299` establishes `EBP`, loads its dynamic target from guest slot `0xA6000`, stores it in `[EBP+8]`, pushes argument `0x2468ACE0`, then executes `CALL [EBP+8]` at `0x112BB`.
+- The checked target read resolves `0x112DF` from guest memory at call time. The generated callee records its incoming `EBP`, return address `0x112BE`, and argument; computes `EAX += 0x35` using `LEA`; saves/restores `EBX`; and returns with `RET 4`.
+- Observed result: `EAX=0x2468AD15`; callee `EBP` equals the caller's saved pre-call `ESP`; post-call `ESP` equals pre-call `ESP`; `EBX=0x23456789`; the zero-flag success marker is `0xCAFEBABE`. The worker exits normally and joins.
+- The test-only nested termination target `0x11283` reaches the existing checked ordinal-258 bridge from the same generated caller. Exit status remains `0x2468ACE0`, the post-call marker remains clear, and generated frames unwind through the existing managed termination path.
+
+### Lifecycle, failure and race evidence
+
+- Concrete lifecycle: `Prepared → Registered → Active → Context initialized → Synthetic claim → Outer callback → Ticket-authorized nested call → Returned or exited → Worker joined → Resources finalized`. Admission failures transition to cancellation, join and finalization. Shutdown closes admission and waits for the worker before guest-memory teardown.
+- Null, un-ticketed, mismatched-ticket, unmapped, out-of-range and authentic `0x002B38A2` targets fail before callee entry. Uncommitted/read-protected outer context fails before caller entry; a read-protected `[EBP+8]` slot faults after caller entry but before callee entry. A deterministic pre-callback barrier changes the slot after authorization and proves the changed target is rejected before callee entry. A stale ticket from a finalized worker cannot be rearmed after dispatch reset.
+- Existing worker tests also cover failed launch, cancellation before activation, shutdown during preparation, double cancellation, double exit, waiter/handle retention and exactly-once finalization. Nested handle closure retains owner resources until termination quiesces.
+- During a blocked nested termination callback, code-page and callback-slot `Decommit`, stack-page protection change and `mem::Shutdown` all wait on deterministic condition-variable barriers. They complete only after callback/worker quiescence. No worker remains; the thread context and owned allocations are cleared; callback tickets and synthetic authorization are cleared; `Threads()` is empty; system allocations return to baseline. The shutdown case ends with memory uninitialized.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture checks | 562 PASS / 0 FAIL | 562 PASS / 0 FAIL |
+| Recompiler, callback, startup, VBlank and execution-probe CTest | 6/6 passed | 6/6 passed |
+| Darwin memory/worker CTest | 1/1 passed | 1/1 passed |
+| Current-source static real-image preflight | Root, secondary and integrated PASS | Root, secondary and integrated PASS |
+| Authentic Phase 2C-41 experiment / authentic XBE execution | Not rerun / none | Not rerun / none |
+
+Fresh `--preflight` binaries were built against the local title `0x4541007B` XBE. The integrated static preflight reports `143/143` instructions supported (72 root plus 71 secondary), four direct calls, four kernel calls, four import reads and the pre-instruction stop at `0x002B5C7B`; teardown reports zero workers and resources. This only analyzes and prepares the route. It does not dispatch authentic guest instructions. Logs are in `.local/ios-port/phase2d5-evidence/`.
+
+The checked code generator now also emits the instruction at `0x002B59A1` (`CALL [EAX+8]`) in the static integrated mapping. The preflight checks that generated form but never enters the dynamic list callback. That callback remains unreviewed for execution and is a separate blocker.
+
+### Decision and remaining limits
+
+- **GO:** next package is a static dependency graph for authentic start routine `0x002B38A2`, covering its directly reachable callees, dynamic targets, import/ABI contracts, epilogue and termination path, SEH registration and handler dependencies, and unsupported instruction forms.
+- **NO-GO:** authentic start-routine execution or worker activation. `0x002B38A2`, `0x002B5C7B`, the dynamic list callback and `0x00319858` were not executed. Authentic guest concurrency and game boot are not demonstrated. Apple callback execution remains disabled.
+- After the graph, implement only the missing checked operations and import contracts in bounded synthetic fixtures; independently review the resulting termination/SEH ownership path before considering any supervised authentic run.
+- No production `Boot()` change, iPhone install, copyrighted generated game code commit or `main` merge occurred. Customer release remains NOT_READY.
+
+**Delivery:** the scoped Phase 2D-5 commit is fast-forward pushed to `origin/feature/ios-port`.

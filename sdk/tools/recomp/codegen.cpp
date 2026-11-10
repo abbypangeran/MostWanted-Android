@@ -373,10 +373,7 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         bool checked_indirect_call = m == ZYDIS_MNEMONIC_CALL && in.operand_count_visible == 1 &&
                                      in.operand_width == 32 && in.stack_width == 32 && in.address_width == 32 &&
                                      ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[0].size == 32 &&
-                                     ops[0].mem.base == ZYDIS_REGISTER_NONE &&
-                                     ops[0].mem.index == ZYDIS_REGISTER_NONE && in.raw.disp.size == 32 &&
-                                     (ops[0].mem.segment == ZYDIS_REGISTER_NONE ||
-                                      ops[0].mem.segment == ZYDIS_REGISTER_DS);
+                                     is_flat_guest_memory(ops[0]);
         bool checked_ret = m == ZYDIS_MNEMONIC_RET && in.operand_count_visible <= 1 &&
                            in.operand_width == 32 && in.stack_width == 32 &&
                            (!in.operand_count_visible || (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
@@ -400,10 +397,13 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                     const uint32_t target = uint32_t(next + ops[0].imm.value.s);
                     Line(Fmt("\t{ X86_SAVE_FLAGS(); x86_checked_call(ctx, base, 0x%Xu, 0x%Xu, 0x%Xu); ", target,
                              next, va));
-                } else {
+                } else if (ops[0].mem.base == ZYDIS_REGISTER_NONE && ops[0].mem.index == ZYDIS_REGISTER_NONE) {
                     const uint32_t operand_address = uint32_t(ops[0].mem.disp.value);
                     Line(Fmt("\t{ X86_SAVE_FLAGS(); x86_checked_indirect_call(ctx, base, 0x%Xu, 0x%Xu, 0x%Xu); ",
                              operand_address, next, va));
+                } else {
+                    Line(Fmt("\t{ X86_SAVE_FLAGS(); x86_checked_indirect_call(ctx, base, %s, 0x%Xu, 0x%Xu); ",
+                             AddrExpr(ops[0]).c_str(), next, va));
                 }
                 Line("\t  cf = ctx.cf; zf = ctx.zf; sf = ctx.sf; of = ctx.of; pf = ctx.pf; af = ctx.af; }");
             } else if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {

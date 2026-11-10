@@ -2810,13 +2810,15 @@ bool ValidateMappingTextFromStrings(const std::string& header, const std::string
         error = "generated integrated source does not contain exactly the reviewed direct calls";
         return false;
     }
-    if (Occurrences(source, "x86_checked_indirect_call") != 4 ||
+    if (Occurrences(source, "x86_checked_indirect_call") != 5 ||
         source.find("x86_checked_indirect_call(ctx, base, 0x3C9E68u, 0x2B5CE6u, 0x2B5CE0u)") == std::string::npos ||
         source.find("x86_checked_indirect_call(ctx, base, 0x3C9D4Cu, 0x2B2763u, 0x2B275Du)") == std::string::npos ||
         source.find("x86_checked_indirect_call(ctx, base, 0x3C9E44u, 0x2B598Cu, 0x2B5986u)") == std::string::npos ||
         source.find("x86_checked_indirect_call(ctx, base, 0x3C9E40u, 0x2B59AFu, 0x2B59A9u)") == std::string::npos ||
+        source.find("x86_checked_indirect_call(ctx, base, (uint32_t)(ctx.eax + 0x8u), 0x2B59A4u, 0x2B59A1u)") ==
+            std::string::npos ||
         Occurrences(source, "0x3C9E44u") != 1 || Occurrences(source, "0x3C9E40u") != 1) {
-        error = "generated integrated source does not contain the four reviewed import calls";
+        error = "generated integrated source does not contain the reviewed imports and dynamic list operand";
         return false;
     }
     if (Occurrences(source, "x86_checked_ret") != 5 ||

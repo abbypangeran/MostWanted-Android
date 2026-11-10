@@ -77,6 +77,7 @@ public:
     std::size_t JoiningCountForTest() const;
     std::size_t JoinWaiterCountForTest() const;
     bool WaitForJoinInProgressForTest(std::chrono::milliseconds timeout);
+    bool WaitForShutdownStartedForTest(std::chrono::milliseconds timeout);
 #endif
 
 private:
@@ -109,6 +110,7 @@ std::size_t KernelWorkerCountForTest();
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
 void HoldKernelWorkerActivationForTest(bool hold);
 void FailNextKernelWorkerStartForTest();
+bool WaitForKernelWorkersShutdownForTest(std::chrono::milliseconds timeout);
 #endif
 
 class GuestDispatchLease {

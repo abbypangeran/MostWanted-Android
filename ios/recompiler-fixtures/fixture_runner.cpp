@@ -932,11 +932,17 @@ void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t other_target = code_page + 0x30;
     constexpr uint32_t output_page = 0xA5000;
     constexpr uint32_t start_context = 0x13572468;
+    constexpr uint32_t dynamic_start = 0x11299;
+    constexpr uint32_t dynamic_callback = 0x112DF;
+    constexpr uint32_t dynamic_callback_slot = 0xA6000;
+    constexpr uint32_t dynamic_argument = 0x2468ACE0;
+    constexpr uint32_t dynamic_result = dynamic_argument + 0x35;
     static const X86FuncMapping functions[] = {{target, sub_0001127E}, {other_target, sub_000110EF}};
     const dispatch::Metadata metadata{code_page, code_page + mem::kPage, target, functions, {}};
     std::string error;
     auto initialize = [&] {
         const bool ready = mem::Init() && mem::Commit(code_page, mem::kPage) && mem::Commit(output_page, mem::kPage) &&
+                           mem::Commit(dynamic_callback_slot, mem::kPage) &&
                            mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
                            dispatch::Init(metadata, error) && kernel::RestartKernelWorkers();
         Check(ready, "synthetic worker fixture memory, dispatch and workers initialize");
@@ -964,6 +970,29 @@ void CheckSyntheticWorkerLifecycle() {
         authorization.dispatch_generation = dispatch_generation;
         authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
         return kernel::ArmSyntheticWorker(authorization);
+    };
+    auto arm_nested = [&](uint32_t start, uint32_t context, uint32_t expected_exit,
+                          const kernel::GuestCallbackTicket& callback_ticket) {
+        kernel::GuestCallbackTicket start_ticket;
+        if (kernel::PrepareGuestCallback(start, kernel::GuestCallbackClass::kThreadStart, start_ticket) !=
+            kernel::GuestCallbackStatus::kReady)
+            return false;
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.context = context;
+        authorization.expected_exit = expected_exit;
+        authorization.code_base = 0x11000;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = start_ticket.dispatch_generation;
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        authorization.callback_ticket = callback_ticket;
+        return kernel::ArmSyntheticWorker(authorization);
+    };
+    auto clear_dynamic_output = [&] {
+        return mem::Fill(output_page + 0x10, 0, 0x30) == mem::AccessStatus::kOk;
+    };
+    auto read_dynamic_word = [&](uint32_t offset, uint32_t& value) {
+        return mem::Read(output_page + offset, &value, sizeof(value)) == mem::AccessStatus::kOk;
     };
     auto wait_thread = [](const kernel::ThreadRef& thread) {
         return kernel::Wait({std::static_pointer_cast<kernel::Object>(thread)}, false, -100'000'000, false);
@@ -1210,11 +1239,8 @@ void CheckSyntheticWorkerLifecycle() {
             mem::Shutdown();
             shutdown_done.store(true);
         });
-        bool waited = false;
-        for (int i = 0; i < 100 && !waited; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            waited = !shutdown_done.load() && !kernel::KernelWorkersAccepting() && mem::IsInitialized();
-        }
+        const bool shutdown_started = kernel::WaitForKernelWorkersShutdownForTest(std::chrono::seconds(3));
+        const bool waited = shutdown_started && !shutdown_done.load() && mem::IsInitialized();
         ReleaseSyntheticHook();
         shutdown.join();
         kernel::SetSyntheticWorkerPreCallbackHookForTest(nullptr);
@@ -1239,6 +1265,203 @@ void CheckSyntheticWorkerLifecycle() {
               "a retained completed ThreadRef cannot release allocations reused by a newer thread");
         Check(kernel::CancelPreparedThread(reused) && mem::Query().system_used == baseline.system_used,
               "the newer prepared thread cancels cleanly after the stale-reference check");
+    }
+
+    // Phase 2D-5: ticket-bound dynamic CALL [EBP+8] through the synthetic worker.
+    {
+        constexpr uint32_t fixture_base = 0x11000;
+        constexpr uint32_t unauthorized_mapped_target = 0x1127E;
+        constexpr uint32_t unmapped_target = 0x111F0;
+        constexpr uint32_t outside_target = 0x002B3916;
+        constexpr uint32_t authentic_start_target = 0x002B38A2;
+        constexpr uint32_t success_marker = 0xCAFEBABE;
+
+        Check(mem::Commit(fixture_base, mem::kPage) &&
+                  mem::Protect(fixture_base, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                  dispatch::Init(error),
+              "dynamic callback uses the checked synthetic fixture dispatch map");
+        auto prepare_dynamic = [&](kernel::ThreadRef& thread, uint32_t context) {
+            return prepare(thread, dynamic_start, context, output_page);
+        };
+        auto dynamic_ticket = [&](uint32_t callback, kernel::GuestCallbackTicket& ticket) {
+            return kernel::PrepareGuestCallback(callback, kernel::GuestCallbackClass::kThreadStart, ticket) ==
+                   kernel::GuestCallbackStatus::kReady;
+        };
+        auto rejected_dynamic = [&](const char* description, uint32_t slot_target, uint32_t authorized_target,
+                                    bool has_ticket, uint32_t context, bool write_only_stack,
+                                    bool write_only_context) {
+            if (!clear_dynamic_output() ||
+                mem::Write(dynamic_callback_slot, &slot_target, sizeof(slot_target)) != mem::AccessStatus::kOk) {
+                Check(false, description);
+                return false;
+            }
+            kernel::ThreadRef thread;
+            if (!prepare_dynamic(thread, context)) {
+                Check(false, description);
+                return false;
+            }
+            uint32_t handle = 0;
+            mem::Read(output_page, &handle, sizeof(handle));
+            kernel::GuestCallbackTicket ticket;
+            const bool ticket_ready = !has_ticket || dynamic_ticket(authorized_target, ticket);
+            const bool armed = ticket_ready && arm_nested(dynamic_start, context, dynamic_result, ticket);
+            const bool stack_protected = !write_only_stack ||
+                                         mem::Protect(thread->stack_top - mem::kPage, mem::kPage, mem::kWrite) ==
+                                             mem::AccessStatus::kOk;
+            const bool context_protected = !write_only_context ||
+                                           mem::Protect(dynamic_callback_slot, mem::kPage, mem::kWrite) ==
+                                               mem::AccessStatus::kOk;
+            const int trap_count = traps;
+            const int fault_count = faults;
+            const bool started = armed && stack_protected && context_protected && kernel::StartThread(thread);
+            if (!started && thread->state.load() == kernel::ThreadState::kPrepared)
+                kernel::CancelPreparedThread(thread);
+            const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+            const bool joined = started && join_workers();
+            if (write_only_context) mem::Protect(dynamic_callback_slot, mem::kPage, mem::kReadWrite);
+            uint32_t callee_ebp = 1, post_call = 1, pre_call_esp = 0;
+            const bool output_read = read_dynamic_word(0x18, callee_ebp) && read_dynamic_word(0x14, post_call) &&
+                                     read_dynamic_word(0x20, pre_call_esp);
+            const bool rejected = started && wait == kernel::kWait0 && joined &&
+                                 thread->state.load() == kernel::ThreadState::kCancelled &&
+                                 thread->resources_released && !thread->ctx && !thread->stack_top &&
+                                 output_read && callee_ebp == 0 && post_call == 0 &&
+                                 kernel::KernelWorkerCountForTest() == 0 && !kernel::SyntheticWorkerArmed() &&
+                                 mem::Query().system_used == baseline.system_used;
+            if (handle) kernel::CloseHandle(handle);
+            const bool before_caller = context != dynamic_callback_slot || write_only_context;
+            const bool correct_phase = before_caller
+                                          ? pre_call_esp == 0 && traps == trap_count && faults == fault_count
+                                          : write_only_stack
+                                                ? pre_call_esp != 0 && traps == trap_count && faults > fault_count
+                                                : pre_call_esp != 0 && traps > trap_count && faults == fault_count;
+            Check(rejected && correct_phase, description);
+            return rejected;
+        };
+
+        if (!clear_dynamic_output() ||
+            mem::Write(dynamic_callback_slot, &dynamic_callback, sizeof(dynamic_callback)) != mem::AccessStatus::kOk) {
+            Check(false, "dynamic callback output and guest target slot initialize");
+            return;
+        }
+        kernel::ThreadRef dynamic_thread;
+        kernel::GuestCallbackTicket callback_ticket;
+        const bool prepared = prepare_dynamic(dynamic_thread, dynamic_callback_slot) &&
+                              dynamic_ticket(dynamic_callback, callback_ticket);
+        const bool armed = prepared && arm_nested(dynamic_start, dynamic_callback_slot, dynamic_result, callback_ticket);
+        uint32_t dynamic_handle = 0;
+        if (prepared) mem::Read(output_page, &dynamic_handle, sizeof(dynamic_handle));
+        const bool started = armed && kernel::StartThread(dynamic_thread);
+        const uint32_t wait = started ? wait_thread(dynamic_thread) : kernel::kTimeout;
+        const bool joined = started && join_workers();
+        uint32_t result = 0, marker = 0, callee_ebp = 0, pre_call_esp = 0, post_call_esp = 0;
+        uint32_t ebx_after = 0, return_address = 0, argument = 0;
+        const bool output_read = read_dynamic_word(0x10, result) && read_dynamic_word(0x14, marker) &&
+                                 read_dynamic_word(0x18, callee_ebp) && read_dynamic_word(0x20, pre_call_esp) &&
+                                 read_dynamic_word(0x24, post_call_esp) && read_dynamic_word(0x28, ebx_after) &&
+                                 read_dynamic_word(0x2C, return_address) && read_dynamic_word(0x30, argument);
+        Check(started && wait == kernel::kWait0 && joined && output_read &&
+                  dynamic_thread->state.load() == kernel::ThreadState::kExited &&
+                  dynamic_thread->exit_code.load() == dynamic_result && result == dynamic_result &&
+                  marker == success_marker && callee_ebp == pre_call_esp && pre_call_esp == post_call_esp &&
+                  ebx_after == 0x23456789 && return_address == 0x112BE && argument == dynamic_argument &&
+                  dynamic_thread->resources_released && !dynamic_thread->ctx && !dynamic_thread->stack_top &&
+                  !dynamic_thread->start_routine_ticket.target && !kernel::SyntheticWorkerArmed() &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "generated CALL [EBP+8] validates the caller frame, argument, return, ESP, EBX and flags, then releases the worker");
+        if (dynamic_handle) kernel::CloseHandle(dynamic_handle);
+        Check(dispatch::Init(error), "dynamic callback dispatch lease releases after normal return");
+        Check(!arm_nested(dynamic_start, dynamic_callback_slot, dynamic_result, callback_ticket) &&
+                  !kernel::SyntheticWorkerArmed(),
+              "a callback ticket from a finalized worker cannot be rearmed after dispatch reset");
+
+        rejected_dynamic("null dynamic target is rejected before callback entry", 0, dynamic_callback, true,
+                         dynamic_callback_slot, false, false);
+        rejected_dynamic("an in-range generated target without a ticket is rejected before callback entry",
+                         dynamic_callback, 0, false, dynamic_callback_slot, false, false);
+        rejected_dynamic("a different in-range generated target fails the exact callback ticket check",
+                         unauthorized_mapped_target, dynamic_callback, true, dynamic_callback_slot, false, false);
+        rejected_dynamic("an unmapped target inside the synthetic image is rejected before dispatch", unmapped_target,
+                         dynamic_callback, true, dynamic_callback_slot, false, false);
+        rejected_dynamic("a target outside the synthetic range is rejected before dispatch", outside_target,
+                         dynamic_callback, true, dynamic_callback_slot, false, false);
+        rejected_dynamic("the authentic Xbox start routine is rejected without being entered", authentic_start_target,
+                         dynamic_callback, true, dynamic_callback_slot, false, false);
+        rejected_dynamic("an uncommitted dynamic callback slot is rejected before generated caller entry",
+                         dynamic_callback, dynamic_callback, true, 0x14000, false, false);
+        rejected_dynamic("a read-protected callback target source is rejected before generated caller entry",
+                         dynamic_callback, dynamic_callback, true, dynamic_callback_slot, false, true);
+        rejected_dynamic("a read-protected [EBP+8] target slot faults after caller entry and before callee entry",
+                         dynamic_callback, dynamic_callback, true, dynamic_callback_slot, true, false);
+
+        // Pause after the worker has claimed its ticket, then alter the guest slot
+        // before the generated CALL reads it.
+        if (!clear_dynamic_output() ||
+            mem::Write(dynamic_callback_slot, &dynamic_callback, sizeof(dynamic_callback)) != mem::AccessStatus::kOk) {
+            Check(false, "changed-target callback output and guest slot initialize");
+            return;
+        }
+        kernel::ThreadRef changed_target_thread;
+        kernel::GuestCallbackTicket changed_ticket;
+        const bool changed_prepared = prepare_dynamic(changed_target_thread, dynamic_callback_slot) &&
+                                      dynamic_ticket(dynamic_callback, changed_ticket) &&
+                                      arm_nested(dynamic_start, dynamic_callback_slot, dynamic_result, changed_ticket);
+        uint32_t changed_handle = 0;
+        if (changed_prepared) mem::Read(output_page, &changed_handle, sizeof(changed_handle));
+        ResetSyntheticHook();
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(SyntheticWorkerPreCallbackHook);
+        const bool changed_started = changed_prepared && kernel::StartThread(changed_target_thread);
+        const bool hook_entered = changed_started && WaitSyntheticHookEntered();
+        const bool slot_changed = hook_entered &&
+                                  mem::Write(dynamic_callback_slot, &unauthorized_mapped_target,
+                                             sizeof(unauthorized_mapped_target)) == mem::AccessStatus::kOk;
+        ReleaseSyntheticHook();
+        const uint32_t changed_wait = changed_started ? wait_thread(changed_target_thread) : kernel::kTimeout;
+        const bool changed_joined = changed_started && join_workers();
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(nullptr);
+        uint32_t changed_entry = 1, changed_marker = 1, changed_pre_call_esp = 0;
+        const bool changed_output = read_dynamic_word(0x18, changed_entry) && read_dynamic_word(0x14, changed_marker) &&
+                                   read_dynamic_word(0x20, changed_pre_call_esp);
+        Check(changed_started && hook_entered && slot_changed && changed_wait == kernel::kWait0 && changed_joined &&
+                  changed_target_thread->state.load() == kernel::ThreadState::kCancelled &&
+                  changed_target_thread->resources_released && changed_output && changed_entry == 0 &&
+                  changed_marker == 0 && changed_pre_call_esp != 0 && !kernel::SyntheticWorkerArmed() &&
+                  kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used,
+              "a callback target changed after ticket authorisation is rejected before callee entry");
+        if (changed_handle) kernel::CloseHandle(changed_handle);
+
+        // A ticket from an older dispatch generation cannot arm a nested callback.
+        kernel::GuestCallbackTicket stale_ticket;
+        const bool stale_prepared = dynamic_ticket(dynamic_callback, stale_ticket) && dispatch::Init(error);
+        kernel::ThreadRef stale_thread;
+        const bool stale_thread_prepared = stale_prepared && clear_dynamic_output() &&
+                                           mem::Write(dynamic_callback_slot, &dynamic_callback,
+                                                      sizeof(dynamic_callback)) == mem::AccessStatus::kOk &&
+                                           prepare_dynamic(stale_thread, dynamic_callback_slot);
+        kernel::GuestCallbackTicket current_start_ticket;
+        const bool current_start_ready = stale_thread_prepared &&
+                                         kernel::PrepareGuestCallback(dynamic_start,
+                                                                      kernel::GuestCallbackClass::kThreadStart,
+                                                                      current_start_ticket) ==
+                                             kernel::GuestCallbackStatus::kReady;
+        kernel::SyntheticWorkerAuthorization stale_authorization;
+        stale_authorization.target = dynamic_start;
+        stale_authorization.context = dynamic_callback_slot;
+        stale_authorization.expected_exit = dynamic_result;
+        stale_authorization.code_base = fixture_base;
+        stale_authorization.code_end = X86CodeEnd;
+        stale_authorization.dispatch_generation = current_start_ticket.dispatch_generation;
+        stale_authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        stale_authorization.callback_ticket = stale_ticket;
+        const bool stale_arm_rejected = current_start_ready && !kernel::ArmSyntheticWorker(stale_authorization);
+        uint32_t stale_handle = 0;
+        if (stale_thread_prepared) mem::Read(output_page, &stale_handle, sizeof(stale_handle));
+        const bool stale_cancelled = stale_thread_prepared && kernel::CancelPreparedThread(stale_thread);
+        Check(stale_arm_rejected && stale_cancelled && stale_thread->resources_released &&
+                  !kernel::KernelWorkerCountForTest() && mem::Query().system_used == baseline.system_used,
+              "a stale nested callback ticket is rejected before worker activation");
+        if (stale_handle) kernel::CloseHandle(stale_handle);
     }
 
     // Phase 2D-4: guest-originated termination through a checked ordinal-258 bridge.
@@ -1392,16 +1615,34 @@ void CheckSyntheticWorkerLifecycle() {
         // releases termination and observes finalization after the callback.
         {
             ResetKernel258Gate(true);
+            const bool fixture_ready = write_marker(0) && clear_dynamic_output() &&
+                                       mem::Write(dynamic_callback_slot, &termination_target,
+                                                  sizeof(termination_target)) == mem::AccessStatus::kOk;
+            Check(fixture_ready, "nested termination fixture data initializes for handle closure");
+            if (!fixture_ready) {
+                ResetKernel258Gate(false);
+                return;
+            }
             kernel::ThreadRef closing;
-            if (!prepare(closing, termination_target, exit_status ^ 1, output_page)) return;
+            const bool closing_prepared = prepare(closing, dynamic_start, dynamic_callback_slot, output_page);
+            Check(closing_prepared, "nested termination worker prepares for handle closure");
+            if (!closing_prepared) {
+                ResetKernel258Gate(false);
+                return;
+            }
             uint32_t handle = 0;
             mem::Read(output_page, &handle, sizeof(handle));
             const uint32_t ethread = closing->ethread;
             const uint32_t kpcr = closing->kpcr;
             const uint32_t stack = closing->stack_top;
-            const uint64_t generation = termination_generation();
-            Check(generation != 0 && arm_termination(exit_status ^ 1, generation),
-                  "authorization arms for handle closure during guest termination");
+            const uint32_t termination_calls_before = g_kernel258_calls.load();
+            kernel::GuestCallbackTicket nested_termination_ticket;
+            const bool nested_ticket_ready =
+                kernel::PrepareGuestCallback(termination_target, kernel::GuestCallbackClass::kThreadStart,
+                                            nested_termination_ticket) == kernel::GuestCallbackStatus::kReady;
+            Check(nested_ticket_ready &&
+                      arm_nested(dynamic_start, dynamic_callback_slot, dynamic_argument, nested_termination_ticket),
+                  "ticket authorizes the nested termination callback for handle closure");
             const bool started = kernel::StartThread(closing);
             const bool entered = WaitKernel258Entered();
             const bool closed = kernel::CloseHandle(handle);
@@ -1415,12 +1656,19 @@ void CheckSyntheticWorkerLifecycle() {
             ReleaseKernel258Gate();
             const uint32_t wait = started ? wait_thread(closing) : kernel::kTimeout;
             const bool joined = join_workers();
+            uint32_t caller_marker = 1;
+            const bool marker_read = read_dynamic_word(0x14, caller_marker);
             Check(retained_active && wait == kernel::kWait0 &&
                       closing->state.load() == kernel::ThreadState::kExited &&
-                      closing->exit_code.load() == (exit_status ^ 1) && closing->resources_released &&
+                      closing->exit_code.load() == dynamic_argument && closing->resources_released &&
                       !closing->ethread && !closing->kpcr && !closing->stack_top &&
-                      kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used,
-                  "closing the handle during guest termination retains resources until the worker finalizes");
+                      marker_read && caller_marker == 0 && read_marker() == 0 &&
+                      g_kernel258_calls.load() == termination_calls_before + 1 &&
+                      kernel::KernelWorkerCountForTest() == 0 &&
+                      kernel::Threads().empty() && !kernel::SyntheticWorkerArmed() &&
+                      mem::Query().system_used == baseline.system_used,
+                  "nested dynamic termination closes the handle, preserves status, skips caller code, and finalizes after quiescence");
+            Check(dispatch::Init(error), "nested termination releases dispatch and page leases after return unwinding");
             ResetKernel258Gate(false);
         }
 
@@ -1460,35 +1708,85 @@ void CheckSyntheticWorkerLifecycle() {
         // Termination quiesces before memory teardown completes.
         {
             ResetKernel258Gate(true);
+            const bool fixture_ready = write_marker(0) && clear_dynamic_output() &&
+                                       mem::Write(dynamic_callback_slot, &termination_target,
+                                                  sizeof(termination_target)) == mem::AccessStatus::kOk;
+            Check(fixture_ready, "nested termination fixture data initializes for shutdown");
+            if (!fixture_ready) {
+                ResetKernel258Gate(false);
+                return;
+            }
             kernel::ThreadRef shutdown_thread;
-            if (!prepare(shutdown_thread, termination_target, exit_status ^ 2, output_page)) return;
+            const bool shutdown_prepared = prepare(shutdown_thread, dynamic_start, dynamic_callback_slot, output_page);
+            Check(shutdown_prepared, "nested termination worker prepares for shutdown");
+            if (!shutdown_prepared) {
+                ResetKernel258Gate(false);
+                return;
+            }
             uint32_t handle = 0;
             mem::Read(output_page, &handle, sizeof(handle));
-            const uint64_t generation = termination_generation();
-            Check(generation != 0 && arm_termination(exit_status ^ 2, generation),
-                  "authorization arms for guest termination during host shutdown");
+            const uint32_t stack_page = shutdown_thread->stack_top - mem::kPage;
+            const uint32_t calls_before = g_kernel258_calls.load();
+            kernel::GuestCallbackTicket nested_termination_ticket;
+            const bool nested_ticket_ready =
+                kernel::PrepareGuestCallback(termination_target, kernel::GuestCallbackClass::kThreadStart,
+                                            nested_termination_ticket) == kernel::GuestCallbackStatus::kReady;
+            Check(nested_ticket_ready &&
+                      arm_nested(dynamic_start, dynamic_callback_slot, dynamic_argument, nested_termination_ticket),
+                  "nested termination ticket arms before the worker enters ordinal 258");
             const bool started = kernel::StartThread(shutdown_thread);
             const bool entered = WaitKernel258Entered();
+
+            {
+                std::lock_guard lock(g_callback_fake_lock);
+                g_callback_page_mutation_waits = 0;
+            }
+            mem::SetPageMutationWaitHookForTest(CallbackPageMutationWaiting);
+            std::atomic<bool> code_decommit{false};
+            std::atomic<mem::AccessStatus> stack_mutation{mem::AccessStatus::kHostError};
+            std::atomic<bool> slot_decommit{false};
+            std::thread code_mutator([&] {
+                code_decommit = mem::Decommit(fixture_base, mem::kPage);
+            });
+            std::thread stack_mutator([&] {
+                stack_mutation = mem::Protect(stack_page, mem::kPage, mem::kReadWrite);
+            });
+            std::thread slot_mutator([&] {
+                slot_decommit = mem::Decommit(dynamic_callback_slot, mem::kPage);
+            });
+            bool mutations_waited = false;
+            {
+                std::unique_lock lock(g_callback_fake_lock);
+                mutations_waited = g_callback_fake_changed.wait_for(lock, std::chrono::seconds(3), [] {
+                    return g_callback_page_mutation_waits >= 3;
+                });
+            }
             std::atomic<bool> shutdown_done{false};
             std::thread shutdown([&] {
                 mem::Shutdown();
                 shutdown_done.store(true);
             });
-            bool waited = false;
-            for (int i = 0; i < 100 && !waited; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                // mem::IsInitialized() locks g_lock, which the blocked bridge holds.
-                waited = !shutdown_done.load() && !kernel::KernelWorkersAccepting();
-            }
+            const bool shutdown_started = kernel::WaitForKernelWorkersShutdownForTest(std::chrono::seconds(3));
+            const bool waited = shutdown_started && !shutdown_done.load();
             ReleaseKernel258Gate();
             shutdown.join();
+            code_mutator.join();
+            stack_mutator.join();
+            slot_mutator.join();
+            mem::SetPageMutationWaitHookForTest(nullptr);
             const bool terminated = shutdown_thread->state.load() == kernel::ThreadState::kExited &&
-                                    shutdown_thread->exit_code.load() == (exit_status ^ 2) &&
-                                    shutdown_thread->resources_released;
+                                    shutdown_thread->exit_code.load() == dynamic_argument &&
+                                    shutdown_thread->resources_released && !shutdown_thread->ctx &&
+                                    !shutdown_thread->ethread && !shutdown_thread->kpcr && !shutdown_thread->stack_top;
+            const auto retained = kernel::FromHandle(handle);
             kernel::CloseHandle(handle);
-            Check(started && entered && waited && shutdown_done.load() && terminated &&
+            Check(started && entered && mutations_waited && waited && shutdown_done.load() && terminated &&
+                      code_decommit.load() &&
+                      stack_mutation.load() == mem::AccessStatus::kOk &&
+                      slot_decommit.load() &&
+                      calls_before + 1 == g_kernel258_calls.load() && retained.get() == shutdown_thread.get() &&
                       kernel::KernelWorkerCountForTest() == 0 && !mem::IsInitialized(),
-                  "host shutdown waits for guest termination to quiesce before releasing memory");
+                  "shutdown and code/stack/slot mutations wait for nested callback quiescence before teardown");
             ResetKernel258Gate(false);
             Check(dispatch::SetKernel258FixtureBridge(false),
                   "ordinal-258 checked bridge disables after the shutdown test");
@@ -2198,9 +2496,35 @@ void CheckIndirectCallTests() {
               !last_fault.write && SameCoreState(ctx, before_overflow_source),
           "indirect CALL overflowing target read preserves guest state");
 
-    Check(ThrowsTrap(sub_000111D5, ctx) && last_trap_pc == 0x111D5 &&
-              last_trap_reason.find("unimplemented: call") != std::string::npos,
-          "checked indirect CALL rejects non-absolute memory operand shape");
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.eax = 0x12345677;
+    ctx.esi = slots;
+    Check(Runs(sub_000111D5, ctx) && ctx.eax == 0x12345678 && ctx.esp == top + 4 &&
+              ctx.last_icall == valid_target,
+          "checked indirect CALL computes a register-based guest effective address");
+
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.ebp = 0x13FF8;
+    const X86Context before_uncommitted_ebp_slot = ctx;
+    Check(ThrowsMemoryFault(sub_00011303, ctx) && last_fault.instruction == 0x11303 &&
+              last_fault.address == 0x14000 && last_fault.status == mem::AccessStatus::kUncommitted &&
+              !last_fault.write && SameCoreState(ctx, before_uncommitted_ebp_slot),
+          "checked CALL [EBP+8] faults on an uncommitted target slot before stack mutation");
+
+    Check(mem::Protect(slots, mem::kPage, mem::kWrite) == mem::AccessStatus::kOk,
+          "EBP-relative indirect CALL slot becomes write-only");
+    ctx = X86Context{};
+    ctx.esp = top;
+    ctx.ebp = slots - 8;
+    const X86Context before_write_only_ebp_slot = ctx;
+    Check(ThrowsMemoryFault(sub_00011303, ctx) && last_fault.instruction == 0x11303 &&
+              last_fault.address == slots && last_fault.status == mem::AccessStatus::kPermissionDenied &&
+              !last_fault.write && SameCoreState(ctx, before_write_only_ebp_slot),
+          "checked CALL [EBP+8] rejects a read-protected target slot before dispatch");
+    Check(mem::Protect(slots, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "EBP-relative indirect CALL slot becomes readable again");
 
     Check(mem::Protect(slots, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk &&
               mem::Write(slots, &valid_target, sizeof(valid_target)) == mem::AccessStatus::kOk,

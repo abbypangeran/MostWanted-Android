@@ -14,6 +14,9 @@
 #include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+#include "kernel/synthetic_worker.h"
+#endif
 
 namespace {
 
@@ -308,6 +311,19 @@ void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t 
 void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t return_address,
                                uint32_t call_pc) {
     const uint32_t target = x86_mem_read<uint32_t>(call_pc, operand_address);
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    mem::ScopedPageLease callback_code_lease;
+    if (kernel::SyntheticWorkerClaimHeld()) {
+        dispatch::CallLease lease;
+        if (lease.Resolve(target).kind == dispatch::TargetKind::kGeneratedFunction) {
+            if (!kernel::SyntheticWorkerHasNestedCallback() ||
+                !kernel::SyntheticWorkerAuthorizesNestedCallback(target, lease.Generation()))
+                x86_checked_trap(ctx, call_pc, "unauthorized synthetic nested callback target");
+            const mem::AccessStatus status = callback_code_lease.Acquire(target, 1, mem::kExecute);
+            if (status != mem::AccessStatus::kOk) throw X86MemoryFault{call_pc, target, status, false};
+        }
+    }
+#endif
     CheckedCall(ctx, base, target, return_address, call_pc);
 }
 

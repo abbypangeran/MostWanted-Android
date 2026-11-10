@@ -180,7 +180,39 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xC7, 0x05, 0x04, 0x51, 0x0A, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, // mov dword ptr [0xA5104], 0xDEADBEEF
         0xC3                                             // ret
     });
-    if (code.size() != 0x299) return false;
+    code.insert(code.end(), {
+        0x55,                                                       // push ebp
+        0x8B, 0xEC,                                                 // mov ebp, esp
+        0xB8, 0x01, 0x00, 0x00, 0x00,                               // mov eax, 1
+        0x39, 0xC0,                                                 // cmp eax, eax; preserve ZF across the callback
+        0xA1, 0x00, 0x60, 0x0A, 0x00,                               // mov eax, [0xA6000] (dynamic callback target)
+        0x89, 0x45, 0x08,                                           // mov [ebp+8], eax
+        0xBB, 0x89, 0x67, 0x45, 0x23,                               // mov ebx, 0x23456789
+        0x89, 0x25, 0x20, 0x50, 0x0A, 0x00,                         // save pre-call ESP
+        0x68, 0xE0, 0xAC, 0x68, 0x24,                               // push 0x2468ACE0
+        0xFF, 0x55, 0x08,                                           // call dword ptr [ebp+8]
+        0x89, 0x25, 0x24, 0x50, 0x0A, 0x00,                         // save post-call ESP
+        0x89, 0x1D, 0x28, 0x50, 0x0A, 0x00,                         // save callee-preserved EBX
+        0xA3, 0x10, 0x50, 0x0A, 0x00,                               // save callback result
+        0x75, 0x0A,                                                 // jnz over the success marker
+        0xC7, 0x05, 0x14, 0x50, 0x0A, 0x00, 0xBE, 0xBA, 0xFE, 0xCA, // success marker
+        0x5D,                                                       // pop ebp
+        0xC2, 0x04, 0x00                                            // ret 4
+    });
+    code.insert(code.end(), {
+        0x89, 0x2D, 0x18, 0x50, 0x0A, 0x00,                         // save callee EBP to prove caller frame delivery
+        0x8B, 0x04, 0x24,                                           // mov eax, [esp] (return address)
+        0xA3, 0x2C, 0x50, 0x0A, 0x00,                               // save return address
+        0x8B, 0x44, 0x24, 0x04,                                     // mov eax, [esp+4] (callback argument)
+        0xA3, 0x30, 0x50, 0x0A, 0x00,                               // save callback argument
+        0x8D, 0x40, 0x35,                                           // lea eax, [eax+0x35] (transform without flags)
+        0x53,                                                       // preserve caller's EBX
+        0xBB, 0x78, 0x56, 0x34, 0x12,                               // clobber EBX inside the callback
+        0x5B,                                                       // restore EBX
+        0xC2, 0x04, 0x00                                            // ret 4 (stdcall callback)
+    });
+    code.insert(code.end(), {0xFF, 0x55, 0x08, 0xC3});              // checked CALL [EBP+8]; ret
+    if (code.size() != 0x307) return false;
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
     std::copy_n("XBEH", 4, image.begin());
@@ -556,7 +588,10 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "\n[[function]]\nat = 0x11270\nend = 0x11279\n"
               "\n[[function]]\nat = 0x11279\nend = 0x1127E\n"
               "\n[[function]]\nat = 0x1127E\nend = 0x11283\n"
-              "\n[[function]]\nat = 0x11283\nend = 0x11299\n";
+              "\n[[function]]\nat = 0x11283\nend = 0x11299\n"
+              "\n[[function]]\nat = 0x11299\nend = 0x112DF\n"
+              "\n[[function]]\nat = 0x112DF\nend = 0x11303\n"
+              "\n[[function]]\nat = 0x11303\nend = 0x11307\n";
     return bool(config);
 }
 

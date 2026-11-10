@@ -31,6 +31,7 @@ std::mutex g_synthetic_worker_lock;
 SyntheticWorkerAuthorization g_synthetic_worker_auth;
 bool g_synthetic_worker_armed = false;
 bool g_synthetic_worker_claimed = false;
+bool g_synthetic_worker_callback_entered = false;
 Thread* g_synthetic_worker_owner = nullptr;
 SyntheticWorkerPreCallbackHook g_synthetic_worker_hook = nullptr;
 #endif
@@ -355,7 +356,12 @@ bool ArmSyntheticWorker(const SyntheticWorkerAuthorization& authorization) {
     if (authorization.image_identity != kSyntheticWorkerImageIdentity || !authorization.target ||
         !authorization.code_base || authorization.code_end <= authorization.code_base ||
         authorization.target < authorization.code_base || authorization.target >= authorization.code_end ||
-        !authorization.dispatch_generation)
+        !authorization.dispatch_generation ||
+        (authorization.callback_ticket.target &&
+         (authorization.callback_ticket.callback_class != GuestCallbackClass::kThreadStart ||
+          authorization.callback_ticket.dispatch_generation != authorization.dispatch_generation ||
+          authorization.callback_ticket.target < authorization.code_base ||
+          authorization.callback_ticket.target >= authorization.code_end)))
         return false;
     std::lock_guard lock(g_synthetic_worker_lock);
     if (g_synthetic_worker_armed || g_synthetic_worker_claimed) return false;
@@ -368,6 +374,7 @@ void DisarmSyntheticWorker() {
     std::lock_guard lock(g_synthetic_worker_lock);
     g_synthetic_worker_armed = false;
     g_synthetic_worker_claimed = false;
+    g_synthetic_worker_callback_entered = false;
     g_synthetic_worker_owner = nullptr;
     g_synthetic_worker_auth = {};
 }
@@ -386,6 +393,7 @@ SyntheticWorkerClaim ClaimSyntheticWorker(uint32_t target, uint32_t context, uin
         target < g_synthetic_worker_auth.code_base || target >= g_synthetic_worker_auth.code_end)
         return SyntheticWorkerClaim::kRejected;
     g_synthetic_worker_claimed = true;
+    g_synthetic_worker_callback_entered = false;
     g_synthetic_worker_owner = Current();
     return SyntheticWorkerClaim::kClaimed;
 }
@@ -395,9 +403,28 @@ bool SyntheticWorkerClaimHeld() {
     return g_synthetic_worker_claimed && g_synthetic_worker_owner == Current();
 }
 
+bool SyntheticWorkerHasNestedCallback() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    return g_synthetic_worker_armed && g_synthetic_worker_auth.callback_ticket.target;
+}
+
+bool SyntheticWorkerAuthorizesNestedCallback(uint32_t target, uint64_t dispatch_generation) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    const GuestCallbackTicket& ticket = g_synthetic_worker_auth.callback_ticket;
+    if (!g_synthetic_worker_claimed || g_synthetic_worker_owner != Current() || g_synthetic_worker_callback_entered ||
+        ticket.target != target || ticket.callback_class != GuestCallbackClass::kThreadStart ||
+        ticket.dispatch_generation != dispatch_generation ||
+        dispatch_generation != g_synthetic_worker_auth.dispatch_generation || target < g_synthetic_worker_auth.code_base ||
+        target >= g_synthetic_worker_auth.code_end)
+        return false;
+    g_synthetic_worker_callback_entered = true;
+    return true;
+}
+
 void FinishSyntheticWorker() {
     std::lock_guard lock(g_synthetic_worker_lock);
     g_synthetic_worker_claimed = false;
+    g_synthetic_worker_callback_entered = false;
     g_synthetic_worker_owner = nullptr;
     g_synthetic_worker_armed = false;
     g_synthetic_worker_auth = {};
@@ -546,9 +573,14 @@ bool StartThread(ThreadRef t) {
                             if (synthetic_claim == SyntheticWorkerClaim::kClaimed) {
                                 synthetic_claimed = true;
                                 CallSyntheticWorkerPreCallbackHookForTest();
-                                callback_status = CallGuestCallbackForTest(
-                                    ctx, t->start_routine_ticket, t->start_routine, start_arguments, stack_base,
-                                    t->stack_size, code);
+                                mem::ScopedPageLease callback_slot_lease;
+                                callback_status = SyntheticWorkerHasNestedCallback() &&
+                                                          callback_slot_lease.Acquire(t->start_context, sizeof(uint32_t),
+                                                                                      mem::kRead) != mem::AccessStatus::kOk
+                                                      ? GuestCallbackStatus::kRejectedTarget
+                                                      : CallGuestCallbackForTest(ctx, t->start_routine_ticket,
+                                                                                 t->start_routine, start_arguments,
+                                                                                 stack_base, t->stack_size, code);
                                 if (callback_status == GuestCallbackStatus::kInvoked &&
                                     !SyntheticWorkerExitMatches(code))
                                     callback_status = GuestCallbackStatus::kRejectedTarget;
