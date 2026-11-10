@@ -3229,3 +3229,158 @@ The integrated static preflight in each configuration reports 72 root plus 71 se
 **Next packages, ranked by dependency and risk:** (1) review the system-routine SEH prolog's checked-call stack contract and design a bounded, fully synthetic exception contract before entering the callback at `0x002B5C7E`; (2) establish authoritative retail ABI/effects for ordinals 179/182/204, then add only evidence-backed import fixtures; (3) trace write paths and callback ABIs for the mutable tables at `0x004720C8`, `0x0041F94C`, `0x0041E7F0`, and `0x0041E7E0`, then define an authentic target authorization policy; (4) validate authentic ordinal-258 ABI, epilogue, and `CLI`/`STI` semantics while keeping `INT3` trapped; (5) expand only required descendants of `0x001C8C20` and review host-visible import side effects. No full-game boot, graphics/audio work, device install, or `main` merge is in scope.
 
 **Development:** Checked lowering and synthetic lifecycle integration implemented. **Validation:** Debug/Release suites and all six static preflights passed. **Integration:** scoped to `feature/ios-port`; no `main` merge. Before this milestone commit, the feature branch was 80 commits ahead of and 0 behind `origin/main`; `main` remains untouched. **Customer release:** not performed; game boot and authentic guest-thread concurrency are not claimed.
+
+## Phase 2D-8 — checked synthetic SEH-chain foundation (PARTIAL)
+
+**`PHASE_2D8_SEH_FOUNDATION = PARTIAL`.** Generated test-only guest instructions now register nested exception records through `FS:[0]`, validate their ownership and links with checked read leases, unlink them in LIFO order, and prove normal return and worker teardown. This does not implement or authorize exception delivery. The authentic handler, `RtlRaiseException`, `RtlUnwind`, protection exports, and dynamic callback ABI remain blocked.
+
+### Frozen milestone and scope
+
+Phase 2C-41 remains **PASS** and frozen. Its existing record at [Phase 2C-41](#phase-2c-41--frozen-143-instruction-closure) reports 143 authentic guest instructions (72 root plus 71 secondary), four direct calls, four kernel calls, four import reads, the reviewed critical-section ABI and ETHREAD ownership, a stop before `0x002B5C7B`, clean cancellation/import restoration/teardown, exit status 0, and evidence at `.local/ios-port/phase2c41-evidence/`. It was not rerun for Phase 2D-8.
+
+Only the fixture builder/runner and a test-macro-gated header changed. No production runtime source, Apple guard, `Boot()`, authentic guest code, generated authentic code, or XBE asset changed. The image SHA-1 is `f636a16af04171089f879a4bed646e185c734233`.
+
+The older Phase 2D-7 statement that the checked return contract was unreconciled is superseded by the static stack accounting below. That reconciliation is not authentic runtime validation. Phase 2D-7's “only the first handler instruction is mapped” describes its bounded map; Phase 2D-8 separately translated a larger static handler map and found the unsupported forms listed below. Neither map was executed.
+
+### Static dependency slice
+
+```mermaid
+graph TD
+    SYS[002B5C0F system routine] -->|002B5C16 CALL| PRO[00319804 SEH prologue]
+    PRO -->|installs FS:0| H[00319858 handler]
+    SYS -->|002B5C7E CALL EBP+8| START[002B38A2 start routine]
+    START --> C1[002B58B8]
+    START --> C2[002B5664]
+    START --> C3[002B582B]
+    START --> C4[002B57D3]
+    START --> C5[001C8C20 bounded fan-out]
+    START --> C6[002B55EE]
+    H -->|direct| U[00317888]
+    U --> U2[00323BDE]
+    U2 -->|JMP slot 003C9EE4| RU[RtlUnwind ordinal 312]
+    H -->|direct| H2[003178CA]
+    H -->|direct| H3[0031795E]
+    H -->|dynamic CALL EAX| DYN[003198AA / 003198F2]
+    SYS -->|002B5BD3| EP[ETHREAD+250 and callback path]
+    SYS -->|002B5C99 / 002B5CA0| TERM[frame OR / ordinal 258]
+    TERM -->|002B5CA6| INT3[INT3 fail-closed]
+```
+
+This is a static relationship map only. The start routine's subordinate import edges and the four writable callback tables are detailed in Phase 2D-7 above; none is evidence of runtime reachability.
+
+### SEH prologue contract and confidence
+
+At the authentic call `0x002B5C16 -> 0x00319804`, let `P` be ESP at callee entry. The call-site bytes establish `[P] = 0x002B5C1B`, `[P+4] = 0x003ED5B8`, and `[P+8] = 0x18`; those values' higher-level meanings are not inferred here. Static translation of `0x00319804` shows:
+
+1. Push handler `0x00319858`, read the old `FS:[0]`, and push that previous head. The candidate record is at `P-8`, with `[P-8] = previous head` and `[P-4] = handler`.
+2. Read the stack-size value at `[P+8]`, save caller EBP there, set EBP to `P+8`, and reserve that many bytes. Save EBX/ESI/EDI and the resulting ESP at `[P-0x10]`.
+3. Copy the call return address from `[P]` to `P-0x30`, replace `[P+4]` with `0xFFFFFFFF`, replace `[P]` with `0x003ED5B8`, and set `FS:[0]` to `P-8`.
+4. `RET` consumes the copied return at `P-0x30`, leaving ESP at `P-0x2C` and returning to `0x002B5C1B`, which matches the checked call frame's expected return. The caller then accesses `[EBP-4]` and `[EBP-0x20]` using the new frame.
+
+The prologue's `SUB ESP,EAX` updates arithmetic flags; following pushes, moves, LEA, and RET preserve those flags. The static operation sequence changes EAX, EBP, ESP, stack locals, and the exception-chain head while saving EBX/ESI/EDI. The checked instruction forms required by the prologue are emitted by the recompiler, but this actual helper was never run. The synthetic fixture is analogous generated code, not a copied prologue and not proof of the authentic handler ABI.
+
+`InitContext` points FS at the thread's KPCR; initialized `FS:[0]` is `0xFFFFFFFF`, `FS:[0x20]` points to KPCR+`0x28`, and KPCR+`0x28` identifies the ETHREAD. The authentic system epilogue at `0x002B5BD3` reads `FS:[0x20]` and then `[ETHREAD+0x250]`, which is beyond this runtime's current synthetic ETHREAD allocation (`0x200`). It may call `[EAX+0x14]`; the owner, object layout, and branch contract remain unresolved.
+
+### Synthetic implementation and lifecycle
+
+The fixture-only `ValidateGuestExceptionChain` in `sdk/runtime/kernel/guest_exception_chain.h` is compiled only with `MOSTWANTED_GUEST_CALLBACK_TESTS`. It takes locks in the existing virtual-range/owner lifecycle order, checks the prepared or active thread identity and memory generation, validates KPCR/ETHREAD and stack bounds, and holds read/execute page leases while walking the chain. It accepts only aligned records wholly inside the owner's stack, follows `[next, handler]` pairs to the `0xFFFFFFFF` sentinel, rejects cycles and chains deeper than 64, and requires every handler pointer to resolve to a generated function. It does not call handlers, deliver faults, mutate guest exception state, or unwind.
+
+Generated synthetic x86 instructions perform registration and LIFO removal through FS-relative memory operations. The fixture covers nested layout, sentinel restoration, invalid FS ownership, invalid/out-of-stack heads, unmapped handlers, cycles, normal return, page-protection/decommit contention, and termination while a record is live. In the normal-return worker race, deterministic condition-variable barriers hold the callback; decommit waits; guest instructions unlink the record before the worker exits; host teardown then joins and releases owned allocations. A separate ordinal-258 race holds one record live through guest termination; managed host unwinding quiesces the worker, then the owner finalizer clears thread identity and releases KPCR/ETHREAD/stack together. No guest handler runs and no old context is admitted after teardown. A checked access after deallocation is rejected. Existing lifecycle coverage continues to exercise invalid/stale tickets, launch failure, cancellation before activation, shutdown during preparation, double cancellation/exit, retained handles, and completion versus teardown.
+
+```text
+Prepared owner
+  -> register callback ticket and activate one managed worker
+  -> initialize worker context, KPCR/ETHREAD identity, and TLS
+  -> execute generated synthetic callback under test-only ticket/generation/page leases
+  -> guest instructions register nested FS:[0] records
+       -> normal return: unlink inner then outer, restore sentinel
+       -> test-only ordinal 258: managed GuestThreadTermination exits without returning
+  -> worker marks exit, clears context/authorization, and finalizes owned guest memory
+  -> host joins; registry, tickets, callbacks, and allocations return to baseline
+
+Cancellation or failed admission/launch -> rollback registration -> join if launched -> finalize once.
+```
+
+The Apple production boundary remains intact: `CallGuestCallback` validates its ticket, stack, target and leases, then returns `kExecutionDisabled` on Apple. Production `CallGuest` traps. `CallGuestCallbackForTest` and the synthetic worker authorization are test-macro gated; the test path does not substitute for the production Apple callback. `Boot()` was not invoked or changed.
+
+### Authentic handler and instruction inventory
+
+Static translation expanded the bounded system map through `0x00319920`: 10 configured functions and 249 instructions. No generated code was executed. The map records these unsupported forms:
+
+| Form | Count | Classification |
+|---|---:|---|
+| `CLD` | 1 | Missing checked instruction support; handler execution forbidden. |
+| `TEST dword [EAX+4], 0x06` | 1 | Missing checked form; handler execution forbidden. |
+| `JMP` | 3 | Missing checked branch forms in this bounded map, including branches to `0x00319922`; handler execution forbidden. |
+| `PUSH` / `POP` | 1 each | Missing forms in the bounded map; handler execution forbidden. |
+| `INT3` | 1 | Intentionally trapped; no continuation was added. |
+
+The handler at `0x00319858` has direct calls to `0x00317888`, `0x003178CA`, and `0x0031795E`. The first path reaches `0x00323BDE`, whose `JMP [0x003C9EE4]` resolves statically to kernel ordinal 312 (`RtlUnwind`). The handler also has dynamic `CALL EAX` sites at `0x003198AA` and `0x003198F2`; their targets and signatures depend on guest data. Other accesses index data through `[EDI+ECX*4+4]` and `[EDI+ECX*4+8]`. The handler's body, dispositions, record/context layouts, and reachable targets are not validated. No handler, dynamic target, or authentic unwind ran.
+
+Local `RtlRaiseException` ordinal 302 and `RtlUnwind` ordinal 312 are not safe for authentic dispatch: their current code uses raw `R32`/`W32` and `HostPtr` scratch access, lacks a bounded/cycle-checked owner chain walk, and calls the handler through `CallGuest` without a callback ticket. `RtlUnwind` does not validate that its target record is reachable or transfer a checked target context/IP. Apple production `CallGuest` traps, but that gate does not make the preceding raw memory operations safe. These implementations remain unavailable to the authentic guest path.
+
+The later system-routine path is also blocked: `0x002B5C7E` is `CALL [EBP+8]` into the dynamic start routine; after return, `0x002B5C99` updates a frame word, `0x002B5CA0` calls ordinal 258 (`PsTerminateSystemThread`), and `0x002B5CA6` executes `INT3`. Local ordinal 258 delegates to managed `ExitThread` and is tested only through the synthetic bridge; authentic calling convention, frame ownership, and post-termination behavior are unvalidated. The authentic start routine `0x002B38A2` and all subsequent startup instructions remain unexecuted.
+
+### Protection import ABI
+
+| Ordinal | Registered export | Local HLE arity | Current behavior | Retail ABI status |
+|---:|---|---:|---|---|
+| 179 | `MmQueryAddressProtect` | 1 | Trap before guest arguments/output or page state are accessed. | Unknown: result shape, constants, address rules, and failure behavior. |
+| 182 | `MmSetAddressProtect` | 3 | Same fail-closed trap. | Unknown: return type, old-protection behavior, range rules, and side effects. |
+| 204 | `NtProtectVirtualMemory` | 4 | Same fail-closed trap. | Exact local export name is confirmed; retail parameter/return semantics remain unknown. |
+
+Static callers at `0x002B5942`, `0x002B5955`, and `0x002B5963` pass ESI and use ordinal 182 with `(ESI, 4, 4)` and `(ESI, 4, saved EAX)`, consistent with a query/change/restore pattern but not sufficient to assign semantics. Internal `mem::Protect` manages 4 KB software page permissions and waits for page leases; it is not evidence for these Xbox exports. The available [OpenXDK memory header](https://github.com/XboxDev/OpenXDK/blob/master/include/xboxkrnl/mm.h) is a non-retail declaration and does not establish the retail contract. No bounded bridge or unconditional-success stub was added.
+
+### Writable callback-table provenance
+
+The four authentic `CALL EAX` sites read these initial file-backed values. The source ranges are in writable `.data`; the target values fall in executable XBE sections. The D8 static map configured each unique pointer as a translation root and emitted a mapping for every initial nonzero value. This confirms the bytes are statically decodable from those requested starts; it does not independently establish natural function boundaries, runtime reachability, calling conventions, or callback ABI.
+
+| Call site | Pointer/table source | Initial contents | Static mapping result | Still unresolved |
+|---|---|---|---|---|
+| `0x002B57DC` | `[0x004720C8]` | `0x00316DA8` (zero skips) | 1 nonzero value emitted as a root. | Writer set, runtime target changes, signature/arguments. |
+| `0x002B57FB` | `[0x0041F94C,0x0041F964)` | 6 dwords: 5 nonzero, 1 zero | All 5 nonzero values emitted as roots. | Table order/meaning, writers, signatures/arguments. |
+| `0x002B581F` | `[0x0041E7F0,0x0041F948)` | 1,110 dwords: 867 unique nonzero, 243 zero, no `0xFFFFFFFF` | All 867 unique values emitted as roots. | Complete target set after mutation, writers, signatures/arguments. |
+| `0x002B5848` | `[0x0041E7E0,0x0041E7EC)` | 3 dwords: 2 nonzero, 1 zero | Both nonzero values emitted as roots. | Writers and callback contract. |
+
+Across the four ranges, all 875 unique initial nonzero values were included in `.local/ios-port/phase2d8-callback-targets/callback_targets.toml`; the ignored output contains 1,236 configured/transitively discovered functions and 24,063 instructions. The small table's exact sequence is zero, `0x003B0C6B`, `0x00317EFB`, `0x003195F1`, `0x00320602`, `0x0031BD3E`; the tail table is zero, `0x0031BBA5`, `0x0031F04D`. This is a translation inventory, not a validated execution graph. No complete cross-image writer proof or pointer-signature proof exists. Existing checked register-indirect dispatch enforces ticket, generation, worker ownership, and page leases for admitted calls; it does not authorize any authentic table target.
+
+### Checked-instruction readiness for this dependency slice
+
+| Dependency/instruction forms | Classification | Evidence and limit |
+|---|---|---|
+| Prologue `PUSH`, `MOV`, `LEA`, `SUB`, FS-relative load/store, and `RET` | **Implemented but not validated for authentic execution** | The checked forms emit the static helper; general fixture coverage exists, while the actual stack/flag transformation was only statically reconciled. |
+| `CALL [EBP+8]` at `0x002B5C7E`, `OR [EBP-4],-1` at `0x002B5C99`, and checked ordinal-258 bridge | **Already supported and verified for synthetic use** | Prior synthetic callback/termination fixtures cover checked dispatch; authentic target, frame, and import contracts remain unvalidated. |
+| `CALL EAX` at `0x003198AA` / `0x003198F2` | **Implemented but not validated for authentic execution** | Generic register-indirect dispatch exists; runtime target and ABI are unresolved and no authentic target is authorized. |
+| `CLD`, `TEST dword [EAX+4],6`, bounded-map `JMP`, `PUSH`, and `POP` forms in handler | **Missing implementation** | Listed in the 10-function/249-instruction static handler inventory; handler remains forbidden. |
+| `INT3`, authentic handler dispatch, production Apple execution, and the three protection exports | **Intentionally forbidden** | They remain trapped/disabled; no permissive substitutes were introduced. |
+
+Expanded static handler translation output is kept only under `.local/ios-port/phase2d8-static-review/generated-system-expanded/`.
+
+### Updated readiness matrix
+
+| Dependency | Classification | Evidence and limit |
+|---|---|---|
+| Synthetic guest record layout, FS chain linking/unlinking, bounds, cycle/depth and handler-map validation | **Already supported and verified for test-only use** | Generated synthetic guest instructions plus checked read-only validator and deterministic worker teardown tests. No exception delivery. |
+| Authentic prologue `0x00319804` and checked return to `0x002B5C1B` | **Implemented instruction forms; authentic execution not validated** | Static stack accounting reconciles the copied return and new frame; analogous fixture only. |
+| Authentic handler `0x00319858`, its dynamic calls and dispositions | **Missing implementation; intentionally forbidden** | Unsupported forms and unresolved target/context ABI; no dispatch. |
+| `RtlRaiseException` 302 / `RtlUnwind` 312 | **Missing safe checked implementation; intentionally forbidden** | Existing raw guest memory access and unbounded chain/unticketed handler call remain unsafe. |
+| Protection exports 179/182/204 | **Intentionally forbidden** | Local HLE traps; authoritative retail contract unavailable. |
+| Four writable callback tables | **Initial static values inspected; authentic calls unvalidated** | Every initial pointer is statically translated from a configured root, but writer coverage and ABI are unknown. |
+| Synthetic single-worker prepare/activate/return/terminate/join/finalize | **Already supported and verified for synthetic tests** | Debug and Release fixtures include nested records, normal LIFO return, ordinal-258 termination, deterministic teardown, and resource-baseline checks. |
+| Apple production guest execution and `Boot()` | **Intentionally forbidden** | `kExecutionDisabled`/production `CallGuest` trap remain unchanged; neither `Boot()` nor an authentic worker was invoked. |
+
+### Validation and delivery
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Full recompiler-fixtures and memory CMake builds | PASS | PASS |
+| `checked_recompiler_tests` | 628 PASS / 0 FAIL | 628 PASS / 0 FAIL |
+| Safe recompiler-fixture CTests | 5/5 passed | 5/5 passed |
+| Memory/worker CTest | 1/1 passed | 1/1 passed |
+| Static real-image validators and preflights | 5/5 passed | 5/5 passed |
+
+The five static checks are root and secondary `--static-real assets/default.xbe` validation plus the root, secondary, and integrated `--preflight` tools. The integrated preflight retains the frozen 143-instruction report and ends with zero workers/resources. The default `execution_probe_secondary_tests` CTest was deliberately excluded because its default child path executes copied authentic secondary guest instruction steps; its static-only mode and secondary real preflight both passed. No authentic XBE instruction, start routine, handler, table target, or worker was executed. Phase 2C-41 evidence was not rerun. No Android ARM64 check was needed because no shared production source changed.
+
+**Development:** bounded synthetic SEH registration/removal and lifecycle integration implemented. **Validation:** Debug/Release synthetic and applicable static suites pass. **Integration scope:** `feature/ios-port`; no force-push or `main` merge. Before the D8 commit, the fetched feature base was 81 commits ahead and 0 behind `origin/main` at `87b951ea8cdfd39852e7138fa236830217d149ad`; `origin/feature/ios-port` matched the expected base. **Customer release:** not performed; game boot and authentic guest-thread concurrency are not claimed.
+
+**Next packages, ranked by dependency and risk:** (1) define and test a checked, ticketed synthetic exception-dispatch/`RtlUnwind` contract, including complete context and reachable target validation, before considering any handler call; (2) obtain authoritative retail semantics for protection ordinals 179/182/204 and implement only the proven bounded behavior; (3) trace callback-table writers and argument contracts, then bind authentic targets to explicit policy; (4) reconcile the system epilogue's ETHREAD+`0x250` object and authentic ordinal-258 termination/`INT3` behavior; (5) only after those gates, prepare a separately authorized one-authentic-worker readiness review. **Recommendation: NO-GO for authentic single-worker execution; GO for the bounded synthetic checked-dispatch and ABI-evidence packages.**

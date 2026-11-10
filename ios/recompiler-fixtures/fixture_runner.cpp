@@ -20,6 +20,7 @@
 #include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
+#include "kernel/guest_exception_chain.h"
 #include "kernel/memory.h"
 #include "kernel/synthetic_worker.h"
 #include "kernel/thread_memory.h"
@@ -51,6 +52,11 @@ bool g_callback_fake_release = false;
 size_t g_callback_page_mutation_waits = 0;
 std::array<uint32_t, 17> g_callback_fake_stack{};
 size_t g_callback_fake_stack_words = 0;
+kernel::ThreadRef g_seh_validation_thread;
+std::atomic<kernel::GuestExceptionChainStatus> g_seh_validation_status{kernel::GuestExceptionChainStatus::kInvalidOwner};
+std::atomic<uint32_t> g_seh_validation_count{0};
+std::atomic<uint32_t> g_seh_validation_calls{0};
+std::atomic<uint32_t> g_seh_handler_calls{0};
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
 std::mutex g_synthetic_hook_lock;
 std::condition_variable g_synthetic_hook_cv;
@@ -191,6 +197,13 @@ void SyntheticGuestCallback(X86Context& ctx, uint8_t*) {
     g_callback_fake_stack_ok.store(g_callback_fake_stack_words <= g_callback_fake_stack.size() &&
                                    mem::Read(ctx.esp, g_callback_fake_stack.data(),
                                              g_callback_fake_stack_words * sizeof(uint32_t)) == mem::AccessStatus::kOk);
+    if (g_seh_validation_thread) {
+        const kernel::GuestExceptionChainValidation validation = kernel::ValidateGuestExceptionChain(
+            ctx, *g_seh_validation_thread);
+        g_seh_validation_status = validation.status;
+        g_seh_validation_count = validation.frame_count;
+        ++g_seh_validation_calls;
+    }
     std::unique_lock lock(g_callback_fake_lock);
     if (g_callback_fake_pause) {
         g_callback_fake_entered = true;
@@ -198,6 +211,13 @@ void SyntheticGuestCallback(X86Context& ctx, uint8_t*) {
         g_callback_fake_changed.wait(lock, [] { return g_callback_fake_release; });
     }
     ctx.eax = 0xAABBCCDD;
+}
+
+void SyntheticSehHandlerMustNotRun(X86Context&, uint8_t*) { ++g_seh_handler_calls; }
+
+void SyntheticSehInspectionCallback(X86Context& ctx, uint8_t* base) {
+    SyntheticGuestCallback(ctx, base);
+    x86_checked_ret(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0, 0);
 }
 
 void CallbackPageMutationWaiting() {
@@ -927,10 +947,22 @@ void CheckGuestThreadLifecycle() {
 
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
 void CheckSyntheticWorkerLifecycle() {
-    constexpr uint32_t code_page = 0x90000;
+    constexpr uint32_t code_page = 0x11000;
     constexpr uint32_t target = code_page + 0x10;
+    constexpr uint32_t seh_inspection_target = code_page + 0x20;
     constexpr uint32_t other_target = code_page + 0x30;
+    constexpr uint32_t seh_normal_return_target = code_page + 0x880;
+    constexpr uint32_t seh_target = code_page + 0x40;
+    constexpr uint32_t seh_cycle_target = code_page + 0x50;
+    constexpr uint32_t seh_bad_head_target = code_page + 0x60;
+    constexpr uint32_t seh_reset_target = code_page + 0x70;
+    constexpr uint32_t seh_bad_handler_target = code_page + 0x80;
+    constexpr uint32_t seh_restore_handler_target = code_page + 0x90;
+    constexpr uint32_t seh_unlink_target = code_page + 0xA0;
+    constexpr uint32_t seh_terminate_target = code_page + 0xB0;
     constexpr uint32_t output_page = 0xA5000;
+    constexpr uint32_t seh_log = output_page + 0x200;
+    constexpr uint32_t seh_context = output_page + 0x100;
     constexpr uint32_t start_context = 0x13572468;
     constexpr uint32_t dynamic_start = 0x11299;
     constexpr uint32_t dynamic_callback = 0x112DF;
@@ -939,7 +971,20 @@ void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t integrated_mode_slot = 0xA6040;
     constexpr uint32_t dynamic_argument = 0x2468ACE0;
     constexpr uint32_t dynamic_result = dynamic_argument + 0x35;
-    static const X86FuncMapping functions[] = {{target, sub_0001127E}, {other_target, sub_000110EF}};
+    static const X86FuncMapping functions[] = {
+        {target, sub_0001127E},
+        {seh_inspection_target, SyntheticSehInspectionCallback},
+        {other_target, SyntheticSehHandlerMustNotRun},
+        {seh_normal_return_target, sub_00011880},
+        {seh_target, sub_00011800},
+        {seh_cycle_target, sub_00011900},
+        {seh_bad_head_target, sub_00011920},
+        {seh_reset_target, sub_00011940},
+        {seh_bad_handler_target, sub_00011960},
+        {seh_restore_handler_target, sub_00011980},
+        {seh_unlink_target, sub_000119A0},
+        {seh_terminate_target, sub_000119E0},
+    };
     const dispatch::Metadata metadata{code_page, code_page + mem::kPage, target, functions, {}};
     std::string error;
     auto initialize = [&] {
@@ -990,6 +1035,23 @@ void CheckSyntheticWorkerLifecycle() {
         authorization.callback_ticket = callback_ticket;
         return kernel::ArmSyntheticWorker(authorization);
     };
+    auto arm_seh_nested = [&](uint32_t start, uint32_t context, uint32_t expected_exit,
+                              const kernel::GuestCallbackTicket& callback_ticket) {
+        kernel::GuestCallbackTicket start_ticket;
+        if (kernel::PrepareGuestCallback(start, kernel::GuestCallbackClass::kThreadStart, start_ticket) !=
+            kernel::GuestCallbackStatus::kReady)
+            return false;
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.context = context;
+        authorization.expected_exit = expected_exit;
+        authorization.code_base = code_page;
+        authorization.code_end = code_page + mem::kPage;
+        authorization.dispatch_generation = start_ticket.dispatch_generation;
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        authorization.callback_ticket = callback_ticket;
+        return kernel::ArmSyntheticWorker(authorization);
+    };
     auto clear_dynamic_output = [&] {
         return mem::Fill(output_page + 0x10, 0, 0x30) == mem::AccessStatus::kOk;
     };
@@ -1000,10 +1062,237 @@ void CheckSyntheticWorkerLifecycle() {
         return kernel::Wait({std::static_pointer_cast<kernel::Object>(thread)}, false, -100'000'000, false);
     };
     auto join_workers = [] { return kernel::StopKernelWorkers() && kernel::RestartKernelWorkers(); };
+    auto call_guest_for_test = [&](const kernel::ThreadRef& thread, X86Context& context, uint32_t callback) {
+        kernel::GuestCallbackTicket ticket;
+        const std::array<uint32_t, 1> arguments{0};
+        uint32_t result = 0;
+        try {
+            return kernel::PrepareGuestCallback(callback, kernel::GuestCallbackClass::kFixture, ticket) ==
+                       kernel::GuestCallbackStatus::kReady &&
+                   kernel::CallGuestCallbackForTest(context, ticket, callback, arguments,
+                                                    thread->stack_top - thread->stack_size, thread->stack_size,
+                                                    result) == kernel::GuestCallbackStatus::kInvoked;
+        } catch (const FixtureStop&) {
+            std::fprintf(stderr, "synthetic SEH fixture trap at %08X: %s\n", last_trap_pc,
+                         last_trap_reason.c_str());
+            return false;
+        }
+    };
 
     if (!initialize()) return;
     const mem::Stats baseline = mem::Query();
-    const uint32_t callbacks_before = g_callback_fake_calls.load();
+    uint32_t callbacks_before = g_callback_fake_calls.load();
+
+    {
+        kernel::ThreadRef thread;
+        if (!prepare(thread, target, 0, output_page)) return;
+        X86Context context{};
+        const bool context_ready = kernel::InitializePreparedThreadContextForTest(thread, context);
+        g_seh_validation_thread = thread;
+        g_callback_fake_pause = false;
+        g_seh_validation_calls = 0;
+        g_seh_handler_calls = 0;
+        mem::Fill(seh_log, 0, 0x40);
+        Check(context_ready && call_guest_for_test(thread, context, seh_target),
+              "generated synthetic guest instructions link two exception frames and inspect the live chain");
+
+        std::array<uint32_t, 8> log{};
+        mem::Read(seh_log, log.data(), sizeof(log));
+        uint32_t outer_words[2]{}, inner_words[2]{};
+        const bool records_read = log[0] && log[1] &&
+                                  mem::Read(log[0], outer_words, sizeof(outer_words)) == mem::AccessStatus::kOk &&
+                                  mem::Read(log[1], inner_words, sizeof(inner_words)) == mem::AccessStatus::kOk;
+        const auto valid = kernel::ValidateGuestExceptionChain(context, *thread);
+        Check(records_read && valid.status == kernel::GuestExceptionChainStatus::kValid &&
+                  valid.frame_count == 2 && g_seh_validation_status.load() == kernel::GuestExceptionChainStatus::kValid &&
+                  g_seh_validation_count.load() == 2 && log[2] == log[0] && log[3] == other_target &&
+                  outer_words[0] == 0xFFFFFFFF && outer_words[1] == other_target &&
+                  inner_words[0] == log[0] && inner_words[1] == other_target &&
+                  log[0] >= thread->stack_top - thread->stack_size && log[1] < thread->stack_top &&
+                  g_seh_handler_calls.load() == 0,
+              "checked chain validation confirms nested next/handler layout and never invokes handlers");
+
+        X86Context wrong_owner = context;
+        wrong_owner.fs_base++;
+        Check(kernel::ValidateGuestExceptionChain(wrong_owner, *thread).status ==
+                  kernel::GuestExceptionChainStatus::kInvalidOwner,
+              "exception chain validation rejects an FS base outside the owning KPCR");
+
+        Check(call_guest_for_test(thread, context, seh_cycle_target) &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kCycle,
+              "generated guest corruption that creates a cyclic registration chain is rejected");
+        Check(call_guest_for_test(thread, context, seh_reset_target) &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kValid,
+              "generated guest unlink restores the exception-chain sentinel");
+
+        Check(call_guest_for_test(thread, context, seh_target) &&
+                  call_guest_for_test(thread, context, seh_bad_head_target) &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kInvalidFrame,
+              "generated guest corruption that points outside its stack is rejected");
+        Check(call_guest_for_test(thread, context, seh_reset_target) && call_guest_for_test(thread, context, seh_target) &&
+                  call_guest_for_test(thread, context, seh_bad_handler_target) &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kUnmappedHandler,
+              "generated guest corruption that installs an unmapped handler is rejected");
+        Check(call_guest_for_test(thread, context, seh_restore_handler_target) &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kValid &&
+                  call_guest_for_test(thread, context, seh_unlink_target) &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).frame_count == 0,
+              "generated guest LIFO removal restores the original sentinel");
+
+        g_seh_validation_status = kernel::GuestExceptionChainStatus::kInvalidOwner;
+        g_seh_validation_count = 0;
+        g_seh_validation_calls = 0;
+        mem::Fill(seh_log, 0, 0x40);
+        Check(call_guest_for_test(thread, context, seh_normal_return_target) &&
+                  g_seh_validation_status.load() == kernel::GuestExceptionChainStatus::kValid &&
+                  g_seh_validation_count.load() == 2 && g_seh_validation_calls.load() == 1 &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kValid &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).frame_count == 0 &&
+                  [&] {
+                      uint32_t restored_head = 0;
+                      return mem::Read(seh_log + 0x18, &restored_head, sizeof(restored_head)) ==
+                                 mem::AccessStatus::kOk &&
+                             restored_head == 0xFFFFFFFF;
+                  }(),
+              "generated guest normal return unlinks nested frames in LIFO order and restores fs:[0]");
+
+        Check(mem::Protect(thread->kpcr, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kMemoryUnavailable &&
+                  mem::Protect(thread->kpcr, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+              "checked chain validation rejects a protected KPCR page");
+        const uint32_t stack_page = (thread->stack_top - 1) & ~(mem::kPage - 1);
+        Check(mem::Protect(stack_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kMemoryUnavailable &&
+                  mem::Protect(stack_page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+              "checked chain validation rejects a protected guest stack page");
+
+        const uint32_t old_kpcr = thread->kpcr, old_ethread = thread->ethread, old_stack = thread->stack_top;
+        Check(kernel::CancelPreparedThread(thread) && thread->ctx == nullptr &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kInvalidOwner,
+              "cancelled owner rejects its stale context before reading released guest state");
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        kernel::CloseHandle(handle);
+        g_seh_validation_thread.reset();
+
+        kernel::ThreadRef reused;
+        Check(prepare(reused, target, 0, output_page) && reused->kpcr == old_kpcr && reused->ethread == old_ethread &&
+                  reused->stack_top == old_stack,
+              "freed KPCR, ETHREAD, and stack allocations are reused by the next prepared guest thread");
+        X86Context reused_context{};
+        const bool reused_context_ready = kernel::InitializePreparedThreadContextForTest(reused, reused_context);
+        Check(reused_context_ready && kernel::ValidateGuestExceptionChain(reused_context, *reused).status ==
+                                          kernel::GuestExceptionChainStatus::kValid &&
+                  kernel::ValidateGuestExceptionChain(reused_context, *reused).frame_count == 0 &&
+                  kernel::ValidateGuestExceptionChain(context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kInvalidOwner,
+              "reused thread memory starts at the sentinel while the old context stays rejected");
+        Check(kernel::CancelPreparedThread(reused), "reused prepared thread releases all guest allocations");
+        mem::Read(output_page, &handle, sizeof(handle));
+        kernel::CloseHandle(handle);
+        Check(mem::Query().system_used == baseline.system_used,
+              "synthetic SEH validation returns guest system allocations to baseline");
+        Check(dispatch::Init(metadata, error), "SEH fixture dispatch generation renews after cancellation");
+    }
+
+    {
+        kernel::ThreadRef thread;
+        if (!prepare(thread, seh_normal_return_target, seh_context, output_page)) return;
+        const uint32_t handle = [&] {
+            uint32_t value = 0;
+            mem::Read(output_page, &value, sizeof(value));
+            return value;
+        }();
+        const uint32_t old_kpcr = thread->kpcr, old_ethread = thread->ethread, old_stack = thread->stack_top;
+        g_seh_validation_thread = thread;
+        g_seh_validation_status = kernel::GuestExceptionChainStatus::kInvalidOwner;
+        g_seh_validation_count = 0;
+        g_seh_validation_calls = 0;
+        g_callback_fake_stack_words = 0;
+        mem::Fill(seh_log, 0, 0x40);
+        {
+            std::lock_guard lock(g_callback_fake_lock);
+            g_callback_fake_pause = true;
+            g_callback_fake_entered = false;
+            g_callback_fake_release = false;
+            g_callback_page_mutation_waits = 0;
+        }
+        mem::SetPageMutationWaitHookForTest(CallbackPageMutationWaiting);
+        kernel::GuestCallbackTicket inspection_ticket;
+        const bool ticket_ready = kernel::PrepareGuestCallback(seh_inspection_target,
+                                                               kernel::GuestCallbackClass::kThreadStart,
+                                                               inspection_ticket) ==
+                                  kernel::GuestCallbackStatus::kReady;
+        const bool armed = ticket_ready &&
+                           arm_seh_nested(seh_normal_return_target, seh_context, seh_context, inspection_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        bool entered = false;
+        {
+            std::unique_lock lock(g_callback_fake_lock);
+            entered = g_callback_fake_changed.wait_for(lock, std::chrono::seconds(5), [] {
+                return g_callback_fake_entered;
+            });
+        }
+        auto range_lock = std::make_unique<mem::ScopedVirtualRangeLock>();
+        const uint32_t stack_page = (thread->stack_top - 1) & ~(mem::kPage - 1);
+        std::atomic<bool> decommit_done{false};
+        std::atomic<bool> decommit_ok{false};
+        std::thread stack_mutator([&] {
+            decommit_ok = mem::Decommit(stack_page, mem::kPage);
+            decommit_done = true;
+        });
+        bool mutation_waited = false;
+        {
+            std::unique_lock lock(g_callback_fake_lock);
+            mutation_waited = g_callback_fake_changed.wait_for(lock, std::chrono::seconds(5), [] {
+                return g_callback_page_mutation_waits >= 1;
+            });
+            g_callback_fake_release = true;
+            g_callback_fake_pause = false;
+        }
+        g_callback_fake_changed.notify_all();
+        stack_mutator.join();
+        mem::SetPageMutationWaitHookForTest(nullptr);
+        const bool stack_restored = decommit_ok.load() && mem::Commit(stack_page, mem::kPage);
+        range_lock.reset();
+        const uint32_t wait = started ? wait_thread(thread) : kernel::kTimeout;
+        const bool joined = join_workers();
+        uint32_t restored_head = 0;
+        const bool guest_chain_restored = mem::Read(seh_log + 0x18, &restored_head, sizeof(restored_head)) ==
+                                              mem::AccessStatus::kOk &&
+                                          restored_head == 0xFFFFFFFF;
+        X86Context stale_context{};
+        stale_context.fs_base = old_kpcr;
+        const auto retained = kernel::FromHandle(handle);
+        Check(started && entered && mutation_waited && decommit_done.load() && stack_restored && wait == kernel::kWait0 &&
+                  joined && g_seh_validation_status.load() == kernel::GuestExceptionChainStatus::kValid &&
+                  g_seh_validation_count.load() == 2 && g_seh_validation_calls.load() == 1 &&
+                  guest_chain_restored &&
+                  thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == seh_context &&
+                  thread->resources_released && !thread->ctx && !thread->ethread && !thread->kpcr && !thread->stack_top &&
+                  !thread->start_routine_ticket.target && retained.get() == thread.get() &&
+                  !mem::AllocationSize(old_ethread) && !mem::AllocationSize(old_kpcr) &&
+                  !mem::IsCommitted(old_stack - 1) &&
+                  kernel::ValidateGuestExceptionChain(stale_context, *thread).status ==
+                      kernel::GuestExceptionChainStatus::kInvalidOwner &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() &&
+                  mem::Query().system_used == baseline.system_used,
+              "one authorized worker returns through nested SEH unlink while page decommit waits, then releases all resources");
+        kernel::CloseHandle(handle);
+        g_seh_validation_thread.reset();
+        Check(dispatch::Init(metadata, error), "SEH worker dispatch leases unwind after normal completion");
+    }
+
+    callbacks_before = g_callback_fake_calls.load();
     kernel::ThreadRef completed_thread;
 
     {
@@ -1895,6 +2184,78 @@ void CheckSyntheticWorkerLifecycle() {
                   "ordinal-258 checked bridge disables after the shutdown test");
             if (!initialize()) return;
         }
+    }
+
+    {
+        ResetKernel258Gate(true);
+        const uint32_t exit_status = seh_context;
+        kernel::ThreadRef thread;
+        const bool bridge_ready = dispatch::SetKernel258FixtureBridge(true);
+        const bool prepared = bridge_ready && prepare(thread, seh_terminate_target, exit_status, output_page);
+        Check(prepared, "single synthetic worker prepares a guest-registered SEH frame before termination");
+        if (!prepared) {
+            ResetKernel258Gate(false);
+            return;
+        }
+        uint32_t handle = 0;
+        mem::Read(output_page, &handle, sizeof(handle));
+        const uint32_t old_kpcr = thread->kpcr;
+        mem::Fill(seh_log, 0, 0x40);
+        g_seh_validation_thread = thread;
+        g_seh_validation_status = kernel::GuestExceptionChainStatus::kInvalidOwner;
+        g_seh_validation_count = 0;
+        g_seh_validation_calls = 0;
+        g_callback_fake_pause = false;
+        const uint32_t term_calls_before = g_kernel258_calls.load();
+        const uint32_t terminate_thunk = dispatch::KernelThunkAddress(258);
+        const bool terminate_slot_ready = mem::Write(seh_context, &terminate_thunk, sizeof(terminate_thunk)) ==
+                                          mem::AccessStatus::kOk;
+        kernel::GuestCallbackTicket inspection_ticket;
+        const bool ticket_ready = kernel::PrepareGuestCallback(seh_inspection_target,
+                                                               kernel::GuestCallbackClass::kThreadStart,
+                                                               inspection_ticket) ==
+                                  kernel::GuestCallbackStatus::kReady;
+        const bool armed = terminate_slot_ready && ticket_ready &&
+                           arm_seh_nested(seh_terminate_target, exit_status, exit_status, inspection_ticket);
+        const bool started = armed && kernel::StartThread(thread);
+        const bool entered = started && WaitKernel258Entered();
+        Check(entered && g_seh_validation_status.load() == kernel::GuestExceptionChainStatus::kValid &&
+                  g_seh_validation_count.load() == 1 && g_seh_validation_calls.load() == 1,
+              "guest-requested termination reaches ordinal 258 while one checked frame remains registered");
+
+        std::atomic<bool> shutdown_done{false};
+        std::thread shutdown([&] {
+            mem::Shutdown();
+            shutdown_done = true;
+        });
+        const bool shutdown_started = kernel::WaitForKernelWorkersShutdownForTest(std::chrono::seconds(5));
+        auto range_lock = std::make_unique<mem::ScopedVirtualRangeLock>();
+        ReleaseKernel258Gate();
+        const uint32_t wait = entered ? wait_thread(thread) : kernel::kTimeout;
+        uint32_t post_termination_marker = 1;
+        const bool marker_read = mem::Read(seh_log + 4, &post_termination_marker, sizeof(post_termination_marker)) ==
+                                 mem::AccessStatus::kOk;
+        const bool exit_observed_before_free = thread->state.load() == kernel::ThreadState::kExited &&
+                                              thread->exit_code.load() == exit_status && !shutdown_done.load();
+        range_lock.reset();
+        shutdown.join();
+        const auto retained = kernel::FromHandle(handle);
+        uint32_t stale_kpcr = 0;
+        const mem::AccessStatus stale_read = mem::Read(old_kpcr, &stale_kpcr, sizeof(stale_kpcr));
+        const bool terminated = thread->resources_released && !thread->ethread && !thread->kpcr && !thread->stack_top &&
+                                !thread->ctx && !thread->start_routine_ticket.target &&
+                                !thread->system_routine_ticket.target;
+        Check(started && entered && shutdown_started && wait == kernel::kWait0 && marker_read &&
+                  post_termination_marker == 0 && exit_observed_before_free && shutdown_done.load() && terminated &&
+                  retained.get() == thread.get() && g_kernel258_calls.load() == term_calls_before + 1 &&
+                  kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() && !mem::IsInitialized() &&
+                  stale_read == mem::AccessStatus::kNotInitialized,
+              "guest termination unwinds host state before teardown frees the registered frame's KPCR and stack");
+        kernel::CloseHandle(handle);
+        g_seh_validation_thread.reset();
+        ResetKernel258Gate(false);
+        Check(dispatch::SetKernel258FixtureBridge(false), "synthetic SEH termination bridge disables after teardown");
+        dispatch::Reset();
     }
 
     kernel::StopKernelWorkers();
