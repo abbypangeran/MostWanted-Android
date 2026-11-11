@@ -4182,3 +4182,107 @@ The fixture grew from 798 to 812 assertions (+14): the production assessment and
 Gate B's remaining blockers are now small and explicit: a claim-bound authentic execution authorisation (a ticket/claim the worker can present at `0x002B5C0F`), checked indirect admission for the dynamic `0x002B5C7E` call, and an explicit decision on whether the entry boundary may run without retail exception delivery. The next substantial package should be the **first authorised, bounded authentic startup experiment** for exactly the 145-instruction entry boundary — not another synthetic feature phase — and must start from a separately approved execution record.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-19 — authentic-run harness and safety contract
+
+**`PHASE_2D19_AUTHENTIC_RUN_HARNESS = PASS`.** A separately gated experimental harness now enforces the first proposed authentic-run boundary at the generated dispatch layer. It is compiled only into dedicated fixture targets, is not reachable from the ordinary application, and cannot authorise authentic execution: `kAuthenticExecutionAuthorised` is false and the authentic admission path validates every binding and then refuses. The authentic image was **not** executed. The Phase 2C-41 record remains frozen and was not rerun or extended.
+
+### Exact boundary (independently confirmed)
+
+| Segment | Executed | Detail |
+|---|---:|---|
+| Parent root | 71 | CRT entry `0x002B3916` through `0x002B3986` (`pop esi`) |
+| Parent stop | 0 | `0x002B3987 ret`, entry refused before execution |
+| Child system routine | 35 | `0x002B5C0F` prologue/TLS fill through `0x002B5C76` |
+| Child SEH prologue | 19 | `0x00319804` registration and return |
+| Child pre-start walk | 17 | `0x002B597D` empty-list path, imports 277/294 |
+| Child start-call setup | 2 | `0x002B5C7B push [ebp+0x0C]`, `0x002B5C7E call [ebp+0x08]` |
+| Child stop | 0 | target `0x002B38A2`, entry refused before execution |
+| **Total executed** | **144** | 71 parent + 73 child; 146 boundary steps including both stops |
+
+The Phase 2D-18 figure of 145 counted the parent stop step inside its "72 root instructions": the parent executes 71 instructions and the 72nd reviewed boundary entry is `0x002B3987`, which is refused. The child executes 73 instructions; the 74th boundary entry is `0x002B38A2`, refused. The `0x002B5C7E` indirect call retires (pushing return address `0x002B5C81`) and the callee entry executes zero instructions.
+
+### Why the stop is exact
+
+The experiment's recompiler config declares **one generated function per reviewed instruction** (`at = pc`, `end = pc + length`, `checked_memory = true`, no entry/gap/pointer/callback seeding). Every control transfer therefore leaves a generated function and re-enters through `x86_checked_call`, `x86_checked_jmp` or `x86_checked_ret`. The harness gate owns those boundaries:
+
+- the current reviewed node and the exact successor edge are checked;
+- the terminal edge is refused **before** the target function is entered (the call's return-address push is performed, then `AuthenticRunStop` is raised; no instruction of `0x002B38A2` executes);
+- transfer, kernel-call and instruction budgets stop before the over-budget boundary;
+- generation, image, claim, cancellation and shutdown checks run at every boundary;
+- the executable run is leased with `AcquireExecutableRun` and released at the stop, before the read-only SEH/TLS verification.
+
+No post-execution PC check and no return from an arbitrary generated function is used. The static preflight checks the generated mapping contains exactly the reviewed entry set and no `x86_icall` or direct host call in the route bodies.
+
+### Generated mapping and policy identity
+
+`ios/recompiler-fixtures/authentic_run_config.cpp` emits the experiment config; `xbe_recomp` produces 152 functions: 144 reviewed instructions plus 8 trap-only entries (the two stops, the SEH handler, and the reviewed forbidden branch arms `0x002B5CEC`, `0x002B3975`, `0x002B276C`, `0x002B5999`, `0x002B59A1`). The trap entries exist so every reviewed conditional target has a checked edge the gate can classify; they are never entered.
+
+`ios/recompiler-fixtures/authentic_run_preflight.cpp` decodes the real image, compares every reviewed instruction, branch target, kernel slot/encoding and startup datum, and with `--generated` checks the generated entry set and source. Result:
+
+| Item | Value |
+|---|---|
+| Image / title / entry / base | `f636a16a…4233`, `4541007B`, `002B3916`, `00010000` |
+| Parent / child executed | 71 / 73 |
+| Total executed / boundary steps | 144 / 146 |
+| Stops | `002B3987` (parent), `002B38A2` (child), both pre-instruction |
+| Kernel slots | 255/187/277/294 at their reviewed call sites |
+| Generated mapping | 152/152 entries, `00011000..003714D4`, identity `EC3486BCAFA498BF` |
+| Unchecked dispatch | none (`x86_icall` 0, direct host calls 0) |
+| Execution | **PROHIBITED** |
+
+### Authorisation capability
+
+`kernel::authentic::AuthorizationPolicy` binds the origin, role, reviewed manifest pointer and identity, XBE SHA-1, callback-policy identity, generated mapping identity, dispatch and memory generations, and separate parent/child budgets. `RunAuthorization` is move-only and names a slot bound to the exact `Thread*`, thread id, image and generations.
+
+- `AuthorizeAuthenticRun` validates the authentic image SHA-1, the compiled-in reviewed parent/child manifests, the callback-policy identity, the generated mapping identity, both generations and the worker gate. It then returns `kAuthenticExecutionNotAuthorised` because `kAuthenticExecutionAuthorised` is false. It creates no claim.
+- `AuthorizeRunForThread` (synthetic rehearsal only) arms a slot under `MOSTWANTED_AUTHENTIC_RUN_TESTS`; it is not compiled or callable in an ordinary build.
+- `RevokeRun` invalidates one claim; `CancelAllRuns` stops both workers at their next boundary; shutdown and generation changes fail closed.
+- The gate admits only exact reviewed edges and exact reviewed kernel calls; it cannot admit an unrelated callback or instruction.
+- `AssessAuthenticSystemThreadRequest` remains the production non-executing assessment. For an authentic-origin child, the harness additionally reuses it before binding the child claim.
+
+### SEH and kernel imports
+
+The child SEH frame is captured at the `0x002B5C16` call (`E`, previous `fs:[0]`, caller EBP) and verified read-only at the stop: live record, scope flag `-1`, scope table, saved ESP, caller EBP, chain position, handler resolution and the scope-table terminator. The 2D-18 prologue contract is unchanged. Retail exception delivery (`0x00319858`, `RtlRaiseException`/`RtlUnwind`) is not enabled: a checked memory fault while the frame is live becomes a stop report and the synthetic handler marker stays zero.
+
+The harness registers exact-name checked implementations for ordinals 255, 187, 277 and 294. The ordinal-255 bridge calls `PrepareSystemThreadEx`, the reviewed admission core, the child binding and `StartThread`; a rejected admission returns an NTSTATUS and creates no child worker. Ordinals 277/294 use checked memory: the object must be the reviewed `0x0046C8B0`, the wait list must be empty, the owner/recursion are validated and updated, and a contended or malformed section fails closed. No fabricated success is returned.
+
+### Diagnostics
+
+The trace records sequence, worker id, claim id, role, origin (`authentic-image` / `synthetic-fixture` / `static-preflight`), event (worker start, instruction entry, call/jump/return, kernel call/return, stop, violation, cancel, finalize), PC, target, ESP/EBP/EAX/ECX/EDX, instruction/transfer/kernel counts, SEH registration, TLS and stop status. No host pointers are recorded.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` (synthetic rehearsal) | 44 PASS / 0 FAIL | 44 PASS / 0 FAIL |
+| Repeat runs | 20 runs, 0 failures | 5 runs, 0 failures |
+| Checked recompiler fixture assertions | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Applicable safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, exit 0 | PASS, exit 0 |
+| `gate_b_preflight` (frozen 2D-18) | PASS, exit 0 | — |
+| Root / secondary / integrated `--preflight` | PASS, exit 0 | PASS, exit 0 |
+| Integrated frozen route | 143/143, stop `002B5C7B` | same |
+| Android ARM64 syntax (`dispatch.cpp`, `threads.cpp`, `worker_lifecycle.cpp`) | PASS | — |
+
+The synthetic suite covers: the full parent/child route and both stops; exact instruction/kernel counts; SEH and TLS verification; distinct worker/claim identities; failed child admission; budget overrun; forbidden conditional outcome; unreviewed kernel ordinal; unsupported instruction; uncommitted memory read; memory fault while the SEH frame is live (handler never called); parent and child cancellation; authorisation revocation before start; image/mapping/generation/shutdown refusals; finalisation with no remaining threads or workers.
+
+An exploratory full `ctest` invocation included `execution_probe_tests` and `execution_probe_secondary_tests`; those execute synthetic fixtures containing copies of authentic route bytes at audited addresses and are therefore excluded from the acceptance evidence (as in previous phases). The applicable evidence uses the five safe CTests above. No authentic XBE instruction and no authentic image-backed callback ran.
+
+### Gates
+
+| Gate | Result | Scope | Blocking conditions |
+|---|---|---|---|
+| A — authentic preparation | **GO** | prepare and inspect the image and thread structures without guest instructions | none |
+| B — bounded authentic execution | **NO-GO** | the 144-instruction entry boundary with both pre-instruction stops | authentic execution authorisation deliberately not granted; the authentic parent start switch is not enabled; imports 277/294 and the SEH registration have not been observed on the authentic path; retail SEH delivery remains prohibited |
+| C — authentic startup | **NO-GO** | start routine, initializer chain, list walk, termination | Gate B plus 867 initializer authorisations, CLI/STI, list callback, SEH 302/312, imports, scheduling |
+
+### Execution plan for the first authorised run (requires explicit user approval)
+
+1. Approve a scoped patch that sets `kAuthenticExecutionAuthorised = true` and arms the authentic parent/child slots through the reviewed manifests; nothing else changes.
+2. Rebuild the experiment mapping with `authentic_run_config` + `xbe_recomp`; run `authentic_run_preflight --generated <dir> <default.xbe>` and require exactly 152/152 entries and identity `EC3486BCAFA498BF` (or the reviewed replacement value printed by a superseding preflight).
+3. Confirm the ordinary app still returns `kExecutionDisabled` and `Boot()` is unchanged; keep the harness targets out of the app.
+4. On the target, prepare the parent thread, call the analysed ordinal-255 request, run the parent route and the child route, and stop at the two boundaries. Record the trace, both claims, the kernel observations, SEH registration, TLS state and cleanup.
+5. Stop both workers; verify no guest thread or worker remains, both claims are released and the image identity is unchanged. Do not extend the run past `0x002B38A2` or the parent ret without a new review.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

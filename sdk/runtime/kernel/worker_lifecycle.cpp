@@ -370,6 +370,18 @@ std::size_t WorkerLifecycle::OwnedCount() const {
 }
 
 #ifdef MOSTWANTED_KERNEL_WORKER_TESTS
+bool WorkerLifecycle::TasksFinishedForTest() const {
+    std::lock_guard lock(lock_);
+    for (const auto& worker : workers_) {
+        const State state = worker->state.load();
+        if (state != State::kQuiescing && state != State::kJoined && state != State::kResourcesReleased)
+            return false;
+    }
+    return true;
+}
+#endif
+
+#ifdef MOSTWANTED_KERNEL_WORKER_TESTS
 void WorkerLifecycle::FailNextStartForTest() {
     std::lock_guard lock(lock_);
     fail_next_start_ = true;
@@ -451,6 +463,7 @@ void FailNextKernelWorkerStartForTest() { g_kernel_workers.FailNextStartForTest(
 bool WaitForKernelWorkersShutdownForTest(std::chrono::milliseconds timeout) {
     return g_kernel_workers.WaitForShutdownStartedForTest(timeout);
 }
+bool KernelWorkerTasksFinishedForTest() { return g_kernel_workers.TasksFinishedForTest(); }
 #endif
 
 GuestDispatchLease::GuestDispatchLease() {

@@ -445,6 +445,103 @@ target_compile_definitions(vblank_runtime_tests PRIVATE
     MOSTWANTED_VBLANK_RUNTIME_TESTS=1
 )
 target_link_libraries(vblank_runtime_tests PRIVATE Threads::Threads)
+
+# Phase 2D-19: the synthetic rehearsal fixture for the authentic-run harness.
+# One generated function per reviewed instruction, so every transfer is a
+# checked dispatch boundary. This fixture contains no authentic instruction.
+add_executable(authentic_run_fixture_builder authentic_run_fixture_builder.cpp)
+set_property(TARGET authentic_run_fixture_builder PROPERTY CXX_STANDARD 20)
+target_include_directories(authentic_run_fixture_builder PRIVATE ${XBE_SDK}/runtime)
+set(AUTHENTIC_RUN_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/authentic_run_fixture)
+set(AUTHENTIC_RUN_FIXTURE_XBE ${AUTHENTIC_RUN_FIXTURE_DIR}/authentic_run_fixture.xbe)
+set(AUTHENTIC_RUN_FIXTURE_CONFIG ${AUTHENTIC_RUN_FIXTURE_DIR}/authentic_run_fixture.toml)
+add_custom_command(
+    OUTPUT ${AUTHENTIC_RUN_FIXTURE_XBE} ${AUTHENTIC_RUN_FIXTURE_CONFIG}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${AUTHENTIC_RUN_FIXTURE_DIR}
+    COMMAND authentic_run_fixture_builder ${AUTHENTIC_RUN_FIXTURE_XBE} ${AUTHENTIC_RUN_FIXTURE_CONFIG}
+    DEPENDS authentic_run_fixture_builder
+    VERBATIM
+)
+set(AUTHENTIC_RUN_FIXTURE_GENERATED_DIR ${AUTHENTIC_RUN_FIXTURE_DIR}/generated)
+set(AUTHENTIC_RUN_FIXTURE_GENERATED_SOURCE ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}/x86_recomp.0.cpp)
+add_custom_command(
+    OUTPUT ${AUTHENTIC_RUN_FIXTURE_GENERATED_SOURCE} ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}/x86_recomp_shared.h
+            ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}/x86_func_mapping.cpp
+    COMMAND $<TARGET_FILE:xbe_recomp> ${AUTHENTIC_RUN_FIXTURE_CONFIG} ${AUTHENTIC_RUN_FIXTURE_XBE}
+            ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}
+    DEPENDS xbe_recomp ${AUTHENTIC_RUN_FIXTURE_XBE} ${AUTHENTIC_RUN_FIXTURE_CONFIG}
+    VERBATIM
+)
+add_custom_target(generate_authentic_run_fixture DEPENDS ${AUTHENTIC_RUN_FIXTURE_GENERATED_SOURCE})
+
+add_executable(authentic_run_tests
+    authentic_run_tests.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/authentic_run.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
+    ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
+    ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/memory_protection.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
+    ${XBE_SDK}/runtime/kernel/crypto.cpp
+    ${XBE_SDK}/runtime/xbe/image_loader.cpp
+    ${AUTHENTIC_RUN_FIXTURE_GENERATED_SOURCE}
+    ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}/x86_func_mapping.cpp
+)
+add_dependencies(authentic_run_tests generate_authentic_run_fixture)
+target_compile_features(authentic_run_tests PRIVATE cxx_std_20)
+target_include_directories(authentic_run_tests PRIVATE ${XBE_SDK}/runtime ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}
+                            ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(authentic_run_tests PRIVATE
+    MOSTWANTED_AUTHENTIC_RUN_HARNESS=1
+    MOSTWANTED_AUTHENTIC_RUN_TESTS=1
+    MOSTWANTED_GUEST_CALLBACK_TESTS=1
+    MOSTWANTED_THREAD_PREPARATION_TESTS=1
+    MOSTWANTED_KERNEL_WORKER_TESTS=1
+    AUTHENTIC_RUN_FIXTURE_XBE="${AUTHENTIC_RUN_FIXTURE_XBE}"
+)
+target_link_libraries(authentic_run_tests PRIVATE Threads::Threads)
+
+# The authentic experiment's recompiler config and static boundary. The
+# generated authentic mapping is excluded from the default build; the static
+# preflight can inspect it when it is generated.
+add_executable(authentic_run_config authentic_run_config.cpp)
+target_compile_features(authentic_run_config PRIVATE cxx_std_20)
+target_include_directories(authentic_run_config PRIVATE ${XBE_SDK}/runtime)
+set(AUTHENTIC_RUN_DIR ${CMAKE_CURRENT_BINARY_DIR}/authentic_run)
+set(AUTHENTIC_RUN_CONFIG ${AUTHENTIC_RUN_DIR}/authentic_run.toml)
+set(AUTHENTIC_RUN_GENERATED_DIR ${AUTHENTIC_RUN_DIR}/generated)
+add_custom_command(
+    OUTPUT ${AUTHENTIC_RUN_CONFIG}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${AUTHENTIC_RUN_DIR}
+    COMMAND authentic_run_config ${AUTHENTIC_RUN_CONFIG}
+    DEPENDS authentic_run_config
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${AUTHENTIC_RUN_GENERATED_DIR}/x86_recomp.0.cpp
+           ${AUTHENTIC_RUN_GENERATED_DIR}/x86_func_mapping.cpp
+           ${AUTHENTIC_RUN_GENERATED_DIR}/x86_recomp_shared.h
+    COMMAND $<TARGET_FILE:xbe_recomp> ${AUTHENTIC_RUN_CONFIG} ${EXECUTION_PROBE_REAL_XBE} ${AUTHENTIC_RUN_GENERATED_DIR}
+    DEPENDS xbe_recomp ${AUTHENTIC_RUN_CONFIG}
+    VERBATIM
+)
+add_custom_target(generate_authentic_run_mapping
+    DEPENDS ${AUTHENTIC_RUN_GENERATED_DIR}/x86_recomp.0.cpp
+            ${AUTHENTIC_RUN_GENERATED_DIR}/x86_func_mapping.cpp)
+set_target_properties(generate_authentic_run_mapping PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+add_executable(authentic_run_preflight authentic_run_preflight.cpp ${XBE_SDK}/runtime/kernel/crypto.cpp)
+target_compile_features(authentic_run_preflight PRIVATE cxx_std_20)
+target_include_directories(authentic_run_preflight PRIVATE ${XBE_SDK}/runtime ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(authentic_run_preflight PRIVATE EXECUTION_PROBE_REAL_XBE="${EXECUTION_PROBE_REAL_XBE}")
+target_link_libraries(authentic_run_preflight PRIVATE Zydis)
+set_target_properties(authentic_run_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
 if(BUILD_TESTING)
     add_test(NAME checked_recompiler_tests COMMAND checked_recompiler_tests)
     add_test(NAME checked_fault_handler_tests COMMAND checked_fault_handler_tests)
@@ -452,4 +549,5 @@ if(BUILD_TESTING)
     add_test(NAME vblank_runtime_tests COMMAND vblank_runtime_tests)
     add_test(NAME execution_probe_tests COMMAND execution_probe_tests)
     add_test(NAME execution_probe_secondary_tests COMMAND execution_probe_secondary_tests)
+    add_test(NAME authentic_run_tests COMMAND authentic_run_tests)
 endif()

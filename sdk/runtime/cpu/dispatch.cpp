@@ -14,6 +14,9 @@
 #include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
+#ifdef MOSTWANTED_AUTHENTIC_RUN_HARNESS
+#include "kernel/authentic_run.h"
+#endif
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
 #include "kernel/synthetic_worker.h"
 #endif
@@ -23,6 +26,27 @@ namespace {
 dispatch::Table g_dispatch;
 std::shared_mutex g_dispatch_lock;
 uint64_t g_dispatch_generation = 1;
+uint64_t g_mapping_identity = 0;
+uint32_t g_mapping_count = 0;
+
+uint64_t ComputeMappingIdentity(const dispatch::Metadata& metadata) {
+    std::vector<uint32_t> entries;
+    entries.reserve(metadata.functions.size());
+    for (const X86FuncMapping& function : metadata.functions) entries.push_back(function.guest);
+    std::sort(entries.begin(), entries.end());
+    uint64_t hash = 0xCBF29CE484222325ull;
+    auto mix = [&hash](uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            hash ^= uint8_t(value >> shift);
+            hash *= 0x100000001B3ull;
+        }
+    };
+    mix(metadata.code_base);
+    mix(metadata.code_end);
+    mix(uint32_t(entries.size()));
+    for (uint32_t entry : entries) mix(entry);
+    return hash;
+}
 thread_local size_t g_call_lease_depth = 0;
 constexpr uint32_t kHostThunkBase = 0xFD000000;
 // synthetic guest addresses for kernel functions reached through a pointer
@@ -103,10 +127,14 @@ bool Init(const Metadata& metadata, std::string& error) {
     if (++g_dispatch_generation == 0) ++g_dispatch_generation;
     if (!g_dispatch.Initialize(metadata, error)) {
         g_dispatch.Reset();
+        g_mapping_identity = 0;
+        g_mapping_count = 0;
         lock.unlock();
         LOGE("dispatch: %s", error.c_str());
         return false;
     }
+    g_mapping_identity = ComputeMappingIdentity(metadata);
+    g_mapping_count = uint32_t(metadata.functions.size());
     LOGI("dispatch: %zu functions over %08X..%08X", metadata.functions.size(), metadata.code_base, metadata.code_end);
     return true;
 }
@@ -121,8 +149,13 @@ bool Init(std::string& error) {
 void Reset() {
     std::unique_lock<std::shared_mutex> lock(g_dispatch_lock);
     g_dispatch.Reset();
+    g_mapping_identity = 0;
+    g_mapping_count = 0;
     if (++g_dispatch_generation == 0) ++g_dispatch_generation;
 }
+
+uint64_t MappingIdentity() { return g_mapping_identity; }
+uint32_t MappingCount() { return g_mapping_count; }
 
 X86Func* Find(uint32_t guest) {
     if (g_call_lease_depth) return g_dispatch.Find(guest);
@@ -197,6 +230,12 @@ bool ResetWouldBlockForTest() {
 }  // namespace dispatch
 
 void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
+#if defined(MOSTWANTED_AUTHENTIC_RUN_HARNESS)
+    // A reviewed run never reaches the unchecked guest indirect path. Refuse
+    // before any mapping lookup so an unreviewed callback cannot execute.
+    if (kernel::authentic::GateActive())
+        x86_checked_trap(ctx, target, "unchecked guest indirect entry during an authentic run");
+#endif
 #if defined(__APPLE__) && !defined(MOSTWANTED_GUEST_CALLBACK_TESTS)
     (void)base;
     x86_trap(ctx, target, "guest indirect execution is disabled in Phase 2C-12");
@@ -231,9 +270,20 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
 
 namespace {
 
-void CheckedCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc) {
+void CheckedCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t call_pc,
+                 uint32_t kernel_slot_address = 0) {
     dispatch::CallLease lease;
     const dispatch::ResolvedTarget resolved = lease.Resolve(target);
+#if defined(MOSTWANTED_AUTHENTIC_RUN_HARNESS)
+    if (kernel::authentic::GateActive()) {
+        if (resolved.kind == dispatch::TargetKind::kKernelThunk) {
+            kernel::authentic::AdmitKernelCall(ctx, base, target, return_address, call_pc, kernel_slot_address);
+            return;
+        }
+        kernel::authentic::AdmitGeneratedTransfer(ctx, target, return_address, call_pc,
+                                                  kernel::authentic::TransferKind::kCall);
+    }
+#endif
 #ifdef MOSTWANTED_CHECKED_KERNEL_ABI_TESTS
     if (resolved.kind == dispatch::TargetKind::kKernelThunk) {
         if (FixtureBridge* bridge = FindFixtureBridge(target)) {
@@ -356,7 +406,7 @@ void CheckedIndirectCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32
         }
     }
 #endif
-    CheckedCall(ctx, base, target, return_address, call_pc);
+    CheckedCall(ctx, base, target, return_address, call_pc, slot_address);
 }
 
 }  // namespace
@@ -410,6 +460,15 @@ namespace {
 // not invent a call frame: the target's own RET completes the caller's frame.
 void CheckedTailJump(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t pc, uint32_t slot_address,
                      bool register_target) {
+#if defined(MOSTWANTED_AUTHENTIC_RUN_HARNESS)
+    if (kernel::authentic::GateActive()) {
+        const kernel::authentic::TransferKind kind =
+            slot_address ? kernel::authentic::TransferKind::kIndirectJump
+                         : (register_target ? kernel::authentic::TransferKind::kRegisterJump
+                                            : kernel::authentic::TransferKind::kJump);
+        kernel::authentic::AdmitGeneratedTransfer(ctx, target, 0, pc, kind);
+    }
+#endif
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
     if (kernel::SyntheticSessionArmed()) {
         dispatch::CallLease resolution;
@@ -484,6 +543,9 @@ void x86_checked_indirect_jmp(X86Context& ctx, uint8_t* base, uint32_t operand_a
 }
 
 void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
+#if defined(MOSTWANTED_AUTHENTIC_RUN_HARNESS)
+    if (kernel::authentic::GateActive()) kernel::authentic::AdmitGuestReturn(ctx, pc, pop_bytes);
+#endif
     if (X86CheckedCallFrame* frame = ctx.checked_call) {
         const uint32_t actual = x86_mem_read<uint32_t>(pc, ctx.esp);
         if (frame->returned || actual != frame->return_address) {

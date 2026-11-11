@@ -59,6 +59,11 @@ struct Metadata {
 
 bool Init(const Metadata& metadata, std::string& error);
 bool IsContinuation(uint32_t guest);
+// Identity of the exact generated mapping in use: a hash over the code range
+// and every function entry. The authentic-run harness binds an authorisation to
+// this value, so a different generated mapping cannot be admitted.
+uint64_t MappingIdentity();
+uint32_t MappingCount();
 #ifdef MOSTWANTED_GUEST_CALLBACK_TESTS
 bool ResetWouldBlockForTest();
 #endif

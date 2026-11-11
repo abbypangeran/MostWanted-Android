@@ -78,6 +78,7 @@ public:
     std::size_t JoinWaiterCountForTest() const;
     bool WaitForJoinInProgressForTest(std::chrono::milliseconds timeout);
     bool WaitForShutdownStartedForTest(std::chrono::milliseconds timeout);
+    bool TasksFinishedForTest() const;
 #endif
 
 private:
@@ -111,6 +112,10 @@ std::size_t KernelWorkerCountForTest();
 void HoldKernelWorkerActivationForTest(bool hold);
 void FailNextKernelWorkerStartForTest();
 bool WaitForKernelWorkersShutdownForTest(std::chrono::milliseconds timeout);
+// Every worker has returned from its task (its QuiesceOnExit has run) even if
+// its host thread has not been reaped yet. Test evidence for deterministic
+// finalisation without forcing a reap/restart.
+bool KernelWorkerTasksFinishedForTest();
 #endif
 
 class GuestDispatchLease {

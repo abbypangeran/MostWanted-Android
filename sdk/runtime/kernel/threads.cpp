@@ -6,6 +6,9 @@
 #include <utility>
 
 #include "kernel/kernel.h"
+#ifdef MOSTWANTED_AUTHENTIC_RUN_HARNESS
+#include "kernel/authentic_run.h"
+#endif
 #include "cpu/dispatch_table.h"
 #include "kernel/synthetic_worker.h"
 #include "kernel/thread_memory.h"
@@ -1363,6 +1366,12 @@ bool StartThread(ThreadRef t) {
                                                             start_arguments, stack_base, t->stack_size, code);
                             }
 #else
+#ifdef MOSTWANTED_AUTHENTIC_RUN_HARNESS
+                            if (authentic::ThreadHasBoundRun(t.get())) {
+                                callback_status = authentic::RunBoundWorker(ctx, *t);
+                                if (callback_status == GuestCallbackStatus::kInvoked) code = 0x2D190000u;
+                            } else
+#endif
                             callback_status =
                                 t->system_routine
                                     ? CallGuestCallback(ctx, t->system_routine_ticket, t->system_routine,
