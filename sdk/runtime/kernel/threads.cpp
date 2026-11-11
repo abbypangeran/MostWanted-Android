@@ -73,8 +73,6 @@ bool FailAt(ThreadPreparationFailPoint point) {
 #endif
 
 // guest structures per thread
-constexpr uint32_t kKpcrSize = 0x400;
-constexpr uint32_t kEthreadSize = 0x200;
 
 bool FinalizeThreadResources(const ThreadRef& thread, bool memory_shutdown);
 
@@ -152,7 +150,9 @@ bool SetupGuestBlocks(const ThreadRef& thread, uint32_t stack_size, uint32_t tls
         return false;
     }
 #endif
-    // TLS sits at the top of the stack: StackBase + tls_index * 4 must equal TlsData
+    // TLS sits at the top of the stack. The image CRT stores the negative
+    // dword index -(tls_size/4) and reads the block through FS:[4 + index*4]
+    // (002B3916, 002B37EE), so the block must end exactly at the stack top.
     t.tls = t.stack_top - tls_size;
 #ifdef __APPLE__
     const auto status = InitializeThreadGuestMemory(t.kpcr, t.ethread, t.stack_top, stack_size, t.tls, t.id);
@@ -163,22 +163,27 @@ bool SetupGuestBlocks(const ThreadRef& thread, uint32_t stack_size, uint32_t tls
     }
 #else
     uint32_t k = t.kpcr;
-    W32(k + 0x00, 0xFFFFFFFF);
-    W32(k + 0x04, t.stack_top);
-    W32(k + 0x08, t.stack_top - stack_size);
-    W32(k + 0x18, k);
-    W32(k + 0x1C, k);
-    W32(k + 0x20, k + 0x28);
-    G<uint8_t>(k + 0x24) = 0;
-    W32(k + 0x28, t.ethread);
+    W32(k + layout::kKpcrExceptionList, 0xFFFFFFFF);
+    W32(k + layout::kKpcrStackBase, t.stack_top);
+    W32(k + layout::kKpcrStackLimit, t.stack_top - stack_size);
+    W32(k + layout::kKpcrSelf, k);
+    W32(k + layout::kKpcrSelfPcr, k);
+    W32(k + layout::kKpcrPrcb, k + layout::kKpcrPrcbData);
+    G<uint8_t>(k + layout::kKpcrIrql) = 0;
+    W32(k + layout::kKpcrPrcbData + layout::kPrcbCurrentThread, t.ethread);
     uint32_t e = t.ethread;
-    G<uint8_t>(e + 0) = 6;
-    G<uint8_t>(e + 2) = uint8_t(kEthreadSize / 4);
-    W32(e + 0x1C, t.stack_top);
-    W32(e + 0x20, t.stack_top - stack_size);
-    W32(e + 0x28, t.tls);
-    W32(e + 0x12C, t.id);
+    G<uint8_t>(e + layout::kThreadHeaderType) = 6;
+    G<uint8_t>(e + layout::kThreadHeaderSize) = uint8_t(kEthreadSize / 4);
+    W32(e + layout::kThreadStackBase, t.stack_top);
+    W32(e + layout::kThreadStackLimit, t.stack_top - stack_size);
+    W32(e + layout::kThreadTlsData, t.tls);
+    W32(e + layout::kThreadUniqueThread, t.id);
 #endif
+    if (!ValidateThreadGuestMemory(t.kpcr, t.ethread, t.stack_top, stack_size, t.tls, t.id)) {
+        LOGE("thread: guest KPCR/ETHREAD read-back mismatch");
+        FreeGuestBlocks(t);
+        return false;
+    }
     return true;
 }
 

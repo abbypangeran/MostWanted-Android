@@ -569,6 +569,35 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
                      0xA3, 0x4C, 0x53, 0x0A, 0x00, 0x8B, 0x45, 0x08, 0x89,
                      0xEC, 0x5D, 0xC2, 0x04, 0x00});
     append_function({0xE8, 0xFB, 0xFE, 0xFF, 0xFF, 0xC3});                    // 0x11F8D direct caller
+    // Phase 2D-14: startup-thread layout probe. Reads the TLS block through the
+    // negative dword index the image CRT stores (002B3916), then the KPCR/KPRCB
+    // fields the authentic start routine touches. Addresses are asserted by
+    // fixture_runner.cpp.
+    append_function({
+        0x64, 0xA1, 0x04, 0x00, 0x00, 0x00,             // 0x11F93 mov eax, fs:[4] (stack top)
+        0x8B, 0x0D, 0x00, 0x01, 0x0A, 0x00,             // mov ecx, [0xA0100] (negative dword index)
+        0x8B, 0x44, 0x88, 0x00,                         // mov eax, [eax+ecx*4] (TLS block)
+        0xA3, 0x00, 0x00, 0x0A, 0x00,                   // save the indexed TLS slot
+        0x64, 0xA1, 0x28, 0x00, 0x00, 0x00,             // mov eax, fs:[0x28] (current ETHREAD)
+        0x8B, 0x50, 0x28,                               // mov edx, [eax+0x28] (TlsData)
+        0x89, 0x15, 0x04, 0x00, 0x0A, 0x00,             // save TlsData
+        0x89, 0x12,                                     // mov [edx], edx (module TLS pointer)
+        0x8B, 0x0A,                                     // mov ecx, [edx] (read the write back)
+        0x89, 0x0D, 0x18, 0x00, 0x0A, 0x00,             // save the read-back slot
+        0x8B, 0x7A, 0x04,                               // mov edi, [edx+4] (initialisation data)
+        0x89, 0x3D, 0x08, 0x00, 0x0A, 0x00,             // save the raw dword
+        0x8B, 0x72, 0x08,                               // mov esi, [edx+8] (zero fill)
+        0x89, 0x35, 0x0C, 0x00, 0x0A, 0x00,             // save the zero dword
+        0x64, 0xA1, 0x20, 0x00, 0x00, 0x00,             // mov eax, fs:[0x20] (KPRCB)
+        0x8B, 0x80, 0x50, 0x02, 0x00, 0x00,             // mov eax, [eax+0x250] (unresolved slot)
+        0xA3, 0x10, 0x00, 0x0A, 0x00,                   // save the unresolved slot
+        0x85, 0xC0,                                     // test eax, eax
+        0x74, 0x09,                                     // jz skip the guarded descriptor read
+        0x8B, 0x48, 0x24,                               // mov ecx, [eax+0x24] (unresolved field)
+        0x89, 0x0D, 0x14, 0x00, 0x0A, 0x00,             // save the guarded read
+        0xB8, 0x93, 0x93, 0x93, 0x93,                   // mov eax, 0x93939393
+        0xC2, 0x04, 0x00                                // ret 4
+    });
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(header_size + code.size(), 0);
     std::copy_n("XBEH", 4, image.begin());

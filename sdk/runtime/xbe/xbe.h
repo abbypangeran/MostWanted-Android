@@ -37,6 +37,19 @@ struct Tls {
     uint32_t data_start = 0, data_end = 0, index_addr = 0, callbacks = 0, zero_fill = 0, characteristics = 0;
 };
 
+// One dword per module index in front of the initialisation data.
+inline constexpr uint32_t kTlsSlotBytes = 4;
+
+// The CRT's own computation (002B3916): align16(zero_fill + data_end - data_start)
+// plus the index slot. The loader must agree with it, or the negative index the
+// CRT stores at the directory's index address will not address the block.
+inline uint32_t TlsBlockSize(const Tls& tls) {
+    if (tls.data_end < tls.data_start) return 0;
+    const uint64_t body = uint64_t(tls.data_end - tls.data_start) + tls.zero_fill;
+    if (body > UINT32_MAX - 15 - kTlsSlotBytes) return 0;
+    return uint32_t((body + 15) & ~uint64_t(15)) + kTlsSlotBytes;
+}
+
 struct Image {
     std::vector<uint8_t> file;
     uint32_t base = 0, header_size = 0, image_size = 0;

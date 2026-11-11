@@ -25,6 +25,7 @@
 #include "kernel/memory.h"
 #include "kernel/synthetic_worker.h"
 #include "kernel/thread_memory.h"
+#include "xbe/xbe.h"
 #include "x86_recomp_shared.h"
 
 namespace kernel {
@@ -1628,6 +1629,182 @@ void CheckPersistentSyntheticCallbacks() {
     }
     Check(kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty() && mem::Query().system_used == baseline.system_used,
           "persistent callback fixture returns to its worker and allocation baseline");
+}
+
+// Phase 2D-14: the startup-thread memory contract. The generated probe at
+// 0x11F93 reproduces the accesses authentic startup code makes: FS:[4] with the
+// CRT's negative dword TLS index, KTHREAD+0x28, and the unresolved KPRCB+0x250.
+void CheckStartupThreadLayout() {
+    constexpr uint32_t code_page = 0x11000;
+    constexpr uint32_t output_page = 0xA0000;
+    constexpr uint32_t probe = 0x11F93;
+    constexpr uint32_t probe_context = 0xC0DE1401;
+    constexpr uint32_t probe_exit = 0x93939393;
+    constexpr uint32_t slot_out = 0xA0000, tls_out = 0xA0004, raw_out = 0xA0008;
+    constexpr uint32_t zero_out = 0xA000C, prcb250_out = 0xA0010, thread24_out = 0xA0014;
+    constexpr uint32_t slot_readback_out = 0xA0018;
+    constexpr uint32_t index_in = 0xA0100;
+    constexpr uint32_t raw_source = 0x11223344;
+    constexpr uint32_t slot_sentinel = 0x5A5A5A5A;
+    constexpr uint32_t thread24_sentinel = 0xDEADBEEF;
+    constexpr uint32_t handle_out = 0xA0040, id_out = 0xA0044;
+
+    // the real image's directory: no initialisation data, 0x90 bytes of zero
+    // fill, so the CRT-sized block is 0x94 and its index is -37.
+    xbe::Tls image_tls;
+    image_tls.zero_fill = 0x90;
+    Check(xbe::TlsBlockSize(image_tls) == 0x94, "the loader derives the authentic 0x94 TLS block from the image directory");
+
+    xbe::Tls tls_dir;
+    tls_dir.data_start = 0x40000;
+    tls_dir.data_end = 0x40004;
+    tls_dir.zero_fill = 0x1C;
+    const uint32_t tls_size = xbe::TlsBlockSize(tls_dir);
+    Check(tls_size == 0x24, "the loader rounds the TLS block to 16 bytes and adds the index slot");
+    xbe::Tls backwards = tls_dir;
+    backwards.data_start = 0x40008;
+    backwards.data_end = 0x40000;
+    xbe::Tls oversized;
+    oversized.zero_fill = UINT32_MAX;
+    Check(xbe::TlsBlockSize(backwards) == 0 && xbe::TlsBlockSize(oversized) == 0,
+          "a reversed or overflowing TLS directory produces no block");
+
+    std::string error;
+    const bool ready = mem::Init() && mem::Commit(code_page, mem::kPage) && mem::Commit(output_page, mem::kPage) &&
+                       mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                       dispatch::Init(error) && kernel::RestartKernelWorkers();
+    Check(ready, "startup-thread layout fixture memory, dispatch and workers initialize");
+    if (!ready) return;
+    const mem::Stats baseline = mem::Query();
+    auto generation = [] {
+        dispatch::CallLease lease;
+        return lease.Generation();
+    };
+    auto prepare = [&](kernel::ThreadRef& thread, uint32_t stack_size, uint32_t tls_bytes, uint32_t start,
+                       uint32_t context) {
+        return kernel::PrepareSystemThreadEx(handle_out, stack_size, tls_bytes, id_out, start, context, false, 0,
+                                             thread) == kernel::kSuccess &&
+               bool(thread);
+    };
+    auto arm = [&](uint32_t start, uint32_t context) {
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.context = context;
+        authorization.expected_exit = probe_exit;
+        authorization.code_base = code_page;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = generation();
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        return kernel::ArmSyntheticWorker(authorization);
+    };
+    auto run = [&](const kernel::ThreadRef& thread) {
+        const bool started = kernel::StartThread(thread);
+        const uint32_t wait = started ? kernel::Wait({std::static_pointer_cast<kernel::Object>(thread)}, false,
+                                                     -100'000'000, false)
+                                      : kernel::kTimeout;
+        return started && wait == kernel::kWait0 && kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+    };
+    auto read = [](uint32_t address, uint32_t& value) {
+        return mem::Read(address, &value, sizeof(value)) == mem::AccessStatus::kOk;
+    };
+
+    {
+        kernel::DisarmSyntheticWorker();
+        kernel::ThreadRef thread;
+        const bool prepared = prepare(thread, 0x10000, tls_size, probe, probe_context);
+        const uint32_t ethread = prepared ? thread->ethread : 0;
+        const uint32_t kpcr = prepared ? thread->kpcr : 0;
+        const uint32_t stack_top = prepared ? thread->stack_top : 0;
+        const uint32_t tls = prepared ? thread->tls : 0;
+        Check(prepared && thread->state.load() == kernel::ThreadState::kPrepared && thread->tls == stack_top - tls_size &&
+                  tls % 4 == 0 && tls + tls_size == stack_top,
+              "the prepared thread places the TLS block immediately below StackBase");
+        Check(prepared && kernel::ValidateThreadGuestMemory(kpcr, ethread, stack_top, 0x10000, tls, thread->id),
+              "the production KPCR/ETHREAD layout reads back through the checked validator");
+        Check(prepared && kernel::R32(kpcr + kernel::layout::kKpcrSelf) == kpcr &&
+                  kernel::R32(kpcr + kernel::layout::kKpcrPrcb) == kpcr + kernel::layout::kKpcrPrcbData &&
+                  kernel::R32(kpcr + kernel::layout::kKpcrPrcbData + kernel::layout::kPrcbCurrentThread) == ethread &&
+                  kernel::R32(kpcr + kernel::layout::kKpcrPrcbData + kernel::layout::kPrcbUnresolved250) == 0 &&
+                  kernel::R32(ethread + kernel::layout::kThreadTlsData) == tls &&
+                  kernel::R32(ethread + kernel::layout::kThreadKernelStack) == 0,
+              "KPCR self/Prcb/CurrentThread agree and the unresolved KPRCB and KTHREAD slots stay zero");
+        std::array<uint8_t, 0x24> block{};
+        const bool zeroed = prepared && mem::Read(tls, block.data(), block.size()) == mem::AccessStatus::kOk &&
+                            std::all_of(block.begin(), block.end(), [](uint8_t value) { return value == 0; });
+        Check(zeroed, "a fresh thread's TLS block is zero before the system routine fills it");
+        const int32_t negative_index = -int32_t(tls_size / 4);
+        const uint32_t negative_index_bits = uint32_t(negative_index);
+        const bool seeded = prepared &&
+                            mem::Write(index_in, &negative_index_bits, sizeof(negative_index_bits)) == mem::AccessStatus::kOk &&
+                            mem::Write(tls, &slot_sentinel, sizeof(slot_sentinel)) == mem::AccessStatus::kOk &&
+                            mem::Write(tls + 4, &raw_source, sizeof(raw_source)) == mem::AccessStatus::kOk &&
+                            mem::Write(thread24_out, &thread24_sentinel, sizeof(thread24_sentinel)) == mem::AccessStatus::kOk;
+        Check(seeded, "the synthetic TLS index, module slot, initialisation dword and guard sentinel initialize");
+        const bool armed = seeded && arm(probe, probe_context);
+        const bool ran = armed && run(thread);
+        uint32_t slot = 0, tls_seen = 0, raw_seen = 0, zero_seen = 0, slot250 = 0, thread24 = 0;
+        uint32_t slot_readback = 0;
+        const bool read_back = ran && read(slot_out, slot) && read(tls_out, tls_seen) && read(raw_out, raw_seen) &&
+                               read(zero_out, zero_seen) && read(prcb250_out, slot250) && read(thread24_out, thread24) &&
+                               read(slot_readback_out, slot_readback);
+        Check(read_back && slot == slot_sentinel && tls_seen == tls && slot_readback == tls,
+              "generated FS:[4 + index*4] reads the TLS block's module slot and the guest rewrites it");
+        Check(raw_seen == raw_source && zero_seen == 0,
+              "the TLS block keeps its initialisation dword and zero fill at the loader's placement");
+        Check(slot250 == 0 && thread24 == thread24_sentinel,
+              "the unresolved KPRCB+0x250 slot stays null so authentic code takes its skip branch");
+        Check(ran && thread->state.load() == kernel::ThreadState::kExited && thread->exit_code.load() == probe_exit &&
+                  thread->resources_released && thread->ethread == 0 && thread->kpcr == 0 && thread->stack_top == 0 &&
+                  kernel::KernelWorkerCountForTest() == 0,
+              "the synthetic guest worker exits with its own status and releases the thread blocks once");
+        uint32_t handle = 0;
+        mem::Read(handle_out, &handle, sizeof(handle));
+        Check(handle != 0 && kernel::CloseHandle(handle) && kernel::Threads().empty(),
+              "closing the retained handle after completion releases the last reference");
+        kernel::DisarmSyntheticWorker();
+    }
+
+    {
+        kernel::ThreadRef thread;
+        const bool prepared = prepare(thread, 0x10000, tls_size, probe, probe_context);
+        const uint32_t kpcr = prepared ? thread->kpcr : 0;
+        const uint32_t ethread = prepared ? thread->ethread : 0;
+        const uint32_t stack_top = prepared ? thread->stack_top : 0;
+        const uint32_t tls = prepared ? thread->tls : 0;
+        const uint32_t zero = 0;
+        const bool valid = prepared && kernel::ValidateThreadGuestMemory(kpcr, ethread, stack_top, 0x10000, tls, thread->id);
+        const bool tampered = valid && mem::Write(kpcr + kernel::layout::kKpcrSelf, &zero, sizeof(zero)) == mem::AccessStatus::kOk;
+        const bool rejected_kpcr =
+            tampered && !kernel::ValidateThreadGuestMemory(kpcr, ethread, stack_top, 0x10000, tls, thread->id);
+        kernel::InitializeThreadGuestMemory(kpcr, ethread, stack_top, 0x10000, tls, thread->id);
+        const bool restored = rejected_kpcr && kernel::ValidateThreadGuestMemory(kpcr, ethread, stack_top, 0x10000, tls, thread->id);
+        const bool rejected_tls =
+            mem::Write(ethread + kernel::layout::kThreadTlsData, &zero, sizeof(zero)) == mem::AccessStatus::kOk &&
+            !kernel::ValidateThreadGuestMemory(kpcr, ethread, stack_top, 0x10000, tls, thread->id);
+        kernel::InitializeThreadGuestMemory(kpcr, ethread, stack_top, 0x10000, tls, thread->id);
+        Check(restored && rejected_tls, "the checked validator rejects a scribbled KPCR self pointer or TlsData");
+        Check(prepared && kernel::CancelPreparedThread(thread) && thread->resources_released && kernel::Threads().empty(),
+              "a prepared thread that never activates is cancelled and fully released");
+    }
+
+    {
+        kernel::ThreadRef thread;
+        const bool prepared = prepare(thread, 0x10000, tls_size, probe, probe_context);
+        const uint32_t bad_index = uint32_t(-int32_t(0x40000 / 4));
+        const bool seeded = prepared && mem::Write(index_in, &bad_index, sizeof(bad_index)) == mem::AccessStatus::kOk;
+        const bool armed = seeded && arm(probe, probe_context);
+        const bool ran = armed && run(thread);
+        Check(ran && thread->state.load() == kernel::ThreadState::kCancelled && thread->exit_code.load() == 0 &&
+                  thread->resources_released && thread->stack_top == 0 && kernel::KernelWorkerCountForTest() == 0,
+              "an out-of-range TLS index faults in the checked read and cancels the worker without leaking blocks");
+        uint32_t handle = 0;
+        mem::Read(handle_out, &handle, sizeof(handle));
+        if (handle) kernel::CloseHandle(handle);
+        kernel::DisarmSyntheticWorker();
+    }
+
+    Check(mem::Query().system_used == baseline.system_used,
+          "the startup-thread fixture returns to its allocation baseline");
 }
 #endif
 
@@ -6437,6 +6614,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckGuestThreadLifecycle();
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
     CheckPersistentSyntheticCallbacks();
+    CheckStartupThreadLayout();
     CheckSyntheticWorkerLifecycle();
 #endif
     mem::Shutdown();

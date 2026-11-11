@@ -3777,3 +3777,93 @@ The checked fixture grew from 681 to 703 assertions (+22). The integrated prefli
 The largest remaining gap is no longer repeated callback admission; it is **authentic worker and initializer readiness**. The next substantial package should be a static-plus-synthetic **start-routine memory/TLS layout review** that binds the 143-instruction frozen route to the initializer chain: validate the guest stack, TLS block, KPCR/ETHREAD fields and the `002B5C76`/`002B5C86` list-walk preconditions against the authentic image, and extend the session policy only where that review identifies a concrete missing admission contract. Authentic execution must remain separately authorized.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-14 — startup-thread memory environment
+
+**`PHASE_2D14_STARTUP_THREAD_LAYOUT = PASS`.** The runtime's KPCR/ETHREAD/TLS layout is now named, checked at creation and validated by generated synthetic guest code. The frozen 143-instruction Phase 2C-41 route is untouched and still passes its preflight; no authentic instruction ran in this phase.
+
+### Corrected earlier reading
+
+Phase 2D-9 recorded the system epilogue's `0x002B5BD9` access as `[ETHREAD+0x250]`. It is not: `FS:[0x20]` is `KPCR.Prcb` (`KPCR+0x28`), so the read is `[KPRCB+0x250]` = `[KPCR+0x278]`, inside the 0x400-byte KPCR. The ETHREAD stays 0x200 bytes and needs no enlargement.
+
+### Startup memory-access contract (static)
+
+| Access | PC | Effective address | Runtime state | Grade |
+|---|---|---|---|---|
+| `mov eax, fs:[0x20]` | `002B38AC` | `KPCR.Prcb` | `kpcr+0x28` | **verified** (Cxbx `KPCR`) |
+| `mov eax, [eax+0x250]` | `002B38B2` | `KPRCB+0x250` = `kpcr+0x278` | 0 (unresolved field) | **unresolved** |
+| `mov ecx, [eax+0x24]` | `002B38BC` | KTHREAD-like `+0x24` | 0 (`kThreadKernelStack`) | **unresolved** |
+| `mov eax, fs:[0x28]` | `002B38C8` | `KPRCB.CurrentThread` | ETHREAD | **verified** (`KeGetCurrentThread` returns the same pointer) |
+| `mov edi, fs:[4]` | `002B38CE` | `NT_TIB.StackBase` | stack top | **verified** |
+| `mov edx, [edi+edx*4]` | `002B38DB` | `[StackBase + tls_index*4]` | `[tls]` | **verified by `002B3916`** |
+| `sub edx, [eax+0x28]` | `002B38DE` | `KTHREAD.TlsData` | `tls` | **verified** (`002B5C28`) |
+| `mov byte [ecx], 1` / `[ecx+4]` | `002B38E1` / `002B38EA` | unresolved descriptor | not reached (`+0x250` null) | **unresolved** |
+| `mov eax, [0x8001003C]` | `002B5859` | first physical megabyte | not initialised | **unresolved, not on the build-5838 path** |
+
+`[KPRCB+0x250]` is read as a non-null object pointer by `002B38B2`, `002B596D`, `002B5BD9`, `002B83F6`, `0037927B` and `0039CD5F`; `0037927B` writes a `KTRAP_FRAME`-shaped block through `[obj+0x20]` and `002B5BD9` calls `[obj+0x14]`. That is not a KTHREAD (`KTHREAD+0x14` is `MutantListHead`), and no writer in the image sets the slot, so the runtime deliberately leaves both it and `KTHREAD+0x24` zero. Authentic code then takes its null branch at `002B38BA`; the block is neither skipped by accident nor faked into running.
+
+### TLS contract
+
+- The XBE TLS directory (`0x003ED3EC`) holds `data_start = 0`, `data_end = 0`, `index_addr = 0x004DF78C`, `zero_fill = 0x90`, no callbacks.
+- `002B3916` computes the per-thread block size as `align16(zero_fill + data_end - data_start) + 4` and stores the **negative dword index** `-(size/4)` at `0x004DF78C`; for this image that is `0x94` and `-37`.
+- `002B5C28` loads `[FS:0x28] -> KTHREAD+0x28` (TlsData), `002B5C31` writes `[TlsData] = TlsData+4`, then `rep movs` copies the raw data and `rep stos` applies the zero fill.
+- Therefore the TLS block is the topmost `tls_size` bytes of the thread stack, `StackBase == TlsData + tls_size`, and `[FS:4 + index*4]` resolves to `[TlsData]`. The runtime already placed it this way; what was missing was a checked derivation and a read-back guarantee. `PsCreateSystemThreadEx` (`002B5CA7`) passes exactly this size as argument 4 (`[0x004EDC74]`, set by `002B3916`), the thread id, start routine, context, packed flags and the fixed system routine `0x002B5C0F` as argument 10 — the vendored ordinal-255 mapping is correct.
+
+### Implemented checked layout
+
+- `sdk/runtime/kernel/thread_memory.h` now owns the guest KPCR/KTHREAD offsets as named constants (`layout::kKpcrSelf`, `kKpcrPrcb`, `kPrcbCurrentThread`, `kThreadTlsData`, `kThreadUniqueThread`, ...), documents every unresolved field at its offset, and adds `ValidateThreadGuestMemory`, which reads the 0x400/0x200 blocks back and rejects any mismatch.
+- `SetupGuestBlocks` uses those constants on both platform branches and fails thread creation if the read-back does not match, releasing the blocks. Behaviour on a valid thread is unchanged.
+- `xbe::TlsBlockSize` reproduces the CRT's own formula with overflow and reversed-range guards; `boot.cpp` uses it instead of open-coded arithmetic. The authentic image still yields `0x94`.
+- Fresh threads keep `[TlsData] == 0`: the loader must not pre-fill the block, because the authentic system routine owns it and Phase 2C-41's preflight checks the zero value.
+
+### Generated synthetic evidence
+
+The checked fixture gained one generated function at `0x11F93..0x11FF9`, run through the production `PrepareSystemThreadEx`/`StartThread` path with a synthetic TLS directory (`raw = 4`, `zero_fill = 0x1C`, block `0x24`):
+
+- `mov eax, fs:[4]`, `mov ecx, [negative index]`, `mov eax, [eax+ecx*4]` reads the module slot inside the TLS block, then the guest rewrites it through `KTHREAD+0x28`; the read-back matches.
+- `[TlsData+4]` returns the loader's initialisation dword and `[TlsData+8]` the zero fill.
+- `fs:[0x20] -> +0x250` returns 0 and the guarded `[eax+0x24]` read never executes.
+- The worker exits with the guest's own status `0x93939393`, `Prepared -> Active -> Exited`, blocks released once, handle retained until closed.
+- Negative runs: the validator rejects a scribbled `KPCR.SelfPcr` or `TlsData` and accepts the restored layout; a prepared thread is cancelled and released; an out-of-range negative TLS index faults in the checked read and cancels the worker with no leaked block.
+
+### Parent/child review
+
+`PsCreateSystemThreadEx` argument delivery and the fixed system routine `0x002B5C0F` are now verified, but the synthetic worker claim remains process-global and single. Two concurrent synthetic guest workers are not supported: the second `ClaimSyntheticWorker` is rejected by design. This is a scheduling limitation, not a layout one, and it is the next architectural package.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 721 PASS / 0 FAIL | 721 PASS / 0 FAIL |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Root / secondary / integrated self-test | 38 / 24 / 68 PASS | 38 / 24 / 68 PASS |
+| Root / secondary `--static-real` | PASS | PASS |
+| Root / secondary / integrated `--preflight` | PASS, exit 0 | PASS, exit 0 |
+| Integrated preflight route | 143/143 instructions, 72 + 71, hashes and four imports unchanged | same |
+| Android ARM64 syntax (`threads.cpp`, `boot.cpp`) | PASS | — |
+
+The checked fixture grew from 703 to 721 assertions (+18). Apple `kExecutionDisabled`, production `Boot()`, authentic start routine `0x002B38A2`, authentic callbacks, retail SEH and protection ordinals 179/182/204 are unchanged and still fail-closed.
+
+### Readiness after D14
+
+| Dependency | Evidence after D14 | Status |
+|---|---|---|
+| KPCR/ETHREAD layout | Named offsets, read-back validator, generated FS probe | implemented, synthetically validated |
+| `ETHREAD+0x250` | Corrected: the access is `KPRCB+0x250`; the owner remains unknown | unresolved |
+| XBE TLS size and placement | CRT formula matched for the real image (`0x94`), generated index/TLS probe | implemented, synthetically validated |
+| TLS raw copy and zero fill | The authentic system routine owns it; loader zero guarantee tested | guest-owned, synthetically validated |
+| `FS:[0x28]` / `FS:[4]` | Both exercised by generated code | implemented, synthetically validated |
+| Start-routine entry stack and callee saves | Frozen 143-instruction route unchanged | implemented, authentic (frozen) |
+| `PsCreateSystemThreadEx` ABI | Argument order verified at `002B5CA7`; TLS size global `0x4EDC74` | statically verified |
+| Two concurrent guest workers | Claim is process-global and single | unresolved, scheduler package |
+| 867 initializer targets, dynamic list callback, `00316DA8` | Phase 2D-12 policy only | unresolved |
+| Retail SEH 302/312, `00319858`, `002B5BD3` | No change | prohibited / unresolved |
+| `[0x8001003C]` physical-window global | Read-only, not on the build-5838 path | unresolved |
+| Protection 179/182/204 | Phase 2D-11 ABI only | fail-closed |
+
+### Remaining blockers and next package
+
+The next substantial package should be the **multi-worker execution-session architecture**: per-worker claim identities, deterministic scheduling and parent/child activation, so `PsCreateSystemThreadEx` can start the `0x002B5C0F` system routine as a second synthetic worker. The layout and TLS preconditions it depends on are now established and tested; the worker claim, dispatch identity and finalizer ownership are the remaining gaps.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

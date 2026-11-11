@@ -170,7 +170,7 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
     LoadPreviousRunData();
 
     uint32_t tls = 0;
-    if (img.tls_addr) tls = ((img.tls.data_end - img.tls.data_start + img.tls.zero_fill + 15) & ~15u) + 4;
+    if (img.tls_addr) tls = xbe::TlsBlockSize(img.tls);
     if (!StartKernelClock()) {
         LOGE("boot: kernel clock worker could not start");
         rollback_image();
