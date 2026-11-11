@@ -110,10 +110,11 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
     if (seh) out += "\tconst uint32_t x86_frame = ctx.esp;\n";
     if (seh || checked) out += "\ttry {\n";
     out += "\tX86_LOAD_FLAGS();\n\tuint32_t ca = 0, cb = 0;\n\t(void)ca; (void)cb;\n";
-    // code below the entry (a shared tail reached by a jump) is emitted first, so enter by label
+    // code below the entry (a shared tail reached by a jump) is emitted first, so enter by label.
+    // An empty body is a trap-only stub: it has no label, so it must not emit a goto.
     bool entry_first = !body.empty() && body.front() == entry;
-    if (!entry_first) out += F("\tgoto loc_%08X;\n", entry);
-    if (labels_.count(entry) && entry_first) out += F("loc_%08X:;\n", entry);
+    if (!body.empty() && !entry_first) out += F("\tgoto loc_%08X;\n", entry);
+    if (!body.empty() && labels_.count(entry) && entry_first) out += F("loc_%08X:;\n", entry);
     out += body_;
     if (checked) out += "\t} catch (const X86MemoryFault& fault) {\n\t\tx86_memory_fault(ctx, fault);\n";
     if (seh) out += "\t} catch (const X86Resume& r) {\n\t\tif (r.esp >= x86_frame) throw;\n\t\tx86_resume(ctx, base, r);\n";

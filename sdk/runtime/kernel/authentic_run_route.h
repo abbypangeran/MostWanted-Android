@@ -24,6 +24,7 @@ struct Step {
     bool taken;         // expected outcome for a conditional
     Segment segment;
     const char* text;
+    uint8_t ret_pop_bytes = 0;  // reviewed RET imm16 cleanup, 0 for RET
 };
 
 inline constexpr Step kParentRoute[] = {
@@ -82,7 +83,7 @@ inline constexpr Step kParentRoute[] = {
     {0x002B5CEAu, 2, StepKind::kConditional, 0x002B5CECu, 0x002B5D0Eu, 0x00000000u, 0x00000000u, 0, 0, true, Segment::kParentRoot, "jnl 0x002B5D0E"},
     {0x002B5D0Eu, 3, StepKind::kSequential, 0x002B5D11u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "mov eax, [ebp+0x0C]"},
     {0x002B5D11u, 1, StepKind::kSequential, 0x002B5D12u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "pop ebp"},
-    {0x002B5D12u, 3, StepKind::kSequential, 0x002B396Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "ret 0x18"},
+    {0x002B5D12u, 3, StepKind::kRet, 0x002B396Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "ret 0x18", 0x18},
     {0x002B396Fu, 2, StepKind::kSequential, 0x002B3971u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "mov edi, eax"},
     {0x002B3971u, 2, StepKind::kSequential, 0x002B3973u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "cmp edi, esi"},
     {0x002B3973u, 2, StepKind::kConditional, 0x002B3975u, 0x002B397Fu, 0x00000000u, 0x00000000u, 0, 0, true, Segment::kParentRoot, "jnz 0x002B397F"},
@@ -95,7 +96,7 @@ inline constexpr Step kParentRoute[] = {
     {0x002B2767u, 2, StepKind::kSequential, 0x002B2769u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "xor eax, eax"},
     {0x002B2769u, 1, StepKind::kSequential, 0x002B276Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "inc eax"},
     {0x002B276Au, 2, StepKind::kSequential, 0x002B2774u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "jmp 0x002B2774"},
-    {0x002B2774u, 3, StepKind::kSequential, 0x002B3985u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "ret 0x04"},
+    {0x002B2774u, 3, StepKind::kRet, 0x002B3985u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "ret 0x04", 0x04},
     {0x002B3985u, 1, StepKind::kSequential, 0x002B3986u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "pop edi"},
     {0x002B3986u, 1, StepKind::kSequential, 0x002B3987u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "pop esi"},
 };
@@ -172,7 +173,7 @@ inline constexpr Step kChildRoute[] = {
     {0x002B59AFu, 1, StepKind::kSequential, 0x002B59B0u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kPreStartWalk, "pop edi"},
     {0x002B59B0u, 1, StepKind::kSequential, 0x002B59B1u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kPreStartWalk, "pop esi"},
     {0x002B59B1u, 1, StepKind::kSequential, 0x002B59B2u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kPreStartWalk, "pop ebx"},
-    {0x002B59B2u, 3, StepKind::kRet, 0x002B5C7Bu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kPreStartWalk, "ret 0x04"},
+    {0x002B59B2u, 3, StepKind::kRet, 0x002B5C7Bu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kPreStartWalk, "ret 0x04", 0x04},
     {0x002B5C7Bu, 3, StepKind::kSequential, 0x002B5C7Eu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kStartCallSetup, "push [ebp+0x0C]"},
     {0x002B5C7Eu, 3, StepKind::kCall, 0x002B5C81u, 0x002B38A2u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kStartCallSetup, "call [ebp+0x08]"},
 };
@@ -198,6 +199,9 @@ inline constexpr uint32_t kSehEntry = 0x00319804;
 inline constexpr uint32_t kSehHandler = 0x00319858;
 inline constexpr uint32_t kSehScopeTable = 0x003ED5B8;
 inline constexpr uint32_t kSehScopeBytes = 0x18;
+// 0x002B5C1B clears the prologue's -1 scope flag after it returns; the SEH
+// record and scope table stay live at this stop.
+inline constexpr uint32_t kSehScopeFlag = 0x00000000;
 inline constexpr uint32_t kCriticalSectionObject = 0x0046C8B0;
 inline constexpr uint32_t kTlsBlockSize = 0x94;
 inline constexpr uint32_t kParentExecutedInstructions = 71;
@@ -209,5 +213,46 @@ inline constexpr uint32_t kParentTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002
 inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, kSehHandler, 0x002B5999, 0x002B59A1};
 inline constexpr uint32_t kAllTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C,
                                                 kChildStop, kSehHandler, 0x002B5999, 0x002B59A1};
+
+inline constexpr uint64_t ComputeManifestIdentity(const Step* steps, size_t count, uint32_t entry, uint32_t stop,
+                                                 uint32_t seh_call = 0, uint32_t seh_entry = 0,
+                                                 uint32_t seh_handler = 0, uint32_t seh_scope_table = 0,
+                                                 uint32_t seh_scope_bytes = 0, uint32_t seh_scope_flag = 0,
+                                                 uint32_t tls_block_size = 0, uint32_t critical_section_object = 0) {
+    if (!steps) return 0;
+    uint64_t hash = 0xCBF29CE484222325ull;
+    auto mix = [&hash](uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            hash ^= uint8_t(value >> shift);
+            hash *= 0x100000001B3ull;
+        }
+    };
+    mix(entry);
+    mix(stop);
+    mix(uint32_t(count));
+    for (size_t i = 0; i < count; ++i) {
+        const Step& step = steps[i];
+        mix(step.pc);
+        mix(step.length);
+        mix(uint32_t(step.kind));
+        mix(step.next);
+        mix(step.target);
+        mix(step.slot);
+        mix(step.encoding);
+        mix(step.ordinal);
+        mix(step.arguments);
+        mix(step.taken ? 1u : 0u);
+        mix(step.ret_pop_bytes);
+    }
+    mix(seh_call);
+    mix(seh_entry);
+    mix(seh_handler);
+    mix(seh_scope_table);
+    mix(seh_scope_bytes);
+    mix(seh_scope_flag);
+    mix(tls_block_size);
+    mix(critical_section_object);
+    return hash;
+}
 
 }  // namespace kernel::authentic::route

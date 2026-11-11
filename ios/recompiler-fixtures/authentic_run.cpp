@@ -83,6 +83,8 @@ struct WorkerSlot {
     uint32_t tls = 0;
     bool seh_verified = false;
     bool tls_verified = false;
+    SehCheck seh_checks[16] = {};
+    uint8_t seh_check_count = 0;
     bool at_stop = false;
     bool seh_captured = false;
     uint32_t seh_call_esp = 0;
@@ -254,6 +256,8 @@ bool ClaimSlot(WorkerSlot& slot, Thread& thread) {
     slot.seh_captured = false;
     slot.seh_verified = false;
     slot.tls_verified = false;
+    slot.seh_check_count = 0;
+    for (SehCheck& check : slot.seh_checks) check = {};
     slot.seh_registration = 0;
     slot.tls = 0;
     slot.at_stop = false;
@@ -318,57 +322,135 @@ bool ReadWord(uint32_t address, uint32_t& value) {
 // checked 4 KB read, and the frame lives on this worker's own stack. Using the
 // lease-taking seh::VerifyRegistration here would self-conflict with the
 // worker's code-page lease and the finalisation path.
+void RecordSehCheck(WorkerSlot& slot, SehCheckKind kind, SehCheckStatus status, uint32_t expected,
+                    uint32_t observed, uint32_t address) {
+    if (slot.seh_check_count >= 16) return;
+    SehCheck& check = slot.seh_checks[slot.seh_check_count++];
+    check.kind = uint8_t(kind);
+    check.status = uint8_t(status);
+    check.expected = expected;
+    check.observed = observed;
+    check.address = address;
+}
+
+// Read-only verification of the live reviewed SEH record. Every predicate is
+// evaluated and recorded, including the ones after the first failure, so a
+// future run can identify the exact frame condition without executing again.
+// The check never writes guest memory.
 bool VerifyStopSeh(WorkerSlot& slot, Thread& thread, const RouteManifest& manifest, uint32_t& registration) {
     registration = 0;
+    slot.seh_check_count = 0;
     if (!manifest.seh_call) return true;
-    if (!slot.seh_captured || !t_context) {
-        return false;
-    }
+    bool ok = true;
+    auto check = [&](SehCheckKind kind, bool pass, uint32_t expected, uint32_t observed, uint32_t address) {
+        RecordSehCheck(slot, kind, pass ? SehCheckStatus::kPass : SehCheckStatus::kFail, expected, observed, address);
+        ok = ok && pass;
+    };
+    auto skip = [&](SehCheckKind kind, uint32_t expected, uint32_t observed) {
+        RecordSehCheck(slot, kind, SehCheckStatus::kSkipped, expected, observed, 0);
+    };
+    auto unknown = [&](SehCheckKind kind, uint32_t expected, uint32_t address) {
+        RecordSehCheck(slot, kind, SehCheckStatus::kUnknown, expected, 0, address);
+        ok = false;
+    };
+
+    const bool captured = slot.seh_captured && t_context;
+    check(SehCheckKind::kCapture, captured, 1, captured ? 1 : 0, 0);
+    if (!captured) return false;
     const uint32_t e = slot.seh_call_esp;
-    if (!e || (e & 3u) || e > UINT32_MAX - 0x18) return false;
+    const bool entry_ok = e && (e & 3u) == 0 && e <= UINT32_MAX - 0x18;
+    check(SehCheckKind::kEntryAddress, entry_ok, 1, e, e);
+    if (!entry_ok) return false;
+
+    const uint32_t stack_top = thread.stack_top;
     const uint32_t stack_bottom = thread.stack_top - thread.stack_size;
     const uint32_t post_prologue_esp = e - manifest.seh_scope_bytes - 0x18;
-    if (stack_bottom >= thread.stack_top || e - 0x14 < stack_bottom || e + 8 > thread.stack_top ||
-        t_context->ebp != e + 4 || t_context->esp > post_prologue_esp || t_context->esp < stack_bottom) {
+    const bool bounds_ok = stack_bottom < stack_top && e - 0x14 >= stack_bottom && e + 8 <= stack_top;
+    check(SehCheckKind::kStackBounds, bounds_ok, stack_top, e, e);
+    const bool esp_ok = t_context->esp <= post_prologue_esp && t_context->esp >= stack_bottom;
+    check(SehCheckKind::kPostPrologueEsp, esp_ok, post_prologue_esp, t_context->esp, e);
+    const bool ebp_ok = t_context->ebp == e + 4;
+    check(SehCheckKind::kCallerEbp, ebp_ok, e + 4, t_context->ebp, e);
+
+    struct Word {
+        uint32_t address;
+        uint32_t value;
+    } previous{e - 0x0C, 0}, handler{e - 0x08, 0}, scope_flag{e, 0}, scope_table{e - 0x04, 0},
+        saved_esp{e - 0x14, 0}, caller_ebp{e + 4, 0}, head{thread.kpcr, 0};
+    auto load = [&](Word& word, SehCheckKind kind, uint32_t expected) {
+        if (ReadWord(word.address, word.value)) return true;
+        unknown(kind, expected, word.address);
         return false;
+    };
+    const bool previous_loaded = load(previous, SehCheckKind::kPreviousRecord, slot.seh_previous_head);
+    const bool handler_loaded = load(handler, SehCheckKind::kHandler, manifest.seh_handler);
+    const bool scope_flag_loaded = load(scope_flag, SehCheckKind::kScopeFlag, manifest.seh_scope_flag);
+    const bool scope_table_loaded = load(scope_table, SehCheckKind::kScopeTable, manifest.seh_scope_table);
+    const bool saved_esp_loaded = load(saved_esp, SehCheckKind::kSavedEsp, post_prologue_esp);
+    const bool caller_ebp_loaded = load(caller_ebp, SehCheckKind::kCallerEbpHeld,
+                                       slot.seh_caller_ebp ? slot.seh_caller_ebp : 0);
+    const bool head_loaded = load(head, SehCheckKind::kChain, e - 0x0C);
+    if (previous_loaded)
+        check(SehCheckKind::kPreviousRecord, previous.value == slot.seh_previous_head, slot.seh_previous_head,
+              previous.value, previous.address);
+    if (handler_loaded)
+        check(SehCheckKind::kHandler, handler.value == manifest.seh_handler, manifest.seh_handler, handler.value,
+              handler.address);
+    if (scope_flag_loaded)
+        check(SehCheckKind::kScopeFlag, scope_flag.value == manifest.seh_scope_flag, manifest.seh_scope_flag,
+              scope_flag.value, scope_flag.address);
+    if (scope_table_loaded)
+        check(SehCheckKind::kScopeTable, scope_table.value == manifest.seh_scope_table, manifest.seh_scope_table,
+              scope_table.value, scope_table.address);
+    if (saved_esp_loaded)
+        check(SehCheckKind::kSavedEsp, saved_esp.value == post_prologue_esp, post_prologue_esp, saved_esp.value,
+              saved_esp.address);
+    if (caller_ebp_loaded) {
+        if (slot.seh_caller_ebp)
+            check(SehCheckKind::kCallerEbpHeld, caller_ebp.value == slot.seh_caller_ebp, slot.seh_caller_ebp,
+                  caller_ebp.value, caller_ebp.address);
+        else
+            skip(SehCheckKind::kCallerEbpHeld, 0, caller_ebp.value);
     }
-    uint32_t previous = 0, handler = 0, scope_flag = 0, scope_table = 0, saved_esp = 0, caller_ebp = 0, head = 0;
-    if (!ReadWord(e - 0x0C, previous) || !ReadWord(e - 0x08, handler) || !ReadWord(e, scope_flag) ||
-        !ReadWord(e - 0x04, scope_table) || !ReadWord(e - 0x14, saved_esp) || !ReadWord(e + 4, caller_ebp) ||
-        !ReadWord(thread.kpcr, head)) {
-        return false;
-    }
-    if (previous != slot.seh_previous_head || handler != manifest.seh_handler) {
-        return false;
-    }
-    if (scope_flag != 0xFFFFFFFFu || scope_table != manifest.seh_scope_table) {
-        return false;
-    }
-    if (saved_esp != post_prologue_esp) return false;
-    if (slot.seh_caller_ebp && caller_ebp != slot.seh_caller_ebp) return false;
-    // The registration must be on the current chain (head or nested).
-    uint32_t link = head;
-    bool found = false;
-    for (uint32_t depth = 0; depth < 64 && link != 0xFFFFFFFFu; ++depth) {
-        if ((link & 3u) || link < stack_bottom || link + 8 > thread.stack_top) return false;
-        if (link == e - 0x0C) {
-            found = true;
-            break;
+    if (head_loaded) {
+        uint32_t link = head.value;
+        bool found = false;
+        bool chain_ok = true;
+        for (uint32_t depth = 0; depth < 64 && link != 0xFFFFFFFFu; ++depth) {
+            if ((link & 3u) || link < stack_bottom || link + 8 > stack_top) {
+                chain_ok = false;
+                break;
+            }
+            if (link == e - 0x0C) {
+                found = true;
+                break;
+            }
+            uint32_t next = 0;
+            if (!ReadWord(link, next)) {
+                chain_ok = false;
+                break;
+            }
+            link = next;
         }
-        uint32_t next = 0;
-        if (!ReadWord(link, next)) return false;
-        link = next;
+        check(SehCheckKind::kChain, chain_ok && found, e - 0x0C, head.value, head.address);
     }
-    if (!found) return false;
+
     dispatch::CallLease lease;
     const dispatch::ResolvedTarget resolved = lease.Resolve(manifest.seh_handler);
-    if (resolved.kind != dispatch::TargetKind::kGeneratedFunction || !resolved.function) return false;
+    const bool handler_resolved = resolved.kind == dispatch::TargetKind::kGeneratedFunction && resolved.function;
+    check(SehCheckKind::kHandlerResolve, handler_resolved, 1, uint32_t(resolved.kind), manifest.seh_handler);
     if (manifest.seh_scope_table) {
         uint32_t terminator = 0;
-        if (!ReadWord(manifest.seh_scope_table, terminator) || terminator != 0xFFFFFFFFu) return false;
+        if (ReadWord(manifest.seh_scope_table, terminator))
+            check(SehCheckKind::kScopeTerminator, terminator == 0xFFFFFFFFu, 0xFFFFFFFFu, terminator,
+                  manifest.seh_scope_table);
+        else
+            unknown(SehCheckKind::kScopeTerminator, 0xFFFFFFFFu, manifest.seh_scope_table);
+    } else {
+        skip(SehCheckKind::kScopeTerminator, 0, 0);
     }
-    registration = e - 0x0C;
-    return true;
+    if (ok) registration = e - 0x0C;
+    return ok;
 }
 
 void VerifyStopState(WorkerSlot& slot) {
@@ -589,36 +671,6 @@ const char* StatusName(Status status) {
 
 namespace {
 
-uint32_t TakenU32(const route::Step& step) { return step.taken ? 1u : 0u; }
-
-uint64_t RouteIdentity(const route::Step* steps, size_t count, uint32_t entry, uint32_t stop) {
-    if (!steps) return 0;
-    uint64_t hash = 0xCBF29CE484222325ull;
-    auto mix = [&hash](uint32_t value) {
-        for (unsigned shift = 0; shift < 32; shift += 8) {
-            hash ^= uint8_t(value >> shift);
-            hash *= 0x100000001B3ull;
-        }
-    };
-    mix(entry);
-    mix(stop);
-    mix(uint32_t(count));
-    for (size_t i = 0; i < count; ++i) {
-        const route::Step& step = steps[i];
-        mix(step.pc);
-        mix(step.length);
-        mix(uint32_t(step.kind));
-        mix(step.next);
-        mix(step.target);
-        mix(step.slot);
-        mix(step.encoding);
-        mix(step.ordinal);
-        mix(step.arguments);
-        mix(TakenU32(step));
-    }
-    return hash;
-}
-
 }  // namespace
 
 const RouteManifest& AuthenticParentManifest() {
@@ -628,7 +680,8 @@ const RouteManifest& AuthenticParentManifest() {
         route::kParentEntry,
         route::kParentStop,
         route::kParentExecutedInstructions,
-        RouteIdentity(route::kParentRoute, route::kParentRouteCount, route::kParentEntry, route::kParentStop),
+        route::ComputeManifestIdentity(route::kParentRoute, route::kParentRouteCount, route::kParentEntry,
+                                       route::kParentStop, 0, 0, 0, 0, 0, 0, 0, 0),
         route::kParentTrapEntries,
         sizeof(route::kParentTrapEntries) / sizeof(route::kParentTrapEntries[0]),
         0, 0, 0, 0, 0, 0, 0,
@@ -643,7 +696,10 @@ const RouteManifest& AuthenticChildManifest() {
         route::kChildEntry,
         route::kChildStop,
         route::kChildExecutedInstructions,
-        RouteIdentity(route::kChildRoute, route::kChildRouteCount, route::kChildEntry, route::kChildStop),
+        route::ComputeManifestIdentity(route::kChildRoute, route::kChildRouteCount, route::kChildEntry,
+                                       route::kChildStop, route::kSehCall, route::kSehEntry, route::kSehHandler,
+                                       route::kSehScopeTable, route::kSehScopeBytes, route::kSehScopeFlag,
+                                       route::kTlsBlockSize, route::kCriticalSectionObject),
         route::kChildTrapEntries,
         sizeof(route::kChildTrapEntries) / sizeof(route::kChildTrapEntries[0]),
         route::kSehCall,
@@ -651,6 +707,7 @@ const RouteManifest& AuthenticChildManifest() {
         route::kSehHandler,
         route::kSehScopeTable,
         route::kSehScopeBytes,
+        route::kSehScopeFlag,
         route::kTlsBlockSize,
         route::kCriticalSectionObject,
     };
@@ -658,7 +715,10 @@ const RouteManifest& AuthenticChildManifest() {
 }
 
 uint64_t ManifestIdentity(const RouteManifest& manifest) {
-    return RouteIdentity(manifest.steps, manifest.count, manifest.entry, manifest.stop);
+    return route::ComputeManifestIdentity(manifest.steps, manifest.count, manifest.entry, manifest.stop,
+                                          manifest.seh_call, manifest.seh_entry, manifest.seh_handler,
+                                          manifest.seh_scope_table, manifest.seh_scope_bytes, manifest.seh_scope_flag,
+                                          manifest.tls_block_size, manifest.critical_section_object);
 }
 
 uint64_t RuntimeMappingIdentity() { return dispatch::MappingIdentity(); }
@@ -879,12 +939,16 @@ void AdmitGuestReturn(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
     const route::Step& step = manifest.steps[slot.node];
     if (step.kind != route::StepKind::kRet || step.pc != pc)
         Violation(slot, Status::kUnreviewedTransfer, pc);
+    if (pop_bytes != step.ret_pop_bytes)
+        Violation(slot, Status::kUnreviewedTransfer, pc, pop_bytes);
     if (slot.depth == 0) Violation(slot, Status::kUnreviewedTransfer, pc);
     uint32_t return_address = 0;
     if (mem::Read(ctx.esp, &return_address, sizeof(return_address)) != mem::AccessStatus::kOk ||
         return_address != step.next)
         Violation(slot, Status::kUnreviewedTransfer, pc, return_address);
     const uint32_t call_node = slot.call_stack[--slot.depth];
+    if (manifest.steps[call_node].next != step.next)
+        Violation(slot, Status::kUnreviewedTransfer, pc, return_address);
     ++slot.transfers;
     TraceEvent(slot, EventKind::kReturnTransfer, pc, return_address);
     TraceContext(slot);
@@ -920,11 +984,15 @@ GuestCallbackStatus RunBoundWorker(X86Context& ctx, Thread& thread) {
     if (code_lease.AcquireExecutableRun(manifest.entry, dispatch::CallLease().CodeEnd()) != mem::AccessStatus::kOk) {
         Violation(*slot, Status::kCodePageDenied, manifest.entry);
     }
-    // The stack is not leased for the whole run: every generated access is a
-    // checked 4 KB access, the checked call frames validate return addresses,
-    // and the SEH verifier takes its own stack lease at the stop. A whole-run
-    // stack lease would conflict with that verifier's read lease on the same
-    // range and deadlock the worker.
+    // Pin the whole worker stack for the run. A decommit, free or protection
+    // change from another thread must wait until the route and the read-only
+    // stop verification finish. The verifier uses checked reads only, so it
+    // does not take a conflicting lease.
+    mem::ScopedPageLease stack_lease;
+    const uint32_t stack_base = thread.stack_top - thread.stack_size;
+    if (stack_lease.Acquire(stack_base, thread.stack_size, mem::kReadWrite) != mem::AccessStatus::kOk) {
+        Violation(*slot, Status::kMemoryViolation, stack_base);
+    }
     TraceEvent(*slot, EventKind::kWorkerStart, manifest.entry, 0);
     TraceContext(*slot);
     try {
@@ -1101,6 +1169,8 @@ bool EvidenceForRole(Role role, RunEvidence* evidence) {
     evidence->at_stop = slot.at_stop;
     evidence->trace_count = slot.trace_count;
     evidence->kernel_count = slot.kernel_count;
+    evidence->seh_check_count = slot.seh_check_count;
+    for (size_t i = 0; i < slot.seh_check_count && i < 16; ++i) evidence->seh_checks[i] = slot.seh_checks[i];
     return true;
 }
 

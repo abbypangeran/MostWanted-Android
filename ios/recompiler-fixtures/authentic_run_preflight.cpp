@@ -145,9 +145,11 @@ bool CheckRoute(const xbe::Image& image, const route::Step* steps, size_t count,
                 size_t& index_base) {
     bool ok = true;
     std::set<uint32_t> pcs;
+    for (size_t i = 0; i < count; ++i) pcs.insert(steps[i].pc);
+    std::set<uint32_t> seen;
     for (size_t i = 0; i < count; ++i) {
         const route::Step& step = steps[i];
-        if (!pcs.insert(step.pc).second) {
+        if (!seen.insert(step.pc).second) {
             g_lines.emplace_back(std::string("AUTH_RUN_DUPLICATE_PC=") + Hex(step.pc));
             ok = false;
         }
@@ -198,11 +200,36 @@ bool CheckRoute(const xbe::Image& image, const route::Step* steps, size_t count,
                 ok = false;
             }
         }
+        const bool is_ret = instruction.mnemonic == ZYDIS_MNEMONIC_RET;
+        if (is_ret != (step.kind == route::StepKind::kRet)) {
+            g_lines.emplace_back(std::string("AUTH_RUN_RET_CLASSIFICATION_MISMATCH=") + Hex(step.pc) +
+                                 " mnemonic=" + (is_ret ? "ret" : text) + " kind=" + KindName(step.kind));
+            ok = false;
+        }
         if (step.kind == route::StepKind::kRet) {
             if (instruction.mnemonic != ZYDIS_MNEMONIC_RET) {
                 g_lines.emplace_back(std::string("AUTH_RUN_RET_MISMATCH=") + Hex(step.pc));
                 ok = false;
+            } else {
+                const bool has_immediate = instruction.operand_count_visible != 0 &&
+                                           operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+                const uint32_t immediate = has_immediate ? uint32_t(operands[0].imm.value.u) : 0;
+                if (immediate != step.ret_pop_bytes) {
+                    g_lines.emplace_back(std::string("AUTH_RUN_RET_IMMEDIATE_MISMATCH=") + Hex(step.pc) +
+                                         " decoded=" + std::to_string(immediate) + " manifest=" +
+                                         std::to_string(step.ret_pop_bytes));
+                    ok = false;
+                }
             }
+            const bool known_target = step.next == stop || pcs.count(step.next) != 0;
+            if (!known_target) {
+                g_lines.emplace_back(std::string("AUTH_RUN_RET_TARGET_MISMATCH=") + Hex(step.pc) + " next=" +
+                                     Hex(step.next));
+                ok = false;
+            }
+        } else if (step.ret_pop_bytes != 0) {
+            g_lines.emplace_back(std::string("AUTH_RUN_RET_IMMEDIATE_ON_NON_RET=") + Hex(step.pc));
+            ok = false;
         }
         char line[384];
         std::snprintf(line, sizeof(line), "AUTH_RUN_STEP=%zu,%s,%08X,%u,%s,%08X,%08X,%s", index_base + i,
@@ -318,6 +345,20 @@ int main(int argc, char** argv) {
     Record("AUTH_RUN_CHILD_COUNT", route::kChildRouteCount == route::kChildExecutedInstructions);
     Record("AUTH_RUN_TOTAL_COUNT", route::kParentRouteCount + route::kChildRouteCount ==
                                        route::kTotalExecutedInstructions);
+    {
+        char parent_identity[40], child_identity[40];
+        std::snprintf(parent_identity, sizeof(parent_identity), "%016llX",
+                      static_cast<unsigned long long>(route::ComputeManifestIdentity(
+                          route::kParentRoute, route::kParentRouteCount, route::kParentEntry, route::kParentStop)));
+        std::snprintf(child_identity, sizeof(child_identity), "%016llX",
+                      static_cast<unsigned long long>(route::ComputeManifestIdentity(
+                          route::kChildRoute, route::kChildRouteCount, route::kChildEntry, route::kChildStop,
+                          route::kSehCall, route::kSehEntry, route::kSehHandler, route::kSehScopeTable,
+                          route::kSehScopeBytes, route::kSehScopeFlag, route::kTlsBlockSize,
+                          route::kCriticalSectionObject)));
+        g_lines.emplace_back(std::string("AUTH_RUN_PARENT_MANIFEST_IDENTITY=") + parent_identity);
+        g_lines.emplace_back(std::string("AUTH_RUN_CHILD_MANIFEST_IDENTITY=") + child_identity);
+    }
     // The two terminal boundaries are exact: the parent's next instruction is
     // the ret at 002B3987, and the child's dynamic call's target is 002B38A2.
     bool parent_stop_edge = false, child_stop_edge = false;

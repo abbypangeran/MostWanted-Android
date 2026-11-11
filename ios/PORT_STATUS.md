@@ -4286,3 +4286,110 @@ An exploratory full `ctest` invocation included `execution_probe_tests` and `exe
 5. Stop both workers; verify no guest thread or worker remains, both claims are released and the image identity is unchanged. Do not extend the run past `0x002B38A2` or the parent ret without a new review.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-20 — first authentic run postmortem and remediation
+
+**`FIRST_AUTHENTIC_RUN_REMEDIATION = PASS`.** The first authentic run remains `EARLY_STOP` and its evidence was not modified. This phase corrects the two confirmed defects, establishes the SEH failure cause from the original trace and code, retains the stack-lease safety fix, and reconciles the allocation counter. **No authentic Xbox instruction ran in this phase**, and the execution switch remains disabled.
+
+### Accepted run evidence (unchanged)
+
+The run under local, uncommitted activation is preserved in `.local/ios-port/phase2d19-authentic-run/` (`run.log`, the preflight and synthetic logs, the dry-run refusal, and the exact local patch). It executed 128 authentic instructions: parent 55 retired (56 entries, divergence at `0x002B5D12`), child 73 retired, child stopped at the pre-instruction boundary `0x002B38A2`. Kernel 255/277/294 all returned success; 187 was not reached. Cleanup reported `workers=0 claims=0 threads_empty=1 system=0 contiguous=0 virtual=1280`. The authorisation was restored to disabled; no rerun occurred.
+
+### Remediation A — RET classification
+
+**Root cause.** The Phase 2C root route table (`execution_probe_route.h`) uses a probe step enum without a return member; its `0x002B5D12 ret 0x18` and `0x002B2774 ret 0x04` entries are `kSequential`. The Phase 2D-19 manifest extractor copied that kind into the authentic parent manifest. The checked return gate requires `kRet`, so it refused the transfer at `0x002B5D12` as `unreviewed-transfer`; the authentic instruction itself did not execute.
+
+**Fix (rule, not address exemptions).**
+
+- The authentic route marks both return sites `kRet`; the child's `0x0031983E` and `0x002B59B2` were already returns.
+- `Step` gained `ret_pop_bytes`; the reviewed immediates are `0x18` and `0x04` for the parent, `0x04` for the child walk and `0` for the SEH return.
+- `AdmitGuestReturn` checks the generated `pop_bytes` against the manifest immediate, rejects an empty call stack, requires the return address to equal the reviewed continuation, and requires the caller call node's continuation to match.
+- `authentic_run_preflight` now classifies every decoded instruction: a decoded `RET`/`RET imm16` must be `kRet`, a `kRet` must decode to `RET`, the immediate must match `ret_pop_bytes`, and the continuation must be a reviewed route PC or the manifest stop.
+- A synthetic `RET imm16` route (caller push/call, a two-instruction callee ending in `RET 4`, stop at `0x001140A`) proves return-address admission, ESP restoration, a corrupted return address rejection, and a deliberately misclassified RET rejection. The fixture never contains authentic bytes.
+
+**New identities.** The generated function mapping is unchanged: **152/152 entries, `EC3486BCAFA498BF`** (`00011000..003714D4`). The route manifest identities changed with the corrected kinds and the new policy hash:
+
+| Identity | Value |
+|---|---|
+| Parent manifest (full) | `7F8AD72F529DC906` |
+| Child manifest (full) | `DBCFD15B661E8CE6` |
+| Parent route-table prefix | `0CAB6ED490B54606` |
+| Child route-table prefix | `14FD36A4C6519854` |
+| Executed / boundary steps | 144 / 146 |
+
+### Remediation B — SEH verification failure
+
+The original `VerifyStopSeh` (commit `4ed1278`) compared the live scope flag against the hard-coded `0xFFFFFFFF`. The authentic caller executes `0x002B5C1B and dword ptr [ebp-4], 0x00` after the prologue returns; at the stop the reviewed trylevel is `0`, while the registration, handler, scope table and chain remain live. The run's trace contains `TRACE role=2 event=instruction pc=002B5C1B` and the child stop after it; the captured frame starts at `E=D005FF3C`, and the prologue trace at `0x00319824` shows the saved ESP `D005FF0C` (`E-0x30`).
+
+| Predicate | Expected | Observed | Source | Result |
+|---|---|---|---|---|
+| Capture | captured | gate captured before the call | gate capture at `0x002B5C16` | pass (verifier reached the scope check) |
+| Entry address | valid `E` | `D005FF3C` | trace call record | pass |
+| Stack bounds | frame inside thread stack | `E` inside the derived stack | `PrepareSystemThreadEx` layout | pass |
+| Post-prologue ESP | `E-0x30 = D005FF0C` | stop ESP `D005FF04` | prologue trace and stop trace | pass |
+| Caller EBP | `E+4 = D005FF40` | `D005FF40` | stop trace | pass |
+| Previous record | captured `fs:[0]` (`FFFFFFFF`) | stack word not in trace | prologue/capture | pass (reached scope) |
+| Handler | `00319858` | stack word not in trace | prologue/manifest | pass (reached scope) |
+| **Scope flag** | **`FFFFFFFF` (hard-coded)** | **`0`** | `0x002B5C1B and [ebp-4],0`; verifier line 344 | **fail** |
+| Scope table | `003ED5B8` | not in trace | prologue/manifest | not evaluated |
+| Saved ESP | `D005FF0C` | derived `0x00319824 esp` | prologue trace | not evaluated (after scope) |
+| Caller EBP held | `0` (skipped) | `0` | call capture | skipped |
+| Chain | registration in `fs:[0]` | `fs:[0]` not in trace | KPCR | not evaluated |
+| Handler resolve | generated entry | mapping has `00319858` | dispatch | not evaluated |
+| Scope terminator | `FFFFFFFF` | static image datum | image `.rdata` | not evaluated |
+
+**Classification: incorrect verifier expectation.** The decoded authentic caller's `and` deterministically clears the scope flag to `0`; the registration and scope table stay live. The trace does not record the stack word values or `fs:[0]`, so the post-scope predicates are marked not evaluated; the new predicate diagnostics record all fourteen for a future run.
+
+**Fix.** `RouteManifest` now carries the reviewed `seh_scope_flag` (`0` for the authentic child); `VerifyStopSeh` uses it and records every predicate with expected/observed/address/source status (`kPass`, `kFail`, `kUnknown`, `kSkipped`). The synthetic child now executes the same `and [ebp-4],0` and uses scope flag `0`; malformed-frame tests corrupt the scope flag, handler, previous record, scope table, saved ESP, exception chain and caller EBP, and assert the specific recorded predicate. Retail exception delivery and the handler remain prohibited; the handler is never called.
+
+### Remediation C — assessment handle corruption
+
+**Root cause.** `AssessAuthenticSystemThreadRequest` prepared its candidate with the request's live `handle_out` and `thread_id_out`, then `CancelPreparedThread` cleared those guest outputs. The real child's handle was therefore zero when the parent later read `[ebp+0x0C]`.
+
+**Fix.** The assessment now prepares an isolated candidate with **zero output addresses** (`PrepareSystemThreadEx(0, ..., 0, ...)`) and only checks that the live request's output addresses are readable/writable. `CancelPreparedThread` cannot touch the live handle or id. The generic `AssessSystemThreadRequest(request, contract)` is shared by the production authentic wrapper and an independently constructed synthetic contract.
+
+**Tests.** Five repeated assessments preserve a live synthetic child's handle and id; candidate allocations and registrations return to baseline; wrong call site, TLS, policy and image are rejected without touching the live child; a candidate that cannot be rolled back still fails closed. A fresh assessment followed by real synthetic thread creation preserves the output, publishes the real handle/id, permits an ordinary checked `NtClose`, and clears the outputs on cancellation. The existing checked-fixture authentic assessment cases pass 812/812 (the success result now also records `reason=kAdmitted`).
+
+### Stack lease and allocation accounting
+
+The run's local whole-run stack lease is retained in `RunBoundWorker`: the code run and the worker stack are leased for the route, the stop verification is read-only and takes no conflicting lease, and both leases release before the worker's finalisation frees the stack. The synthetic suite covers concurrent stack decommit (it waits for the lease, completes only after finalisation, and neither stop is disturbed), cancellation while the lease is held, failed child preparation, shutdown and generation changes. The harness has no nested callback admission, so the stack lease does not cross a nested callback; the callback path remains covered by the checked-fixture callback suite.
+
+`authentic_run_accounting` (static/preparation only) shows:
+
+```
+BASELINE            virtual=0
+AFTER_IMAGE         virtual=1280  available=15104
+AFTER_THREADS       virtual=1280  system=0 contiguous=0
+AFTER_CANCEL        virtual=1280  system=0 contiguous=0
+AFTER_SHUTDOWN      virtual=0     available=16384
+```
+
+The `virtual=1280` is the **image reservation** (`0x500000` pages for the `0x4F8040` image rounded up), not a retained worker or stack. `AFTER_SHUTDOWN` returns to `0`; `system` and `contiguous` stay `0`. The first run's `virtual=1280` is the same image reservation.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` synthetic suite | 79 PASS / 0 FAIL | 79 PASS / 0 FAIL |
+| Checked recompiler fixture assertions | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Applicable safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, exit 0 | PASS, exit 0 |
+| `gate_b_preflight` / root / secondary / integrated static | PASS / exit 0 | PASS / exit 0 |
+| `authentic_run_accounting` | PASS, exit 0 | PASS, exit 0 |
+| Android ARM64 syntax (`dispatch.cpp`, `threads.cpp`, `worker_lifecycle.cpp`) | PASS | — |
+
+The integrated frozen preflight still reports 143/143, 72 root + 71 secondary, stop `002B5C7B`, and `production assessment: status=validated-but-execution-prohibited unresolved=F threads=0`. The `execution_probe*` targets were not used as acceptance evidence.
+
+### Remaining blockers for the next bounded experiment
+
+- The first run's authorisation is consumed; a second authentic execution requires separate user approval.
+- Retail SEH exception delivery remains prohibited; no handler or `RtlRaiseException`/`RtlUnwind` may run. The predicate diagnostics are ready but have not observed the authentic frame at a stop yet.
+- The authentic ordinal 187 (NtClose) was not reached in the first run; with the corrected parent RETs it is on the next path and must be observed.
+- The 867 initializer targets, `CLI`/`STI`, the dynamic list callback, ordinal 258 and the game-loop dependencies remain Gate C.
+- The authentic parent start driver and activation patch are not committed; `kAuthenticExecutionAuthorised` remains `false` and the ordinary app path is unchanged.
+
+### Proposed second experiment (for review, not authorised)
+
+The same original 144-instruction boundary: parent 71 executed + stop `0x002B3987`, child 73 executed + stop `0x002B38A2`, mapping `EC3486BCAFA498BF`, manifests `7F8AD72F529DC906` / `DBCFD15B661E8CE6`, SEH scope flag `0`, isolated assessment, whole-run code/stack leases and the predicate diagnostics. It would require one new explicit authorisation; it must reach **both** stops, observe 255/187/277/294, verify the live SEH predicate set and TLS, and show the same cleanup baseline. No boundary extension is included.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

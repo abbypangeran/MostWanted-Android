@@ -3,6 +3,7 @@
 // budget, SEH/TLS, kernel-call and cancellation paths the authentic experiment
 // would use. No authentic instruction, address or image is executed.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -29,6 +30,7 @@
 #include "authentic_run_fixture_route.h"
 
 namespace run = kernel::authentic;
+namespace route = kernel::authentic::route;
 namespace fixture = authentic_run_fixture;
 
 namespace kernel {
@@ -84,6 +86,7 @@ run::RouteManifest ChildManifest() {
     manifest.seh_handler = fixture::kSehHandler;
     manifest.seh_scope_table = fixture::kSehScopeTable;
     manifest.seh_scope_bytes = fixture::kSehScopeBytes;
+    manifest.seh_scope_flag = fixture::kSehScopeFlag;
     manifest.tls_block_size = fixture::kTlsBlockSize;
     manifest.critical_section_object = fixture::kCriticalSectionObject;
     manifest.identity = run::ManifestIdentity(manifest);
@@ -98,6 +101,19 @@ run::RouteManifest UnsupportedManifest() {
     manifest.stop = fixture::kUnsupportedStop;
     manifest.executed_instructions = 1;
     manifest.trap_entries = fixture::kUnsupportedTrapEntries;
+    manifest.trap_count = 1;
+    manifest.identity = run::ManifestIdentity(manifest);
+    return manifest;
+}
+
+run::RouteManifest RetImmManifest() {
+    run::RouteManifest manifest;
+    manifest.steps = fixture::kRetImmRoute;
+    manifest.count = fixture::kRetImmRouteCount;
+    manifest.entry = fixture::kRetImmEntry;
+    manifest.stop = fixture::kRetImmStop;
+    manifest.executed_instructions = fixture::kRetImmExecutedInstructions;
+    manifest.trap_entries = fixture::kRetImmTrapEntries;
     manifest.trap_count = 1;
     manifest.identity = run::ManifestIdentity(manifest);
     return manifest;
@@ -264,8 +280,96 @@ void JoinThread(const kernel::ThreadRef& thread) {
 namespace {
 void ForceBranchNotTaken(X86Context& ctx) { ctx.ecx = 0; }
 void FaultAtTlsWrite(X86Context& ctx) { ctx.edx = 0x00020000; }
+uint32_t StopFrameE(const X86Context& ctx) { return ctx.ebp - 4; }
+void CorruptScopeFlag(X86Context& ctx) { const uint32_t v = 0x1234; mem::Write(StopFrameE(ctx), &v, 4); }
+void CorruptHandler(X86Context& ctx) { const uint32_t v = 0xDEADBEEF; mem::Write(StopFrameE(ctx) - 8, &v, 4); }
+void CorruptPrevious(X86Context& ctx) { const uint32_t v = 0xDEADBEEF; mem::Write(StopFrameE(ctx) - 0xC, &v, 4); }
+void CorruptScopeTable(X86Context& ctx) { const uint32_t v = 0; mem::Write(StopFrameE(ctx) - 4, &v, 4); }
+void CorruptSavedEsp(X86Context& ctx) { const uint32_t v = 0; mem::Write(StopFrameE(ctx) - 0x14, &v, 4); }
+void DetachExceptionChain(X86Context& ctx) { const uint32_t v = 0xFFFFFFFF; mem::Write(ctx.fs_base, &v, 4); }
+void SetCallerEbp(X86Context& ctx) { ctx.ebp = 0x1000; }
+void CorruptCallerSlot(X86Context& ctx) { const uint32_t v = 0x1234; mem::Write(StopFrameE(ctx) + 4, &v, 4); }
+void CorruptReturnAddress(X86Context& ctx) { const uint32_t v = 0xDEADBEEF; mem::Write(ctx.esp, &v, 4); }
+std::atomic<bool> g_stack_probe{false};
+std::atomic<bool> g_stack_mutation_started{false};
+std::atomic<bool> g_stack_mutation_done{false};
+std::atomic<int> g_stack_mutation_status{-1};
+void HoldForStackMutation(X86Context&) {
+    g_stack_probe = true;
+    for (unsigned i = 0; i < 5000 && !g_stack_mutation_started.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
 void CancelAfterChildStart(X86Context&) { kernel::authentic::CancelAllRuns(); }
 void CancelAtChildEntry(X86Context&) { kernel::authentic::CancelAllRuns(); }
+
+struct RouteRun {
+    kernel::ThreadRef thread;
+    run::RunAuthorization authorization;
+    run::Status start = run::Status::kInternalError;
+    bool have = false;
+    run::RunEvidence evidence;
+};
+
+RouteRun RunSyntheticRoute(const Fixture& fixture, const run::RouteManifest& manifest, uint32_t instruction_budget,
+                           uint32_t transfer_budget, uint32_t kernel_budget, uint32_t maximum_depth) {
+    WaitForQuiescence();
+    RouteRun result;
+    if (kernel::PrepareSystemThreadEx(0, 0x10000, 0x94, 0, manifest.entry, 0, false, 0, result.thread) !=
+        kernel::kSuccess)
+        return result;
+    result.start = run::AuthorizeSyntheticRouteForThread(
+        result.thread.get(), manifest, fixture.sha1.c_str(), dispatch::MappingIdentity(),
+        dispatch::CallLease().Generation(), mem::Generation(), instruction_budget, transfer_budget, kernel_budget,
+        maximum_depth, &result.authorization);
+    if (result.start != run::Status::kReady) return result;
+    if (!kernel::StartThread(result.thread)) {
+        result.start = run::Status::kInvalidThread;
+        return result;
+    }
+    JoinThread(result.thread);
+    WaitForRole(run::Role::kParent);
+    result.have = run::EvidenceForRole(run::Role::kParent, &result.evidence);
+    return result;
+}
+
+struct ChildRun {
+    Started started;
+    run::RunEvidence parent;
+    run::RunEvidence child;
+    bool have_parent = false;
+    bool have_child = false;
+};
+
+template <typename Setup>
+ChildRun RunWithChildHooks(const Fixture& fixture, Setup setup) {
+    ResetData();
+    setup();
+    ChildRun result;
+    result.started = StartParent(fixture);
+    JoinThread(result.started.parent);
+    WaitForRole(run::Role::kChild);
+    WaitForRole(run::Role::kParent);
+    result.have_parent = run::EvidenceForRole(run::Role::kParent, &result.parent);
+    result.have_child = run::EvidenceForRole(run::Role::kChild, &result.child);
+    run::ClearInjectionHooksForTest();
+    return result;
+}
+
+bool HasSehCheck(const run::RunEvidence& evidence, run::SehCheckKind kind, run::SehCheckStatus status) {
+    for (size_t i = 0; i < evidence.seh_check_count; ++i)
+        if (evidence.seh_checks[i].kind == uint8_t(kind) && evidence.seh_checks[i].status == uint8_t(status))
+            return true;
+    return false;
+}
+
+const run::TraceRecord* FindTrace(const run::RunEvidence& evidence, run::Role role, run::EventKind kind) {
+    for (size_t i = 0; i < evidence.trace_count; ++i) {
+        const run::TraceRecord* record = run::TraceForRole(role, i);
+        if (record && record->event == uint8_t(kind)) return record;
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 int main() {
@@ -279,6 +383,7 @@ int main() {
         std::printf("FAIL: fixture preparation: %s\n", error.c_str());
         return 1;
     }
+    const mem::Stats allocation_baseline = mem::Query();
     {
         ResetData();
         const Started started = StartParent(fixture);
@@ -294,11 +399,19 @@ int main() {
         Check(parent.status == run::Status::kStopped && child.status == run::Status::kStopped,
               "both stops are recorded as kStopped");
         Check(parent.instructions == fixture::kParentExecutedInstructions, "parent retires exactly 19 instructions");
-        Check(child.instructions == fixture::kChildExecutedInstructions, "child retires exactly 33 instructions");
+        Check(child.instructions == fixture::kChildExecutedInstructions, "child retires exactly the reviewed instruction count");
         Check(parent.stop_pc == fixture::kParentStop, "parent stop PC is the pre-instruction ret");
         Check(child.stop_pc == fixture::kChildStop && child.at_stop, "child stop PC is the pre-instruction start-routine entry");
         Check(child.seh_verified && child.seh_registration != 0, "child SEH record is live and verified at the stop");
         Check(child.tls_verified && child.tls != 0, "child TLS pointer is initialised and verified");
+        bool seh_checks_ok = child.seh_check_count >= 14;
+        for (size_t i = 0; i < child.seh_check_count; ++i) {
+            const run::SehCheck& check = child.seh_checks[i];
+            if (check.status == uint8_t(run::SehCheckStatus::kFail) ||
+                check.status == uint8_t(run::SehCheckStatus::kUnknown))
+                seh_checks_ok = false;
+        }
+        Check(seh_checks_ok, "every SEH predicate is recorded and passes on the normal synthetic frame");
         Check(parent.thread_id != child.thread_id && parent.claim_id && child.claim_id && parent.claim_id != child.claim_id,
               "parent and child have distinct worker and claim identities");
         Check(parent.origin == uint32_t(run::Origin::kSyntheticFixture) &&
@@ -392,7 +505,7 @@ int main() {
 
     {
         ResetData();
-        run::SetInjectionHookForTest(run::Role::kChild, 0x001111B, FaultAtTlsWrite);
+        run::SetInjectionHookForTest(run::Role::kChild, 0x001111F, FaultAtTlsWrite);
         const Started started = StartParent(fixture);
         JoinThread(started.parent);
         WaitForRole(run::Role::kChild);
@@ -502,6 +615,219 @@ int main() {
         request.dispatch_generation = dispatch::CallLease().Generation() ^ 1;
         Check(run::StartParentWorkerForTest(request, &authorization) == run::Status::kStaleDispatch,
               "a stale dispatch generation is refused");
+    }
+
+    {
+        ResetData();
+        run::RouteManifest ret = RetImmManifest();
+        const RouteRun run = RunSyntheticRoute(fixture, ret, 4, 8, 1, 2);
+        Check(run.start == run::Status::kReady && run.have && run.evidence.status == run::Status::kStopped &&
+                  run.evidence.instructions == fixture::kRetImmExecutedInstructions &&
+                  run.evidence.stop_pc == fixture::kRetImmStop &&
+                  run.evidence.at_stop,
+              "RET imm16 callee returns through the checked frame and the caller stops at the reviewed boundary");
+        const run::TraceRecord* start = FindTrace(run.evidence, run::Role::kParent, run::EventKind::kWorkerStart);
+        const run::TraceRecord* stop = FindTrace(run.evidence, run::Role::kParent, run::EventKind::kStop);
+        Check(start && stop && start->esp == stop->esp,
+              "RET imm16 restores ESP exactly after the caller push, call return address and clean-up");
+    }
+    {
+        ResetData();
+        run::SetInjectionHookForTest(run::Role::kParent, 0x0011412, CorruptReturnAddress);
+        const run::RouteManifest ret = RetImmManifest();
+        const RouteRun run = RunSyntheticRoute(fixture, ret, 4, 8, 1, 2);
+        run::ClearInjectionHooksForTest();
+        Check(run.have && run.evidence.status == run::Status::kUnreviewedTransfer,
+              "a modified return address is refused before the RET transfer can be taken");
+    }
+    {
+        ResetData();
+        std::array<route::Step, 4> misclassified{};
+        std::copy(std::begin(fixture::kRetImmRoute), std::end(fixture::kRetImmRoute), misclassified.begin());
+        misclassified[3].kind = route::StepKind::kSequential;
+        run::RouteManifest wrong;
+        wrong.steps = misclassified.data();
+        wrong.count = misclassified.size();
+        wrong.entry = fixture::kRetImmEntry;
+        wrong.stop = fixture::kRetImmStop;
+        wrong.executed_instructions = fixture::kRetImmExecutedInstructions;
+        wrong.identity = run::ManifestIdentity(wrong);
+        const RouteRun run = RunSyntheticRoute(fixture, wrong, 4, 8, 1, 2);
+        Check(run.have && run.evidence.status == run::Status::kUnreviewedTransfer,
+              "a RET classified as sequential is refused at the return boundary");
+    }
+    {
+        struct Case {
+            const char* name;
+            void (*hook)(X86Context&);
+            run::SehCheckKind kind;
+        };
+        const Case cases[] = {
+            {"scope flag", CorruptScopeFlag, run::SehCheckKind::kScopeFlag},
+            {"handler", CorruptHandler, run::SehCheckKind::kHandler},
+            {"previous record", CorruptPrevious, run::SehCheckKind::kPreviousRecord},
+            {"scope table", CorruptScopeTable, run::SehCheckKind::kScopeTable},
+            {"saved ESP", CorruptSavedEsp, run::SehCheckKind::kSavedEsp},
+            {"exception chain", DetachExceptionChain, run::SehCheckKind::kChain},
+        };
+        for (const Case& current : cases) {
+            const ChildRun run = RunWithChildHooks(fixture, [&] {
+                run::SetInjectionHookForTest(run::Role::kChild, 0x0011113, current.hook);
+            });
+            Check(run.have_child && run.child.status == run::Status::kSehViolation &&
+                      HasSehCheck(run.child, current.kind, run::SehCheckStatus::kFail),
+                  current.name);
+        }
+        const ChildRun caller = RunWithChildHooks(fixture, [] {
+            run::SetInjectionHookForTest(run::Role::kChild, 0x001110A, SetCallerEbp);
+            run::SetInjectionHookForTest(run::Role::kChild, 0x0011113, CorruptCallerSlot);
+        });
+        Check(caller.have_child && caller.child.status == run::Status::kSehViolation &&
+                  HasSehCheck(caller.child, run::SehCheckKind::kCallerEbpHeld, run::SehCheckStatus::kFail),
+              "caller EBP");
+    }
+    {
+        ResetData();
+        const uint32_t initial_handle = 0x11111111u, initial_id = 0x22222222u;
+        mem::Write(fixture::kHandleOut, &initial_handle, sizeof(initial_handle));
+        mem::Write(fixture::kIdOut, &initial_id, sizeof(initial_id));
+        kernel::ThreadRef live;
+        const uint32_t prepared = kernel::PrepareSystemThreadEx(
+            fixture::kHandleOut, 0x10000, 0x94, fixture::kIdOut, fixture::kChildStop, 0, false,
+            fixture::kChildEntry, live);
+        uint32_t handle = 0, id = 0;
+        mem::Read(fixture::kHandleOut, &handle, sizeof(handle));
+        mem::Read(fixture::kIdOut, &id, sizeof(id));
+        Check(prepared == kernel::kSuccess && handle != 0 && id != 0 &&
+                  kernel::FromHandle(handle).get() == live.get(),
+              "a live synthetic child publishes its handle and id");
+        const mem::Stats before = mem::Query();
+        kernel::AuthenticSystemThreadRequest request;
+        request.handle_out = fixture::kHandleOut;
+        request.stack_size = 0x10000;
+        request.tls_size = 0x94;
+        request.thread_id_out = fixture::kIdOut;
+        request.start_routine = fixture::kChildStop;
+        request.start_context = 0;
+        request.system_routine = fixture::kChildEntry;
+        request.call_pc = 0x001103A;
+        request.argument_count = 10;
+        request.policy_identity = "synthetic-assessment";
+        request.dispatch_generation = dispatch::CallLease().Generation();
+        request.memory_generation = mem::Generation();
+        const kernel::SystemThreadAssessmentContract contract{
+            fixture.sha1.c_str(), fixture::kChildEntry, fixture::kChildStop, 0x001103A, 10, 0x94,
+            "synthetic-assessment",
+        };
+        for (int repeat = 0; repeat < 5; ++repeat) {
+            const kernel::AuthenticAdmissionResult assessed = kernel::AssessSystemThreadRequest(request, contract);
+            uint32_t observed_handle = 0, observed_id = 0;
+            mem::Read(fixture::kHandleOut, &observed_handle, sizeof(observed_handle));
+            mem::Read(fixture::kIdOut, &observed_id, sizeof(observed_id));
+            Check(assessed.status == kernel::AuthenticAdmissionStatus::kValidatedButExecutionProhibited &&
+                      observed_handle == handle && observed_id == id,
+                  "assessment is repeatable and leaves the live handle and id unchanged");
+        }
+        Check(mem::Query().system_used == before.system_used &&
+                  mem::Query().contiguous_used == before.contiguous_used &&
+                  kernel::Threads().empty(),
+              "assessment candidates release every allocation and registration");
+        kernel::AuthenticSystemThreadRequest wrong = request;
+        wrong.call_pc = 0x001103B;
+        Check(kernel::AssessSystemThreadRequest(wrong, contract).status ==
+                  kernel::AuthenticAdmissionStatus::kInvalidCallSite,
+              "assessment rejects a wrong call site");
+        wrong = request;
+        wrong.tls_size = 0x90;
+        Check(kernel::AssessSystemThreadRequest(wrong, contract).status ==
+                  kernel::AuthenticAdmissionStatus::kRejected,
+              "assessment rejects an invalid TLS block");
+        wrong = request;
+        wrong.policy_identity = "wrong-policy";
+        Check(kernel::AssessSystemThreadRequest(wrong, contract).status ==
+                  kernel::AuthenticAdmissionStatus::kInvalidPolicyIdentity,
+              "assessment rejects a wrong policy identity");
+        kernel::SystemThreadAssessmentContract wrong_image = contract;
+        wrong_image.image_sha1 = "0000000000000000000000000000000000000000";
+        Check(kernel::AssessSystemThreadRequest(request, wrong_image).status ==
+                  kernel::AuthenticAdmissionStatus::kInvalidImage,
+              "assessment rejects a wrong image identity");
+        mem::Read(fixture::kHandleOut, &handle, sizeof(handle));
+        mem::Read(fixture::kIdOut, &id, sizeof(id));
+        Check(handle != 0 && id != 0 && kernel::FromHandle(handle).get() == live.get(),
+              "rejected assessments do not alter the live child");
+        Check(kernel::CloseHandle(handle) && !kernel::FromHandle(handle),
+              "the live child's handle closes through the ordinary checked path");
+        Check(kernel::CancelPreparedThread(live), "the live prepared child cancels after handle close");
+        uint32_t cleared_handle = 1, cleared_id = 1;
+        mem::Read(fixture::kHandleOut, &cleared_handle, sizeof(cleared_handle));
+        mem::Read(fixture::kIdOut, &cleared_id, sizeof(cleared_id));
+        Check(cleared_handle == 0 && cleared_id == 0,
+              "cancellation clears the live child's published outputs after the close");
+
+        const uint32_t zero = 0;
+        mem::Write(fixture::kHandleOut, &zero, sizeof(zero));
+        mem::Write(fixture::kIdOut, &zero, sizeof(zero));
+        const kernel::AuthenticAdmissionResult assessed = kernel::AssessSystemThreadRequest(request, contract);
+        uint32_t after_assessment_handle = 1, after_assessment_id = 1;
+        mem::Read(fixture::kHandleOut, &after_assessment_handle, sizeof(after_assessment_handle));
+        mem::Read(fixture::kIdOut, &after_assessment_id, sizeof(after_assessment_id));
+        Check(assessed.status == kernel::AuthenticAdmissionStatus::kValidatedButExecutionProhibited &&
+                  after_assessment_handle == 0 && after_assessment_id == 0,
+              "assessment leaves an unwritten handle and id output for the real creation");
+        kernel::ThreadRef actual;
+        const uint32_t created = kernel::PrepareSystemThreadEx(
+            fixture::kHandleOut, 0x10000, 0x94, fixture::kIdOut, fixture::kChildStop, 0, false,
+            fixture::kChildEntry, actual);
+        uint32_t actual_handle = 0, actual_id = 0;
+        mem::Read(fixture::kHandleOut, &actual_handle, sizeof(actual_handle));
+        mem::Read(fixture::kIdOut, &actual_id, sizeof(actual_id));
+        Check(created == kernel::kSuccess && actual_handle != 0 && actual_id != 0,
+              "creation after assessment publishes the real handle and id");
+        Check(kernel::CloseHandle(actual_handle) && !kernel::FromHandle(actual_handle),
+              "the created child's handle closes normally after assessment");
+        Check(kernel::CancelPreparedThread(actual), "the created child cancels after its handle close");
+        mem::Read(fixture::kHandleOut, &actual_handle, sizeof(actual_handle));
+        mem::Read(fixture::kIdOut, &actual_id, sizeof(actual_id));
+        Check(actual_handle == 0 && actual_id == 0,
+              "the created child's outputs clear on cancellation");
+    }
+    {
+        ResetData();
+        g_stack_probe = false;
+        g_stack_mutation_started = false;
+        g_stack_mutation_done = false;
+        g_stack_mutation_status = -1;
+        run::SetInjectionHookForTest(run::Role::kParent, 0x0011040, HoldForStackMutation);
+        const Started started = StartParent(fixture);
+        const uint32_t stack_page = (started.parent->stack_top - 1) & ~(mem::kPage - 1);
+        std::thread mutator([&] {
+            while (!g_stack_probe.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            g_stack_mutation_started = true;
+            g_stack_mutation_status = mem::Decommit(stack_page, mem::kPage) ? 1 : 0;
+            g_stack_mutation_done = true;
+        });
+        JoinThread(started.parent);
+        WaitForRole(run::Role::kChild);
+        WaitForRole(run::Role::kParent);
+        mutator.join();
+        run::ClearInjectionHooksForTest();
+        run::RunEvidence parent, child;
+        const bool have_parent = run::EvidenceForRole(run::Role::kParent, &parent);
+        const bool have_child = run::EvidenceForRole(run::Role::kChild, &child);
+        Check(started.parent->resources_released && g_stack_mutation_done.load(),
+              "a concurrent stack decommit completes only after the worker finalises");
+        Check(have_parent && parent.status == run::Status::kStopped && have_child &&
+                  child.status == run::Status::kStopped,
+              "the stack mutation does not disturb either reviewed stop");
+        std::printf("stack mutation decommit=%d\n", g_stack_mutation_status.load());
+    }
+    {
+        const mem::Stats final = mem::Query();
+        Check(final.system_used == allocation_baseline.system_used &&
+                  final.contiguous_used == allocation_baseline.contiguous_used &&
+                  final.virtual_committed == allocation_baseline.virtual_committed,
+              "all synthetic runs, assessments and cancellations restore the allocation baseline");
     }
 
     Check(kernel::StopKernelWorkers(), "the harness worker gate closes");

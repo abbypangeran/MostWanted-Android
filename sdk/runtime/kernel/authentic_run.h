@@ -82,6 +82,7 @@ struct RouteManifest {
     uint32_t seh_handler = 0;
     uint32_t seh_scope_table = 0;
     uint32_t seh_scope_bytes = 0;
+    uint32_t seh_scope_flag = 0xFFFFFFFFu;  // reviewed [E] value at the stop
     uint32_t tls_block_size = 0;         // 0 if the route does not initialise TLS
     uint32_t critical_section_object = 0;  // reviewed 277/294 object, 0 if none
 };
@@ -213,6 +214,33 @@ struct KernelObservation {
     Status status = Status::kReady;
 };
 
+enum class SehCheckKind : uint8_t {
+    kCapture,
+    kEntryAddress,
+    kStackBounds,
+    kPostPrologueEsp,
+    kCallerEbp,
+    kPreviousRecord,
+    kHandler,
+    kScopeFlag,
+    kScopeTable,
+    kSavedEsp,
+    kCallerEbpHeld,
+    kChain,
+    kHandlerResolve,
+    kScopeTerminator,
+};
+
+enum class SehCheckStatus : uint8_t { kPass, kFail, kUnknown, kSkipped };
+
+struct SehCheck {
+    uint8_t kind = 0;
+    uint8_t status = 0;
+    uint32_t expected = 0;
+    uint32_t observed = 0;
+    uint32_t address = 0;
+};
+
 struct RunEvidence {
     uint32_t role = 0;
     uint32_t origin = 0;
@@ -233,6 +261,8 @@ struct RunEvidence {
     bool at_stop = false;
     size_t trace_count = 0;
     size_t kernel_count = 0;
+    size_t seh_check_count = 0;
+    SehCheck seh_checks[16] = {};
 };
 
 bool EvidenceForRole(Role role, RunEvidence* evidence);

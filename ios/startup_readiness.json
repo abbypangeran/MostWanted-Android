@@ -1,11 +1,66 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-19",
-  "milestone": "PHASE_2D19_AUTHENTIC_RUN_HARNESS",
+  "phase": "2D-20",
+  "milestone": "FIRST_AUTHENTIC_RUN_REMEDIATION",
   "result": "PASS",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
   "image_sha1": "f636a16af04171089f879a4bed646e185c734233",
+  "first_authentic_run": {
+    "result": "EARLY_STOP",
+    "evidence_dir": ".local/ios-port/phase2d19-authentic-run/",
+    "authorisation_consumed": true,
+    "rerun": false,
+    "parent_retired": 55,
+    "parent_entries": 56,
+    "child_retired": 73,
+    "total_retired": 128,
+    "child_stop": "0x002B38A2",
+    "parent_stop_reached": false,
+    "first_divergence": {
+      "pc": "0x002B5D12",
+      "instruction": "ret 0x18",
+      "status": "unreviewed-transfer",
+      "cause": "parent manifest classified the RET as sequential"
+    },
+    "kernel_calls": [
+      {
+        "ordinal": 255,
+        "call": "0x002B5CE0",
+        "return": "0x002B5CE6",
+        "result": 0,
+        "reached": true
+      },
+      {
+        "ordinal": 277,
+        "call": "0x002B5986",
+        "return": "0x002B598C",
+        "result": 0,
+        "reached": true
+      },
+      {
+        "ordinal": 294,
+        "call": "0x002B59A9",
+        "return": "0x002B59AF",
+        "result": 0,
+        "reached": true
+      },
+      {
+        "ordinal": 187,
+        "call": "0x002B275D",
+        "result": null,
+        "reached": false
+      }
+    ],
+    "cleanup": {
+      "threads_empty": true,
+      "workers": 0,
+      "claims": 0,
+      "system": 0,
+      "contiguous": 0,
+      "virtual": 1280
+    }
+  },
   "frozen_route": {
     "instructions": 143,
     "root": 72,
@@ -25,7 +80,6 @@
     "withheld"
   ],
   "experiment_boundary": {
-    "scope": "parent CRT route -> ordinal-255 call -> child system routine/TLS fill -> SEH prologue -> pre-start walk -> dynamic start call -> stop before 0x002B38A2",
     "parent_executed": 71,
     "child_executed": 73,
     "total_executed": 144,
@@ -34,327 +88,216 @@
       {
         "pc": "0x002B3987",
         "owner": "parent",
-        "kind": "pre-instruction",
-        "instruction": "ret"
+        "kind": "pre-instruction"
       },
       {
         "pc": "0x002B38A2",
         "owner": "child",
         "kind": "pre-instruction",
-        "instruction": "call 0x002B58B8",
         "callee_instructions_executed": 0,
         "call_site": "0x002B5C7E",
         "call_return": "0x002B5C81"
       }
     ],
-    "segments": {
-      "parent_root": 71,
-      "child_system_routine": 35,
-      "child_seh_prologue": 19,
-      "child_pre_start_walk": 17,
-      "child_start_call_setup": 2
+    "identities": {
+      "mapping_entries": 152,
+      "mapping_code_bounds": "00011000..003714D4",
+      "mapping_identity": "EC3486BCAFA498BF",
+      "parent_manifest": "7F8AD72F529DC906",
+      "child_manifest": "DBCFD15B661E8CE6",
+      "parent_route_table": "0CAB6ED490B54606",
+      "child_route_table": "14FD36A4C6519854"
     },
-    "phase_2d18_correction": "2D-18 reported 145 as 72 root plus 73 child. The parent executes 71 instructions; its 72nd boundary entry is the refused ret at 0x002B3987. The exact executed total is 144.",
-    "excluded": [
-      "0x002B58B8 hardware/version selector",
-      "0x002B5854 [0x8001003C] probe",
-      "all KPRCB+0x250 reads",
-      "0x002B57D3 and 0x002B582B initializer walkers",
-      "all 867 live initializer targets",
-      "0x0032062A dynamic list callback",
-      "ordinal-258 termination"
-    ],
-    "mapping": {
-      "generator": "ios/recompiler-fixtures/authentic_run_config.cpp",
-      "policy": "one generated function per reviewed instruction; checked_memory; no entry, gap, pointer or callback seeding",
-      "entries": 152,
-      "reviewed_entries": 144,
-      "trap_entries": 8,
-      "code_bounds": "00011000..003714D4",
-      "identity": "EC3486BCAFA498BF",
-      "unchecked_dispatch": false,
-      "preflight": "PASS",
-      "execution": "PROHIBITED"
-    }
+    "mapping_identity_changed": false,
+    "manifest_identity_changed": true
   },
-  "authentic_run_harness": {
-    "status": "implemented_synthetic",
-    "compile_gate": "MOSTWANTED_AUTHENTIC_RUN_HARNESS",
-    "test_gate": "MOSTWANTED_AUTHENTIC_RUN_TESTS",
-    "ordinary_build_reachable": false,
-    "authentic_execution_switch": false,
-    "stop_enforcement": "checked dispatch boundary; target refused before entry; no post-execution PC check",
-    "bounds": {
-      "instructions": "per-worker budget",
-      "transfers": "per-worker budget",
-      "kernel_calls": "per-worker budget",
-      "call_depth": "per-worker limit"
-    },
-    "claims": {
-      "binding": "exact Thread*, thread id, image, mapping, dispatch and memory generations, reviewed manifest",
-      "non_transferable": true,
-      "revocable": true,
-      "invalid_after_shutdown": true,
-      "invalid_after_generation_change": true
-    },
-    "authentic_authorisation": "AuthorizeAuthenticRun validates every binding and returns kAuthenticExecutionNotAuthorised",
-    "production_assessment": "AssessAuthenticSystemThreadRequest remains evidence-only; no conversion to execution permission",
-    "executable_run_lease": "AcquireExecutableRun from worker start, released at the stop",
-    "trace": {
-      "origin_labels": ["authentic-image", "synthetic-fixture", "static-preflight"],
-      "records": [
-        "sequence",
-        "worker id",
-        "claim id",
-        "role",
-        "event",
-        "pc",
-        "target",
-        "esp",
-        "ebp",
-        "eax",
-        "ecx",
-        "edx",
-        "instruction count",
-        "transfer count",
-        "kernel call count",
-        "ordinal",
-        "seh registration",
-        "tls",
-        "stop status"
+  "remediation": {
+    "ret_classification": {
+      "result": "corrected",
+      "root_cause": "the Phase 2C root route table has no return step kind and marked 0x002B5D12 and 0x002B2774 as sequential; the Phase 2D-19 manifest inherited the kind",
+      "fix": [
+        "both parent RETs and the child walk RET are kRet with reviewed ret_pop_bytes",
+        "AdmitGuestReturn checks cleanup bytes, call depth, return address and caller continuation",
+        "authentic_run_preflight rejects decoded RET/kRet mismatches, wrong immediates and unreviewed continuations",
+        "Step.ret_pop_bytes is part of the manifest identity"
       ],
-      "host_pointers_logged": false
-    }
-  },
-  "authentic_admission": {
-    "validator": "ValidateAuthenticSystemRoutineAdmission",
-    "production_assessment": "AssessAuthenticSystemThreadRequest",
-    "valid_result": "VALIDATED_BUT_EXECUTION_PROHIBITED",
-    "executable_token": false,
-    "harness_authorisation": "kAuthenticExecutionAuthorised = false; no authentic claim exists",
-    "constants": {
-      "image_sha1": "f636a16af04171089f879a4bed646e185c734233",
-      "system_routine": "0x002B5C0F",
-      "start_routine": "0x002B38A2",
-      "ordinal_255_call_pc": "0x002B5CE0",
-      "ordinal_255_arguments": 10,
-      "tls_block_size": "0x94",
-      "callback_policy_identity": "7eec0a102a0485f4aa6e2036aece1aa00381fd99"
+      "synthetic_tests": [
+        "RET imm16 return and ESP restoration",
+        "corrupted return-address rejection",
+        "RET classified as sequential rejection",
+        "caller/callee return-target admission"
+      ]
     },
-    "child_binding": "BindChildThreadForRequest validates the reviewed request, prepared Thread, manifest endpoints, TLS block, generations and mapping, then binds a child claim (synthetic rehearsal only)",
-    "rejected_admission": "returns an NTSTATUS; no child worker is started",
-    "unresolved_flags": [
-      "kprcb_250",
-      "retail_seh",
-      "initializer_chain",
-      "physical_window_0x8001003C"
-    ]
-  },
-  "seh_and_kernels": {
-    "seh": {
-      "status": "implemented_synthetic",
-      "pc": "0x00319804",
-      "handler": "0x00319858",
+    "seh_verification": {
+      "result": "incorrect_verifier_expectation",
+      "finding": "the original verifier hard-coded the scope flag as 0xFFFFFFFF; the authentic caller 0x002B5C1B and [ebp-4],0 clears it to 0 while the registration and scope table stay live",
+      "observed_scope_flag": 0,
+      "expected_scope_flag_original": "0xFFFFFFFF",
+      "expected_scope_flag_corrected": 0,
+      "first_failing_predicate": "scope flag",
+      "evidence": [
+        "run trace contains the executed 0x002B5C1B instruction and the child stop",
+        "frame E=D005FF3C, saved ESP D005FF0C, EBP D005FF40, stop ESP D005FF04",
+        "post-scope stack word values were not recorded in the original trace"
+      ],
+      "fix": [
+        "RouteManifest.seh_scope_flag (0 for the authentic child)",
+        "VerifyStopSeh evaluates all fourteen predicates with expected/observed/address/status",
+        "synthetic child executes and [ebp-4],0 and uses scope flag 0",
+        "malformed-frame tests for scope flag, handler, previous record, scope table, saved ESP, chain and caller EBP"
+      ],
+      "retail_exception_delivery": "prohibited",
       "handler_executed": false,
-      "captured": ["call E", "previous fs:[0]", "caller EBP"],
-      "verified_at_stop": [
-        "live record",
-        "chain position",
-        "scope flag -1",
-        "scope table",
-        "saved ESP",
-        "caller EBP",
-        "handler resolution",
-        "scope-table terminator"
-      ],
-      "fault_while_live": "stop report; handler not called",
-      "retail_delivery": "prohibited"
+      "predicate_observation_status": "original trace insufficient for post-scope stack words; diagnostics added for the next authorised run"
     },
-    "kernels": [
-      {
-        "ordinal": 255,
-        "name": "PsCreateSystemThreadEx",
-        "arguments": 10,
-        "call_site": "0x002B5CE0",
-        "implementation": "harness bridge: PrepareSystemThreadEx, reviewed admission, child claim, StartThread",
-        "status": "implemented_synthetic"
-      },
-      {
-        "ordinal": 187,
-        "name": "NtClose",
-        "arguments": 1,
-        "call_site": "0x002B275D",
-        "implementation": "checked handle close",
-        "status": "implemented_synthetic"
-      },
-      {
-        "ordinal": 277,
-        "name": "RtlEnterCriticalSection",
-        "arguments": 1,
-        "call_site": "0x002B5986",
-        "implementation": "checked object, empty wait list, owner/recursion update, fail-closed contention",
-        "status": "implemented_synthetic"
-      },
-      {
-        "ordinal": 294,
-        "name": "RtlLeaveCriticalSection",
-        "arguments": 1,
-        "call_site": "0x002B59A9",
-        "implementation": "checked owner/recursion, restores the free layout, fail-closed malformed state",
-        "status": "implemented_synthetic"
-      }
-    ]
+    "assessment_handle": {
+      "result": "corrected",
+      "root_cause": "the assessment prepared its candidate with the live handle_out/thread_id_out and cancellation cleared the real child's published outputs",
+      "fix": [
+        "generic AssessSystemThreadRequest prepares an isolated candidate with zero output addresses",
+        "the live request outputs are checked readable/writable but never written by the assessment",
+        "the authentic wrapper uses the same isolated path"
+      ],
+      "tests": [
+        "five repeated assessments preserve a live synthetic handle/id",
+        "wrong call site/TLS/policy/image reject without touching the live child",
+        "candidate allocations and registrations return to baseline",
+        "assessment followed by real synthetic creation publishes the handle and permits checked NtClose",
+        "checked-fixture authentic assessment 812/812"
+      ]
+    },
+    "stack_lease": {
+      "result": "retained",
+      "scope": "whole-run code and stack leases",
+      "release": "before worker finalisation frees the stack",
+      "seh_verifier": "read-only; takes no conflicting stack lease",
+      "tests": [
+        "concurrent stack decommit waits for the lease and completes after finalisation",
+        "cancellation while the lease is held",
+        "failed child preparation",
+        "shutdown and generation changes",
+        "nested callbacks: not admitted by this harness; callback suite remains separate"
+      ]
+    },
+    "allocation_accounting": {
+      "tool": "authentic_run_accounting (static/preparation only)",
+      "baseline": {"virtual": 0},
+      "after_image": {"virtual": 1280, "available": 15104},
+      "after_threads": {"virtual": 1280, "system": 0, "contiguous": 0},
+      "after_cancel": {"virtual": 1280, "system": 0, "contiguous": 0},
+      "after_shutdown": {"virtual": 0, "available": 16384},
+      "conclusion": "the 1280 is the image reservation (0x500000 for the 0x4F8040 image rounded up), not a retained worker or stack; the first run's 1280 is the same reservation"
+    }
   },
   "gates": {
     "gate_a_preparation": {
       "result": "GO",
       "scope": "prepare and inspect the authentic image and thread structures without executing guest instructions",
-      "evidence": [
-        "image identity bound and compared",
-        "required parent/child manifests and generated mapping checked",
-        "prepared-thread and kernel admission layout checked",
-        "production assessment returns VALIDATED_BUT_EXECUTION_PROHIBITED",
-        "no worker starts and no authentic guest instruction executes"
-      ],
       "blockers": []
     },
     "gate_b_bounded_execution": {
       "result": "NO-GO",
       "scope": "the 144-executed-instruction entry boundary with both pre-instruction stops",
-      "technical_readiness": "harness, safety contract, synthetic rehearsal and static preflight PASS",
+      "technical_readiness": "harness, safety contract, corrected RET/SEH/assessment, synthetic suite and static preflight PASS",
       "blockers": [
-        "authentic execution authorisation is deliberately withheld",
-        "the authentic parent start path is not enabled (the synthetic rehearsal start is tested)",
-        "ordinals 277/294 and the SEH registration have not been observed on the authentic path",
-        "retail SEH exception delivery remains prohibited and unvalidated"
-      ],
-      "initializer_chain_required": false,
-      "kprcb_250_required": false,
-      "physical_window_required": false
+        "the first run's authorisation is consumed; a second run requires separate approval",
+        "retail SEH exception delivery remains prohibited; predicate diagnostics have not observed an authentic stop",
+        "ordinal 187 was not reached in the first run and must be observed on the corrected path",
+        "the authentic parent start driver/activation patch is not committed and the execution switch is false"
+      ]
     },
     "gate_c_authentic_startup": {
       "result": "NO-GO",
       "scope": "start routine through the initializer chain and list walk towards the game loop",
       "blockers": [
-        "persistent authentic authorisation for 867 live initializer targets",
-        "CLI/STI at 0x002B5957/0x002B595E and the version-selected hardware path",
-        "the dynamic list callback 0x0032062A and its registration",
-        "retail SEH 302/312, authentic ordinal 258 and the frame-sensitive 0x00316DA8",
-        "kernel-import compatibility including the fail-closed protection imports",
-        "remaining unsupported instructions, multiple authentic workers and scheduling",
-        "the system routine never returns: it terminates through ordinal 258 after the start routine"
-      ],
-      "initializer_chain_required": true
+        "867 live initializer target authorisation",
+        "CLI/STI and the version-selected hardware path",
+        "the dynamic list callback 0x0032062A",
+        "retail SEH 302/312, authentic ordinal 258 and 0x00316DA8",
+        "protection imports and multiple authentic workers/scheduling",
+        "the system routine never returns; it terminates through ordinal 258"
+      ]
     }
+  },
+  "proposed_second_experiment": {
+    "authorised": false,
+    "boundary": "same 144 executed / 146 boundary steps; both stops mandatory",
+    "mapping_identity": "EC3486BCAFA498BF",
+    "parent_manifest": "7F8AD72F529DC906",
+    "child_manifest": "DBCFD15B661E8CE6",
+    "seh_scope_flag": 0,
+    "requirements": [
+      "one new explicit user authorisation",
+      "reach both 0x002B3987 and 0x002B38A2",
+      "observe kernel 255, 187, 277 and 294",
+      "record every SEH predicate and TLS verification",
+      "reproduce the allocation baseline",
+      "no boundary extension"
+    ]
   },
   "dependencies": [
     {
-      "id": "pre_instruction_stop",
-      "dependency": "Exact pre-instruction stop at both boundaries",
-      "evidence": "one generated function per reviewed instruction; checked dispatch transfers",
-      "implementation": "authentic_run gate (AuthenticRunStop before target entry)",
-      "validation": "synthetic exact stops/counts; 20 Debug and 5 Release repeat runs",
+      "id": "ret_classification",
+      "dependency": "Returns classified and admitted as returns",
+      "evidence": "decoded RET/RET imm16, ret_pop_bytes, continuations",
+      "implementation": "kRet manifest entries, gate checks, preflight classifier",
+      "validation": "synthetic RET imm16, misclassification and return-target tests",
+      "status": "implemented_synthetic",
+      "blocker": ""
+    },
+    {
+      "id": "assessment_isolation",
+      "dependency": "Side-effect-free authentic assessment",
+      "evidence": "isolated zero-output candidate",
+      "implementation": "generic AssessSystemThreadRequest",
+      "validation": "repeated assessments, creation/close, negatives, checked fixture",
+      "status": "implemented_synthetic",
+      "blocker": ""
+    },
+    {
+      "id": "seh_normal_path",
+      "dependency": "Reviewed SEH registration on the normal path",
+      "evidence": "frame at E; scope flag 0 at the stop",
+      "implementation": "VerifyStopSeh with predicate diagnostics",
+      "validation": "normal and malformed-frame synthetic cases",
+      "status": "implemented_synthetic",
+      "blocker": "retail exception delivery prohibited"
+    },
+    {
+      "id": "stack_lease",
+      "dependency": "Whole-run code and stack lifetime",
+      "evidence": "code/stack leases released before finalisation",
+      "implementation": "RunBoundWorker",
+      "validation": "concurrent decommit, cancellation, failed child, shutdown",
       "status": "implemented_synthetic",
       "blocker": ""
     },
     {
       "id": "claim_bound_authorisation",
       "dependency": "Claim-bound authentic execution authorisation",
-      "evidence": "policy bound to image, reviewed manifests, mapping, policy identity and generations",
-      "implementation": "AuthorizeAuthenticRun (validates and withholds); synthetic-only AuthorizeRunForThread",
-      "validation": "synthetic claims, revocation, cancellation, refusals",
+      "evidence": "policy/manifest/mapping identities and generations",
+      "implementation": "AuthorizeAuthenticRun validates and withholds",
+      "validation": "synthetic claims and refusals",
       "status": "withheld",
-      "blocker": "kAuthenticExecutionAuthorised is false by design"
-    },
-    {
-      "id": "ordinal_255_binding",
-      "dependency": "Ordinal-255 child admission",
-      "evidence": "reviewed call site 0x002B5CE0, ten arguments, TLS 0x94, prepared child",
-      "implementation": "BindChildThreadForRequest; production assessment reused for authentic origin",
-      "validation": "synthetic child created, rejected admission, no child on failure",
-      "status": "implemented_synthetic",
-      "blocker": "authentic path not enabled"
-    },
-    {
-      "id": "seh_normal_path",
-      "dependency": "Reviewed SEH registration on the normal path",
-      "evidence": "prologue 0x00319804; frame captured at the call; read-only stop verification",
-      "implementation": "VerifyStopSeh",
-      "validation": "live frame, chain, scope, saved ESP, handler; fault-while-live handler never called",
-      "status": "implemented_synthetic",
-      "blocker": "retail exception delivery prohibited"
+      "blocker": "kAuthenticExecutionAuthorised is false"
     },
     {
       "id": "kernel_277_294",
       "dependency": "Checked critical-section imports",
       "evidence": "reviewed object 0x0046C8B0 and call sites",
-      "implementation": "checked enter/leave implementations",
-      "validation": "state updates, ABI cleanup, final free layout, fail-closed cases",
+      "implementation": "checked enter/leave",
+      "validation": "synthetic state and ABI",
       "status": "implemented_synthetic",
-      "blocker": "not observed on the authentic path"
+      "blocker": "not yet observed on the authentic path"
     },
     {
-      "id": "code_page_lifetime",
-      "dependency": "Executable code-page lifetime",
-      "evidence": "AcquireExecutableRun at worker start, released at the stop",
-      "implementation": "harness worker entry",
-      "validation": "existing CheckCodePageLeaseScope fixtures plus harness lease path",
+      "id": "ordinal_187",
+      "dependency": "Authentic NtClose",
+      "evidence": "0x002B275D, one argument",
+      "implementation": "checked handle close",
+      "validation": "synthetic child handle close",
       "status": "implemented_synthetic",
-      "blocker": ""
-    },
-    {
-      "id": "parent_child_shutdown",
-      "dependency": "Parent/child cancellation and deterministic finalisation",
-      "evidence": "per-worker claims and cancellation flags",
-      "implementation": "CancelAllRuns/RevokeRun; existing finalisation",
-      "validation": "both workers stopped, no residual threads/workers",
-      "status": "implemented_synthetic",
-      "blocker": ""
-    },
-    {
-      "id": "diagnostic_trace",
-      "dependency": "Experimental trace",
-      "evidence": "fixed trace records with origin and boundary evidence",
-      "implementation": "TraceRecord/TraceEvidence in the harness",
-      "validation": "synthetic trace shape and stop records",
-      "status": "implemented_synthetic",
-      "blocker": ""
-    },
-    {
-      "id": "gate_b_preflight",
-      "dependency": "Static authentic-run boundary preflight",
-      "evidence": "144 decoded instructions, 152-entry generated mapping, identity",
-      "implementation": "authentic_run_preflight (static only)",
-      "validation": "image, route text/targets, data, imports, generated mapping",
-      "status": "implemented_synthetic",
-      "blocker": "static readiness is not execution authorisation"
-    },
-    {
-      "id": "kprcb_250",
-      "dependency": "KPRCB+0x250 object pointer",
-      "evidence": "six reads; none in this boundary",
-      "implementation": "stays zero",
-      "validation": "static disassembly plus guarded access",
-      "status": "not_on_path",
-      "blocker": "becomes required past 0x002B38A2"
-    },
-    {
-      "id": "physical_window_0x8001003C",
-      "dependency": "Physical-window global 0x8001003C",
-      "evidence": "reached from 0x002B38A2's first call",
-      "implementation": "stays zero",
-      "validation": "static only",
-      "status": "not_on_path",
-      "blocker": "outside this boundary"
-    },
-    {
-      "id": "retail_seh",
-      "dependency": "Retail SEH RtlRaiseException/RtlUnwind (302/312)",
-      "evidence": "prologue 0x00319804; handler 0x00319858",
-      "implementation": "fail-closed",
-      "validation": "normal registration and read-only stop verification only",
-      "status": "prohibited",
-      "blocker": "exception delivery contracts not validated"
+      "blocker": "not reached in the first run"
     },
     {
       "id": "initializer_targets",
@@ -366,22 +309,31 @@
       "blocker": "Gate C only"
     },
     {
-      "id": "ordinal_258",
-      "dependency": "Authentic PsTerminateSystemThread",
-      "evidence": "the system routine always ends here after the start routine",
-      "implementation": "production bridge unchanged",
-      "validation": "synthetic child exit",
-      "status": "partial",
-      "blocker": "outside this boundary"
+      "id": "retail_seh",
+      "dependency": "Retail SEH RtlRaiseException/RtlUnwind (302/312)",
+      "evidence": "handler 0x00319858",
+      "implementation": "fail-closed",
+      "validation": "normal registration and diagnostics only",
+      "status": "prohibited",
+      "blocker": "exception delivery contracts not validated"
     },
     {
-      "id": "remaining_instructions",
-      "dependency": "Remaining x86 instructions and traps",
-      "evidence": "frozen route 143/143; experiment 144/144",
-      "implementation": "checked recompiler",
-      "validation": "integrated preflight and authentic_run_preflight",
-      "status": "partial",
-      "blocker": "start routine, CLI/STI, INT3 and the initializer chain"
+      "id": "kprcb_250",
+      "dependency": "KPRCB+0x250 object pointer",
+      "evidence": "six reads; none in this boundary",
+      "implementation": "stays zero",
+      "validation": "static",
+      "status": "not_on_path",
+      "blocker": "becomes required past 0x002B38A2"
+    },
+    {
+      "id": "physical_window_0x8001003C",
+      "dependency": "Physical-window global 0x8001003C",
+      "evidence": "reached from 0x002B38A2's first call",
+      "implementation": "stays zero",
+      "validation": "static",
+      "status": "not_on_path",
+      "blocker": "outside this boundary"
     },
     {
       "id": "protection_imports",
@@ -391,37 +343,19 @@
       "validation": "none",
       "status": "fail_closed",
       "blocker": "not on the build-5838 path"
-    },
-    {
-      "id": "frame_sensitive_00316DA8",
-      "dependency": "Frame-sensitive callback 0x00316DA8",
-      "evidence": "reads its caller's stack frame",
-      "implementation": "none",
-      "validation": "static classification",
-      "status": "unresolved",
-      "blocker": "caller-frame layout and ABI unresolved"
-    },
-    {
-      "id": "dynamic_list_callback",
-      "dependency": "Dynamic list callback 0x0032062A",
-      "evidence": "registered through 0x0031BBA5, invoked after 0x002B5C86, RET 4",
-      "implementation": "none",
-      "validation": "static reconstruction",
-      "status": "static_only",
-      "blocker": "runtime provenance and node lifetime unresolved"
     }
   ],
   "validation": {
-    "authentic_run_tests": {
-      "debug": "44 PASS / 0 FAIL",
-      "release": "44 PASS / 0 FAIL",
-      "repeat_runs": "20 Debug and 5 Release, 0 failures"
-    },
+    "authentic_run_tests": "79 PASS / 0 FAIL, Debug and Release",
     "checked_recompiler_fixtures": "812 PASS / 0 FAIL, Debug and Release",
     "safe_ctests": "5/5, Debug and Release (-E execution_probe)",
-    "preflights": "authentic_run_preflight --generated PASS; gate_b_preflight PASS; root, secondary and integrated static preflights exit 0",
+    "authentic_run_preflight": "PASS, 152/152, EC3486BCAFA498BF, 144 executed / 146 boundary steps",
+    "identity_preflight": "parent 7F8AD72F529DC906, child DBCFD15B661E8CE6",
+    "gate_b_preflight": "PASS",
+    "root_secondary_integrated_static_preflights": "exit 0; integrated 143/143; production assessment validated-but-execution-prohibited",
+    "authentic_run_accounting": "PASS; virtual=1280 after image, 0 after shutdown",
     "android_arm64_syntax": "PASS (dispatch.cpp, threads.cpp, worker_lifecycle.cpp)",
-    "excluded": "execution_probe* CTests execute synthetic copies of authentic route bytes and are not acceptance evidence",
+    "excluded": "execution_probe* fixtures were not used as acceptance evidence",
     "authentic_image_executed": false,
     "frozen_phase_2c41_rerun": false
   },

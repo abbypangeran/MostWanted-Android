@@ -542,6 +542,35 @@ target_compile_definitions(authentic_run_preflight PRIVATE EXECUTION_PROBE_REAL_
 target_link_libraries(authentic_run_preflight PRIVATE Zydis)
 set_target_properties(authentic_run_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
+# Phase 2D-20: static/preparation memory accounting. This target never
+# initializes dispatch or starts a worker; it prepares the same Thread blocks
+# and prints the guest memory counters for the virtual=1280 reconciliation.
+add_executable(authentic_run_accounting
+    authentic_run_accounting.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch.cpp
+    ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
+    ${XBE_SDK}/runtime/cpu/memory_fault.cpp
+    ${XBE_SDK}/runtime/core/log.cpp
+    ${XBE_SDK}/runtime/kernel/clock_worker.cpp
+    ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
+    ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/memory_protection.cpp
+    ${XBE_SDK}/runtime/kernel/objects.cpp
+    ${XBE_SDK}/runtime/kernel/ordinals.cpp
+    ${XBE_SDK}/runtime/kernel/threads.cpp
+    ${XBE_SDK}/runtime/kernel/crypto.cpp
+    ${XBE_SDK}/runtime/xbe/image_loader.cpp
+    ${AUTHENTIC_RUN_FIXTURE_GENERATED_SOURCE}
+    ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}/x86_func_mapping.cpp
+)
+add_dependencies(authentic_run_accounting generate_authentic_run_fixture)
+target_compile_features(authentic_run_accounting PRIVATE cxx_std_20)
+target_include_directories(authentic_run_accounting PRIVATE ${XBE_SDK}/runtime
+                            ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(authentic_run_accounting PRIVATE AUTHENTIC_RUN_XBE="${EXECUTION_PROBE_REAL_XBE}")
+target_link_libraries(authentic_run_accounting PRIVATE Threads::Threads)
+set_target_properties(authentic_run_accounting PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
 if(BUILD_TESTING)
     add_test(NAME checked_recompiler_tests COMMAND checked_recompiler_tests)
     add_test(NAME checked_fault_handler_tests COMMAND checked_fault_handler_tests)

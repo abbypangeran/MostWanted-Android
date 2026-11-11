@@ -433,6 +433,22 @@ struct AuthenticSystemThreadRequest {
     uint64_t memory_generation = 0;
 };
 
+// The reviewed contract the assessment evaluates. The authentic wrapper fills
+// this with the authentic constants; tests use an independently constructed
+// contract so the side-effect-free assessment path can be exercised on
+// synthetic guest structures.
+struct SystemThreadAssessmentContract {
+    const char* image_sha1 = nullptr;
+    uint32_t system_routine = 0;
+    uint32_t start_routine = 0;
+    uint32_t call_pc = 0;
+    uint32_t argument_count = 0;
+    uint32_t tls_size = 0;
+    const char* policy_identity = nullptr;
+};
+
+AuthenticAdmissionResult AssessSystemThreadRequest(const AuthenticSystemThreadRequest& request,
+                                                   const SystemThreadAssessmentContract& contract);
 AuthenticAdmissionResult AssessAuthenticSystemThreadRequest(const AuthenticSystemThreadRequest& request);
 
 // files

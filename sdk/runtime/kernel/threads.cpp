@@ -576,67 +576,102 @@ AuthenticAdmissionResult ValidateAuthenticSystemRoutineAdmission(const Thread& p
     return result;
 }
 
-AuthenticAdmissionResult AssessAuthenticSystemThreadRequest(const AuthenticSystemThreadRequest& request) {
+AuthenticAdmissionResult AssessSystemThreadRequest(const AuthenticSystemThreadRequest& request,
+                                                   const SystemThreadAssessmentContract& contract) {
     AuthenticAdmissionResult result;
-    result.unresolved = kAuthenticUnresolvedKprcb250 | kAuthenticUnresolvedRetailSeh |
-                        kAuthenticUnresolvedInitializerChain | kAuthenticUnresolvedPhysicalWindow;
     auto malformed = [&result](SystemRoutineAdmission reason, uint32_t detail) {
         result.status = AuthenticAdmissionStatus::kRejected;
         result.reason = reason;
         result.detail = detail;
         return result;
     };
-    // The raw request must match the reviewed call site before anything is
-    // allocated; a mismatch is reported as a call-site violation, the same
-    // status the prepared-thread validator gives a wrong routine.
+    if (!contract.image_sha1 || !*contract.image_sha1 || !contract.policy_identity || !*contract.policy_identity ||
+        !contract.system_routine || !contract.start_routine || !contract.call_pc || !contract.argument_count ||
+        !contract.tls_size)
+        return malformed(SystemRoutineAdmission::kInvalidRequest, 0);
+    // The request must match the reviewed call site before anything is
+    // allocated. The assessment never writes the request's output slots.
     if (!request.handle_out || request.thread_extension_size || request.reserved ||
         (request.create_flags & 0xFFu))
         return malformed(SystemRoutineAdmission::kInvalidRequest,
                          request.thread_extension_size | request.reserved | (request.create_flags & 0xFFu));
-    if (request.call_pc != kAuthenticCreateThreadCallPc ||
-        request.argument_count != kAuthenticCreateThreadArguments ||
-        request.system_routine != kAuthenticSystemRoutine || request.start_routine != kAuthenticStartRoutine) {
+    if (mem::CheckAccess(request.handle_out, sizeof(uint32_t), mem::kRead | mem::kWrite) != mem::AccessStatus::kOk)
+        return malformed(SystemRoutineAdmission::kInvalidRequest, request.handle_out);
+    if (request.thread_id_out &&
+        mem::CheckAccess(request.thread_id_out, sizeof(uint32_t), mem::kRead | mem::kWrite) != mem::AccessStatus::kOk)
+        return malformed(SystemRoutineAdmission::kInvalidRequest, request.thread_id_out);
+    if (request.call_pc != contract.call_pc || request.argument_count != contract.argument_count ||
+        request.system_routine != contract.system_routine || request.start_routine != contract.start_routine) {
         result.status = AuthenticAdmissionStatus::kInvalidCallSite;
         result.detail = request.call_pc;
         return result;
     }
-    if (request.tls_size != kAuthenticTlsBlockSize)
+    if (request.tls_size != contract.tls_size)
         return malformed(SystemRoutineAdmission::kInvalidTls, request.tls_size);
     if (!request.policy_identity ||
-        std::strcmp(request.policy_identity, kAuthenticCallbackPolicyIdentity) != 0) {
+        std::strcmp(request.policy_identity, contract.policy_identity) != 0) {
         result.status = AuthenticAdmissionStatus::kInvalidPolicyIdentity;
         return result;
     }
     if (!mem::IsInitialized()) return malformed(SystemRoutineAdmission::kNotInitialized, 0);
     if (!KernelWorkersAccepting()) return malformed(SystemRoutineAdmission::kShutdown, 0);
 
-    // Prepare the candidate exactly as the production export would, then run the
-    // same core admission. Nothing is started; the candidate is cancelled and its
-    // resources return to the baseline before this function returns.
+    // Evaluate an isolated candidate. The live request's handle, thread-id and
+    // ownership are not passed to the candidate, so preparation and cleanup
+    // cannot clear or change a real child's published outputs.
     ThreadRef candidate;
     const uint32_t status = PrepareSystemThreadEx(
-        request.handle_out, request.stack_size ? request.stack_size : 0x10000, request.tls_size, request.thread_id_out,
-        request.start_routine, request.start_context, false, request.system_routine, candidate);
+        0, request.stack_size ? request.stack_size : 0x10000, request.tls_size, 0, request.start_routine,
+        request.start_context, false, request.system_routine, candidate);
     if (status != kSuccess || !candidate)
         return malformed(SystemRoutineAdmission::kInvalidRequest, status);
 
-    AuthenticAdmissionSpec spec;
-    spec.expected_image_sha1 = kAuthenticImageSha1;
-    spec.expected_system_routine = kAuthenticSystemRoutine;
-    spec.expected_start_routine = kAuthenticStartRoutine;
-    spec.call_pc = kAuthenticCreateThreadCallPc;
-    spec.argument_count = kAuthenticCreateThreadArguments;
-    spec.expected_policy_identity = kAuthenticCallbackPolicyIdentity;
+    SystemRoutineAdmissionSpec spec;
+    spec.expected_image_sha1 = contract.image_sha1;
+    spec.expected_parent_id = request.parent_id;
+    spec.expected_start_routine = contract.start_routine;
+    spec.expected_system_routine = contract.system_routine;
     spec.dispatch_generation = request.dispatch_generation;
     spec.memory_generation = request.memory_generation;
-    spec.expected_parent_id = request.parent_id;
-    result = ValidateAuthenticSystemRoutineAdmission(*candidate, spec);
+    const SystemRoutineAdmissionResult checked = ValidateSystemRoutineAdmission(*candidate, spec);
+    if (checked.status != SystemRoutineAdmission::kAdmitted) {
+        result.status = checked.status == SystemRoutineAdmission::kInvalidImage
+                            ? AuthenticAdmissionStatus::kInvalidImage
+                            : AuthenticAdmissionStatus::kRejected;
+        result.reason = checked.status;
+        result.detail = checked.detail;
+        CancelPreparedThread(candidate);
+        return result;
+    }
+    if (uint64_t(candidate->stack_top) - candidate->tls != contract.tls_size) {
+        result.status = AuthenticAdmissionStatus::kRejected;
+        result.reason = SystemRoutineAdmission::kInvalidTls;
+        result.detail = uint32_t(uint64_t(candidate->stack_top) - candidate->tls);
+        CancelPreparedThread(candidate);
+        return result;
+    }
+    const uint32_t candidate_id = candidate->id;
     if (!CancelPreparedThread(candidate)) {
-        // A candidate that cannot be rolled back is not a valid assessment.
         result.status = AuthenticAdmissionStatus::kRejected;
         result.reason = SystemRoutineAdmission::kInvalidThreadState;
-        result.detail = candidate->id;
+        result.detail = candidate_id;
+        return result;
     }
+    result.status = AuthenticAdmissionStatus::kValidatedButExecutionProhibited;
+    result.reason = SystemRoutineAdmission::kAdmitted;
+    result.detail = candidate_id;
+    return result;
+}
+
+AuthenticAdmissionResult AssessAuthenticSystemThreadRequest(const AuthenticSystemThreadRequest& request) {
+    const SystemThreadAssessmentContract contract{
+        kAuthenticImageSha1,      kAuthenticSystemRoutine,        kAuthenticStartRoutine,
+        kAuthenticCreateThreadCallPc, kAuthenticCreateThreadArguments, kAuthenticTlsBlockSize,
+        kAuthenticCallbackPolicyIdentity,
+    };
+    AuthenticAdmissionResult result = AssessSystemThreadRequest(request, contract);
+    result.unresolved = kAuthenticUnresolvedKprcb250 | kAuthenticUnresolvedRetailSeh |
+                        kAuthenticUnresolvedInitializerChain | kAuthenticUnresolvedPhysicalWindow;
     return result;
 }
 
