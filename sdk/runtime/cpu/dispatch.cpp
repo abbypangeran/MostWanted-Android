@@ -204,6 +204,15 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
     ctx.last_icall = target;
     dispatch::CallLease lease;
     const dispatch::ResolvedTarget resolved = lease.Resolve(target);
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    // A tail jump reaches generated code without a callback admission. Keep the
+    // destination run pinned so the path cannot execute on a mutated mapping;
+    // target authorization for this form remains a documented gap.
+    mem::ScopedPageLease tail_code_lease;
+    if (resolved.kind == dispatch::TargetKind::kGeneratedFunction && kernel::SyntheticWorkerClaimHeld() &&
+        tail_code_lease.AcquireExecutableRun(target, lease.CodeEnd()) != mem::AccessStatus::kOk)
+        x86_checked_trap(ctx, target, "synthetic tail-call code pages unavailable");
+#endif
     if (resolved.kind == dispatch::TargetKind::kContinuation) throw X86Resume{target, ctx.esp};
     if (resolved.kind == dispatch::TargetKind::kGeneratedFunction || resolved.kind == dispatch::TargetKind::kHostThunk) {
         resolved.function(ctx, base);
@@ -323,6 +332,12 @@ void CheckedIndirectCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32
             struct ReleaseAdmission {
                 ~ReleaseAdmission() { kernel::ReleaseSyntheticCallbackAdmission(); }
             } release;
+            // The nested callee gets its own executable-run lease. The outer
+            // ticket lease is already held, so a pending mutation fails this
+            // admission closed instead of blocking behind that lease.
+            mem::ScopedPageLease nested_code_lease;
+            if (nested_code_lease.AcquireExecutableRun(target, resolution.CodeEnd()) != mem::AccessStatus::kOk)
+                x86_checked_trap(ctx, call_pc, "synthetic callback code pages unavailable");
             CheckedCall(ctx, base, target, return_address, call_pc);
             if (ctx.esp != expected_esp)
                 x86_checked_trap(ctx, call_pc, "synthetic callback ABI stack cleanup mismatch");
@@ -336,7 +351,7 @@ void CheckedIndirectCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32
             if (!kernel::SyntheticWorkerHasNestedCallback() ||
                 !kernel::SyntheticWorkerAuthorizesNestedCallback(target, lease.Generation()))
                 x86_checked_trap(ctx, call_pc, "unauthorized synthetic nested callback target");
-            const mem::AccessStatus status = callback_code_lease.Acquire(target, 1, mem::kExecute);
+            const mem::AccessStatus status = callback_code_lease.AcquireExecutableRun(target, lease.CodeEnd());
             if (status != mem::AccessStatus::kOk) throw X86MemoryFault{call_pc, target, status, false};
         }
     }
@@ -364,6 +379,9 @@ void x86_checked_call(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t 
             struct ReleaseAdmission {
                 ~ReleaseAdmission() { kernel::ReleaseSyntheticCallbackAdmission(); }
             } release;
+            mem::ScopedPageLease nested_code_lease;
+            if (nested_code_lease.AcquireExecutableRun(target, resolution.CodeEnd()) != mem::AccessStatus::kOk)
+                x86_checked_trap(ctx, call_pc, "synthetic callback code pages unavailable");
             CheckedCall(ctx, base, target, return_address, call_pc);
             if (ctx.esp != expected_esp)
                 x86_checked_trap(ctx, call_pc, "synthetic callback ABI stack cleanup mismatch");
@@ -574,12 +592,14 @@ GuestCallbackStatus ValidateCallbackTicket(const GuestCallbackTicket& ticket, ui
         return GuestCallbackStatus::kStaleDispatch;
     const GuestCallbackStatus mapped = ValidateMappedCallback(target, lease, function);
     if (mapped != GuestCallbackStatus::kReady) return mapped;
-    // Pin only the page the entry point lives on, the same scope the nested
-    // callback path uses. Leasing the whole code range made every extra code
-    // section a precondition on unrelated (and possibly uncommitted) pages.
-    return code_lease.Acquire(target, 1, mem::kExecute) == mem::AccessStatus::kOk
-               ? GuestCallbackStatus::kReady
-               : GuestCallbackStatus::kCodePageDenied;
+    // Lease the maximal executable run from the entry. A generated function may
+    // cross a page boundary or call another generated function, and the compiled
+    // body never fetches its own bytes, so one run lease covers every page this
+    // admission can execute from without pinning unrelated sections.
+    const mem::AccessStatus leased = code_lease.AcquireExecutableRun(target, lease.CodeEnd());
+    if (leased == mem::AccessStatus::kOk) return GuestCallbackStatus::kReady;
+    return leased == mem::AccessStatus::kBusy ? GuestCallbackStatus::kCodePageBusy
+                                              : GuestCallbackStatus::kCodePageDenied;
 }
 
 GuestCallbackStatus ValidateCallbackStack(X86Context& ctx, uint32_t stack_base, uint32_t stack_size,
@@ -634,8 +654,10 @@ GuestCallbackStatus PrepareGuestCallback(uint32_t target, GuestCallbackClass cal
     const GuestCallbackStatus mapped = ValidateMappedCallback(target, lease, function);
     if (mapped != GuestCallbackStatus::kReady) return mapped;
     mem::ScopedPageLease code_lease;
-    if (code_lease.Acquire(target, 1, mem::kExecute) != mem::AccessStatus::kOk)
-        return GuestCallbackStatus::kCodePageDenied;
+    const mem::AccessStatus leased = code_lease.AcquireExecutableRun(target, lease.CodeEnd());
+    if (leased != mem::AccessStatus::kOk)
+        return leased == mem::AccessStatus::kBusy ? GuestCallbackStatus::kCodePageBusy
+                                                  : GuestCallbackStatus::kCodePageDenied;
     if (!KernelWorkersAccepting()) return GuestCallbackStatus::kCancelled;
     ticket = {target, lease.Generation(), callback_class};
     return GuestCallbackStatus::kReady;

@@ -3945,3 +3945,82 @@ The fixture grew from 721 to 732 assertions. `synthetic_startup_integration_test
 The scheduling and ownership layer is no longer the blocker: two managed workers can run, isolate state and finalise independently. What remains before a controlled authentic startup is **an authentic admission route** — a reviewed way for the real `PsCreateSystemThreadEx` call at `0x002B5CD0` to start the `0x002B5C0F` system routine under a validated claim — together with the initializer chain, `KPRCB+0x250` and retail SEH. The next package should be the **authentic system-routine admission design**: bind `0x002B5C0F` to the now-working worker/session machinery with static argument and memory preconditions, without enabling any authentic instruction yet.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-16 — system-routine admission and executable-page lifetime
+
+**`PHASE_2D16_SYSTEM_ROUTINE_ADMISSION = PASS`.** The callback code-page lease is now an executable-run lease shared by every admission path, and a checked, non-executing `ValidateSystemRoutineAdmission` contract gates the prepared system-routine request that the synthetic ordinal-255 bridge builds. A generated parent creates a child whose synthetic system routine fills TLS, calls the start routine, which runs two permitted nested callbacks on other pages and terminates through ordinal 258. No authentic instruction ran; the frozen Phase 2C-41 route is unchanged.
+
+### Executable-page lifetime
+
+Phase 2D-15 replaced the whole-code lease with an entry-page lease. That left two gaps: a generated function whose instructions cross a 4 KB boundary executed with its later pages unpinned, and every nested callback admitted while holding the outer lease took no lease of its own. The fix is `mem::ScopedPageLease::AcquireExecutableRun(va, limit)` (`sdk/runtime/kernel/memory.cpp`), used by every code admission:
+
+- It leases the maximal contiguous run of committed, executable pages containing the entry, capped at the dispatch code end. Generated code never fetches its own bytes, so this is the complete set of code pages the compiled body can execute from, without pinning a code section's gaps or unrelated pages.
+- A thread that already holds a lease never waits for a mutation. A re-acquisition fully covered by a range it already leases only increments the counts; one that is not covered fails as `mem::AccessStatus::kBusy` when a mutator has marked one of its pages. This removes the Phase 2D-13 nested-lease deadlock class: a mutator may be waiting for the outer lease, so a nested wait could never complete.
+- `ValidateCallbackTicket`, `PrepareGuestCallback`, both nested-callback paths, the tail-call path (`x86_icall`) and the synthetic continuation/unwind paths all use the run lease. The whole-code leases in `guest_exception_chain.h` are gone.
+
+`ios/memory-tests` proves the primitive: a mid-page entry leases every contiguous page, a mutation of the last page waits for the lease, a non-executable middle page ends the run (the pages after it are not pinned), and a readable/writable entry is rejected. The checked fixture proves the execution side: the new `.text3` section at `0x13F00` holds a callback at `0x13FF0` whose call instruction straddles `0x14000`; a mutation of the second page waits for the lease while it runs, both pages' markers are written, and the worker exits with `0x55555555`. A nested outer callback on `0x14000` calls a callback on `0x13000`; only the nested lease can explain why a mutation of `0x13000` waits. A target page made non-executable between admission and execution is rejected before its body runs.
+
+### Checked system-routine admission
+
+`sdk/runtime/kernel/threads.cpp` now owns `SetImageIdentity`/`ImageIdentityMatches` (bound from `boot.cpp` to the recompiled image's SHA-1) and `ValidateSystemRoutineAdmission(const Thread&, const SystemRoutineAdmissionSpec&)`. It inspects a **prepared** thread without executing anything and returns a precise status:
+
+| Check | Rejection |
+|---|---|
+| guest memory initialized | `kNotInitialized` |
+| workers accepting | `kShutdown` |
+| expected image SHA-1 | `kInvalidImage` |
+| expected parent thread id | `kInvalidParent` |
+| registry ceiling (`kMaximumGuestThreads = 256`) | `kRegistryFull` |
+| free synthetic claim slot (synthetic builds) | `kInvalidSession` |
+| `Prepared`, not activated, resources owned | `kInvalidThreadState` |
+| memory generation match | `kStaleMemory` |
+| stack bounds and checked read/write | `kInvalidStack` |
+| `TlsData == StackBase - tls_size`, CRT `align16(n)+4` shape | `kInvalidTls` |
+| KPCR/KPRCB/ETHREAD read-back | `kInvalidThreadBlocks` |
+| active `ctx->fs_base == kpcr` | `kInvalidFsBase` |
+| dispatch generation and start routine mapping | `kStaleDispatch` / `kInvalidStartRoutine` |
+| system routine identity and mapping | `kInvalidSystemRoutine` |
+| entry-page execute permission | `kInvalidCodePage` |
+
+The contract does **not** authorise execution: `StartThread` still builds its callback tickets and the synthetic claim gate still applies. The test-only ordinal-255 bridge calls it before arming the child, and the descriptor now carries `{magic, expected_exit, system_routine, reserved}` so the bridge argument and descriptor must agree; a mismatch returns `kInvalidParameter` and no child exists.
+
+### Generated system-routine evidence
+
+| Function | Address | Role |
+|---|---|---|
+| synthetic system routine | `13F10` | reads `FS:[0x28]`, fills `[TlsData]`, calls the start routine with its context, terminates through ordinal 258 |
+| synthetic start routine | `13F50` | reads `FS:[0x28]/[4]/[0x20]`, writes the `"SROU"` TLS marker, runs two admitted callbacks, terminates with `0xC0DE1602` |
+| nested/pausing callback | `13FC0` | entered marker, `NtClose` pause, released marker |
+| cross-page callback | `13FF0` | straddling call, second-page marker |
+| simple callback | `14020` | counter and return |
+| outer callback | `14040` | calls the `13000`-page callback across pages |
+| parent start | `14060` | ordinal-255 create with `system_routine = 13F10`, `NtClose`, normal return |
+
+`StartThread` now invokes the **system routine** ticket with `{start_routine, start_context}` when one is set (previously it always called the start routine), and the synthetic claim target is the system routine. The child's session admits the system routine's one-argument `CALL ECX` (callee cleanup) and the start routine's two indirect callbacks.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 766 PASS / 0 FAIL | 766 PASS / 0 FAIL |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Root / secondary / integrated self-test | 38 / 24 / 68 PASS | 38 / 24 / 68 PASS |
+| Root `--static-real` | PASS | — |
+| Root / secondary / integrated `--preflight` | PASS, exit 0 | PASS, exit 0 |
+| Integrated preflight route | 143/143 instructions, 72 + 71, stop `002B5C7B` | same |
+| Android ARM64 syntax (`memory.cpp`, `dispatch.cpp`, `threads.cpp`, `boot.cpp`) | PASS | — |
+
+The fixture grew from 732 to 766 assertions (+34). Regenerating the fixture exposed one stale expectation in `fault_handler_test.cpp` (`0x1113F` calls `0x12000`, not `0x13000`); it now matches the generated diagnostic. No authentic instruction ran.
+
+### Readiness after D16
+
+See [`STARTUP_READINESS.md`](STARTUP_READINESS.md) (machine-readable copy: [`startup_readiness.json`](startup_readiness.json)). The smallest set of blockers for a separately authorised, controlled authentic single-worker experiment is:
+
+1. **`KPRCB+0x250`** — the authentic start routine reads it as an object pointer and takes its null branch; the owner, initialisation and lifetime are still unresolved. Do not fake it.
+2. **Authentic admission route** — the production ordinal-255 path still starts threads through `CallGuestCallback`, which returns `kExecutionDisabled` on Apple. Binding `0x002B5C0F` to a validated claim without enabling guest execution is the next implementation step.
+3. **Initializer chain** — the 867 live targets have a complete static policy but no runtime authorisation; multi-call admission exists only for synthetic slots.
+4. **Retail SEH 302/312** — `RtlRaiseException`/`RtlUnwind` remain raw and fail-closed; the authentic handler and epilogue contracts are not validated.
+5. **Remaining traps and imports** — `CLI`/`STI`, `INT3` and any unimplemented instruction on the startup path, plus the fail-closed protection imports (not on the build-5838 path).
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

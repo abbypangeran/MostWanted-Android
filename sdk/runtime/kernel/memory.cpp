@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -40,6 +41,30 @@ static std::mutex g_page_lease_lock;
 static std::condition_variable g_page_lease_changed;
 static std::vector<uint32_t> g_page_leases(kGuestPageCount, 0);
 static std::vector<uint8_t> g_page_mutating(kGuestPageCount, 0);
+// Ranges this thread already leases. A nested acquisition of a fully covered
+// range only increments the counts: the pages cannot be mutated while the outer
+// lease is held, so waiting would deadlock behind a pending mutation. A nested
+// acquisition of an uncovered range never waits either; it fails as busy when a
+// mutator already marked one of its pages.
+struct ThreadLeaseRange {
+    uint32_t first;
+    uint32_t count;
+};
+constexpr uint32_t kMaximumThreadLeaseRanges = 32;
+static thread_local std::array<ThreadLeaseRange, kMaximumThreadLeaseRanges> g_thread_lease_ranges{};
+static thread_local uint32_t g_thread_lease_range_count = 0;
+
+static bool ThreadAlreadyLeases(uint32_t first, uint32_t count) {
+    for (uint32_t p = first; p < first + count; ++p) {
+        bool covered = false;
+        for (uint32_t i = 0; i < g_thread_lease_range_count && !covered; ++i) {
+            const ThreadLeaseRange& range = g_thread_lease_ranges[i];
+            covered = p >= range.first && p < range.first + range.count;
+        }
+        if (!covered) return false;
+    }
+    return true;
+}
 #ifdef MOSTWANTED_GUEST_PAGE_LEASE_TESTS
 static std::atomic<PageMutationWaitHook> g_page_mutation_wait_hook{nullptr};
 #endif
@@ -448,21 +473,45 @@ AccessStatus ScopedPageLease::Acquire(uint32_t va, std::size_t size, uint8_t per
     const uint32_t first = va >> 12;
     const uint64_t end = uint64_t(va) + size;
     const uint32_t count = uint32_t(((end - 1) >> 12) - first + 1);
+    const bool covered = g_thread_lease_range_count && ThreadAlreadyLeases(first, count);
     {
         std::unique_lock lock(g_page_lease_lock);
-        g_page_lease_changed.wait(lock, [&] {
+        if (!covered && g_thread_lease_range_count) {
             for (uint32_t p = first; p < first + count; ++p)
-                if (g_page_mutating[p]) return false;
-            return true;
-        });
+                if (g_page_mutating[p]) return AccessStatus::kBusy;
+        } else if (!covered) {
+            g_page_lease_changed.wait(lock, [&] {
+                for (uint32_t p = first; p < first + count; ++p)
+                    if (g_page_mutating[p]) return false;
+                return true;
+            });
+        }
         for (uint32_t p = first; p < first + count; ++p) ++g_page_leases[p];
     }
     first_page_ = first;
     page_count_ = count;
     active_ = true;
+    if (g_thread_lease_range_count < kMaximumThreadLeaseRanges)
+        g_thread_lease_ranges[g_thread_lease_range_count++] = {first, count};
     const AccessStatus status = CheckAccess(va, size, permissions);
     if (status != AccessStatus::kOk) Release();
     return status;
+}
+
+AccessStatus ScopedPageLease::AcquireExecutableRun(uint32_t va, uint32_t limit) {
+    if (!limit || va >= limit || OverlapsPhysical(va, limit)) return AccessStatus::kInvalidAddress;
+    uint64_t end = va;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_lock);
+        if (!g_base) return AccessStatus::kNotInitialized;
+        if (g_poisoned) return AccessStatus::kHostError;
+        for (uint64_t page = va >> 12; page <= (uint64_t(limit) - 1) >> 12; ++page) {
+            if (!g_committed[size_t(page)] || !(g_permissions[size_t(page)] & kExecute)) break;
+            end = std::min<uint64_t>((page + 1) << 12, limit);
+        }
+    }
+    if (end == va) return AccessStatus::kPermissionDenied;
+    return Acquire(va, size_t(end - va), kExecute);
 }
 
 void ScopedPageLease::Release() {
@@ -473,6 +522,13 @@ void ScopedPageLease::Release() {
             if (g_page_leases[p]) --g_page_leases[p];
     }
     active_ = false;
+    // leases release in reverse order, so the last matching range is this one
+    for (uint32_t i = g_thread_lease_range_count; i > 0; --i) {
+        if (g_thread_lease_ranges[i - 1].first == first_page_ && g_thread_lease_ranges[i - 1].count == page_count_) {
+            g_thread_lease_ranges[i - 1] = g_thread_lease_ranges[--g_thread_lease_range_count];
+            break;
+        }
+    }
     first_page_ = page_count_ = 0;
     g_page_lease_changed.notify_all();
 }
@@ -489,6 +545,7 @@ const char* StatusName(AccessStatus status) {
         case AccessStatus::kUncommitted: return "uncommitted";
         case AccessStatus::kPermissionDenied: return "permission-denied";
         case AccessStatus::kHostError: return "host-error";
+        case AccessStatus::kBusy: return "page-busy";
     }
     return "unknown";
 }

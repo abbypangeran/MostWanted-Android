@@ -2222,6 +2222,591 @@ void CheckMultiWorkerSessions() {
           "multi-worker fixture bridges disable after quiescence");
 }
 
+// Phase 2D-16: executable-page lease scope and a checked, non-executing system
+// routine admission. Both use generated synthetic code only.
+namespace {
+
+std::mutex g_lease_lock;
+std::condition_variable g_lease_cv;
+bool g_lease_pause_entered = false;
+bool g_lease_pause_release = false;
+bool g_lease_mutation_waiting = false;
+
+// NtClose is reused as a pause point: the checked kernel bridge permits the
+// call, and the worker stays inside the callback while the test mutates a page.
+void LeasePauseHandler(X86Context& ctx, uint8_t*) {
+    {
+        std::unique_lock lock(g_lease_lock);
+        g_lease_pause_entered = true;
+        g_lease_cv.notify_all();
+        g_lease_cv.wait(lock, [] { return g_lease_pause_release; });
+    }
+    kernel::Return(ctx, kernel::kSuccess, 1);
+}
+
+void LeaseMutationWaitHook() {
+    {
+        std::lock_guard lock(g_lease_lock);
+        g_lease_mutation_waiting = true;
+    }
+    g_lease_cv.notify_all();
+}
+
+void ResetLeasePause() {
+    std::lock_guard lock(g_lease_lock);
+    g_lease_pause_entered = false;
+    g_lease_pause_release = false;
+    g_lease_mutation_waiting = false;
+}
+
+bool WaitLeasePause() {
+    std::unique_lock lock(g_lease_lock);
+    return g_lease_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_lease_pause_entered; });
+}
+
+bool WaitLeaseMutation() {
+    std::unique_lock lock(g_lease_lock);
+    return g_lease_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_lease_mutation_waiting; });
+}
+
+void ReleaseLeasePause() {
+    {
+        std::lock_guard lock(g_lease_lock);
+        g_lease_pause_release = true;
+    }
+    g_lease_cv.notify_all();
+}
+
+std::mutex g_admission_lock;
+std::condition_variable g_admission_cv;
+bool g_admission_entered = false;
+bool g_admission_release = false;
+
+void AdmissionPauseHook() {
+    std::unique_lock lock(g_admission_lock);
+    g_admission_entered = true;
+    g_admission_cv.notify_all();
+    g_admission_cv.wait(lock, [] { return g_admission_release; });
+}
+
+void ResetAdmissionPause() {
+    std::lock_guard lock(g_admission_lock);
+    g_admission_entered = false;
+    g_admission_release = false;
+}
+
+bool WaitAdmissionPause() {
+    std::unique_lock lock(g_admission_lock);
+    return g_admission_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_admission_entered; });
+}
+
+void ReleaseAdmissionPause() {
+    {
+        std::lock_guard lock(g_admission_lock);
+        g_admission_release = true;
+    }
+    g_admission_cv.notify_all();
+}
+
+uint64_t CurrentDispatchGeneration() {
+    dispatch::CallLease lease;
+    return lease.Generation();
+}
+
+uint32_t LeaseWord(uint32_t address) {
+    uint32_t value = 0;
+    mem::Read(address, &value, sizeof(value));
+    return value;
+}
+
+uint32_t LeaseWait(const kernel::ThreadRef& thread) {
+    return thread ? kernel::Wait({std::static_pointer_cast<kernel::Object>(thread)}, false, -100'000'000, false)
+                  : kernel::kTimeout;
+}
+
+}  // namespace
+
+void CheckCodePageLeaseScope() {
+    constexpr uint32_t code2_page = 0x13000, code3_page = 0x14000, data_page = 0xB0000;
+    constexpr uint32_t cross_entry = 0x13FF0;
+    constexpr uint32_t nested_entry = 0x13FC0;
+    constexpr uint32_t outer_entry = 0x14040, outer_nested_call = 0x1404A;
+    constexpr uint32_t handle_out = 0xB0040, id_out = 0xB0044;
+    constexpr uint32_t pause_slot = 0xB00CC, nested_slot = 0xB00C0;
+
+    kernel::RegisterExport(187, "NtClose", LeasePauseHandler);
+    std::string error;
+    const bool ready = mem::Init() && mem::Commit(code2_page, 2 * mem::kPage) && mem::Commit(data_page, mem::kPage) &&
+                       mem::Protect(code2_page, 2 * mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                       dispatch::Init(error) && kernel::RestartKernelWorkers() &&
+                       dispatch::SetKernel187FixtureBridge(true);
+    Check(ready, "code-page lease fixture memory, dispatch, bridge and workers initialize");
+    if (!ready) return;
+    const mem::Stats baseline = mem::Query();
+    mem::SetPageMutationWaitHookForTest(LeaseMutationWaitHook);
+    auto zero_data = [] {
+        uint32_t zero = 0;
+        for (uint32_t address = 0xB0000; address < 0xB00E0; address += 4)
+            mem::Write(address, &zero, sizeof(zero));
+    };
+    auto arm = [&](uint32_t start, uint32_t expected_exit, uint32_t slot_address, uint32_t slot_target,
+                   uint32_t call_pc, kernel::ThreadRef& thread) {
+        if (kernel::PrepareSystemThreadEx(handle_out, 0x10000, 0x24, id_out, start, 0, false, 0, thread) !=
+                kernel::kSuccess ||
+            !thread)
+            return false;
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.expected_exit = expected_exit;
+        authorization.code_base = X86CodeBase;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = CurrentDispatchGeneration();
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        if (!kernel::ArmSyntheticWorkerForThread(thread.get(), authorization)) return false;
+        if (slot_target) {
+            kernel::SyntheticSessionPolicy policy;
+            policy.image_identity = kernel::kSyntheticWorkerImageIdentity;
+            policy.code_base = X86CodeBase;
+            policy.code_end = X86CodeEnd;
+            policy.max_depth = 2;
+            policy.dispatch_generation = authorization.dispatch_generation;
+            policy.slot_count = 1;
+            policy.slots[0].entry = kernel::SyntheticCallbackEntry::kIndirectSlot;
+            policy.slots[0].slot_address = slot_address;
+            policy.slots[0].target = slot_target;
+            policy.slots[0].call_pc = call_pc;
+            if (!kernel::ArmSyntheticSessionForThread(thread.get(), policy)) return false;
+        }
+        return true;
+    };
+
+    {
+        // One callback whose instructions straddle 0x14000: the run lease must
+        // cover both pages, so a mutation of the second one waits for it.
+        ResetLeasePause();
+        zero_data();
+        const uint32_t thunk187 = dispatch::KernelThunkAddress(187);
+        mem::Write(pause_slot, &thunk187, sizeof(thunk187));
+        kernel::ThreadRef worker;
+        const bool prepared = arm(cross_entry, 0x55555555, 0, 0, 0, worker);
+        const bool started = prepared && kernel::StartThread(worker);
+        if (!prepared) kernel::CancelPreparedThread(worker);
+        const bool paused = started && WaitLeasePause();
+        std::atomic<bool> mutation_ok{false};
+        std::thread mutation([&] {
+            mutation_ok = mem::Protect(code3_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk;
+        });
+        const bool waiting = paused && WaitLeaseMutation();
+        if (started) ReleaseLeasePause();
+        const uint32_t wait = started ? LeaseWait(worker) : kernel::kTimeout;
+        mutation.join();
+        Check(paused && waiting, "a mutation of the callback's second page waits for the executable-run lease");
+        Check(mutation_ok.load(), "the second-page mutation completes once the callback returns");
+        Check(wait == kernel::kWait0 && worker && worker->state.load() == kernel::ThreadState::kExited &&
+                  worker->exit_code.load() == 0x55555555 && LeaseWord(0xB0090) == 0x11111111 &&
+                  LeaseWord(0xB0094) == 0x22222222,
+              "the cross-page callback ran instructions on both pages and exited with its own status");
+        Check(mem::Protect(code3_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+              "the second code page becomes executable again after the lease unwinds");
+    }
+
+    {
+        // The entry page is not executable: admission rejects before any guest
+        // instruction runs, and the worker is cancelled without a leak.
+        uint32_t zero = 0;
+        mem::Write(0xB00A0, &zero, sizeof(zero));
+        Check(mem::Protect(code2_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk,
+              "the nested callback's entry page becomes non-executable");
+        kernel::ThreadRef worker;
+        const bool armed = arm(nested_entry, 0xAAAA0003, 0, 0, 0, worker);
+        const bool started = armed && kernel::StartThread(worker);
+        if (!started) kernel::CancelPreparedThread(worker);
+        Check(armed && !started, "a non-executable entry page is rejected at callback preparation");
+        Check(mem::Protect(code2_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                  LeaseWord(0xB00A0) == 0 && worker && worker->state.load() != kernel::ThreadState::kActive &&
+                  worker->resources_released,
+              "the rejected callback executed no guest instruction and released its thread");
+    }
+
+    {
+        // Nested callbacks on distinct pages: the outer lease covers 0x14000, so
+        // only the nested lease can hold 0x13000 while the inner callback runs.
+        ResetLeasePause();
+        zero_data();
+        const uint32_t thunk187 = dispatch::KernelThunkAddress(187);
+        mem::Write(nested_slot, &nested_entry, sizeof(nested_entry));
+        mem::Write(pause_slot, &thunk187, sizeof(thunk187));
+        kernel::ThreadRef worker;
+        const bool prepared = arm(outer_entry, 0xAAAA0004, nested_slot, nested_entry, outer_nested_call, worker);
+        const bool started = prepared && kernel::StartThread(worker);
+        if (!prepared) kernel::CancelPreparedThread(worker);
+        const bool paused = started && WaitLeasePause();
+        std::atomic<bool> mutation_ok{false};
+        std::thread mutation([&] {
+            mutation_ok = mem::Protect(code2_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk;
+        });
+        const bool waiting = paused && WaitLeaseMutation();
+        if (started) ReleaseLeasePause();
+        const uint32_t wait = started ? LeaseWait(worker) : kernel::kTimeout;
+        mutation.join();
+        Check(paused && waiting && mutation_ok.load(),
+              "a nested callback's own page lease holds while the outer callback is still active");
+        Check(wait == kernel::kWait0 && worker && worker->state.load() == kernel::ThreadState::kExited &&
+                  worker->exit_code.load() == 0xAAAA0004 && LeaseWord(0xB0098) == 1 && LeaseWord(0xB00A0) == 1 &&
+                  LeaseWord(0xB00A4) == 1 && LeaseWord(0xB009C) == 1,
+              "the nested callback returned through the outer callback on another page");
+        Check(mem::Protect(code2_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+              "the nested code page becomes executable again after both leases unwind");
+    }
+
+    {
+        // The nested target's page turns non-executable between admission and
+        // the lease: the call must fail closed and the nested body must not run.
+        ResetAdmissionPause();
+        zero_data();
+        mem::Write(nested_slot, &nested_entry, sizeof(nested_entry));
+        const uint32_t thunk187 = dispatch::KernelThunkAddress(187);
+        mem::Write(pause_slot, &thunk187, sizeof(thunk187));
+        kernel::SetSyntheticSessionAdmissionHookForTest(AdmissionPauseHook);
+        kernel::ThreadRef worker;
+        const bool prepared = arm(outer_entry, 0xAAAA0004, nested_slot, nested_entry, outer_nested_call, worker);
+        const bool started = prepared && kernel::StartThread(worker);
+        if (!prepared) kernel::CancelPreparedThread(worker);
+        const bool paused = started && WaitAdmissionPause();
+        const bool mutated =
+            paused && mem::Protect(code2_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk;
+        if (started) ReleaseAdmissionPause();
+        const uint32_t wait = started ? LeaseWait(worker) : kernel::kTimeout;
+        kernel::SetSyntheticSessionAdmissionHookForTest(nullptr);
+        Check(mutated && wait == kernel::kWait0 && worker &&
+                  worker->state.load() == kernel::ThreadState::kCancelled && worker->exit_code.load() == 0 &&
+                  LeaseWord(0xB00A0) == 0 && worker->resources_released,
+              "a nested target whose page loses execute permission during admission is rejected before its body runs");
+        Check(mem::Protect(code2_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                  kernel::SyntheticSessionDepthForTest() == 0,
+              "the rejected nested admission leaves no page lease or session depth behind");
+    }
+
+    mem::SetPageMutationWaitHookForTest(nullptr);
+    kernel::DisarmSyntheticWorker();
+    const bool joined = kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+    Check(joined && dispatch::SetKernel187FixtureBridge(false) && kernel::Threads().empty() &&
+              kernel::SyntheticWorkerCountForTest() == 0 && mem::Query().system_used == baseline.system_used,
+          "the code-page lease fixture returns to its worker and allocation baseline");
+}
+
+namespace {
+
+uint64_t g_sr_generation = 0;
+std::mutex g_sr_lock;
+std::condition_variable g_sr_cv;
+kernel::ThreadRef g_sr_child_thread;
+
+void SystemRoutinePreCallback() {
+    kernel::ThreadRef self = kernel::CurrentRef();
+    if (!self || !self->system_routine) return;
+    {
+        std::lock_guard lock(g_sr_lock);
+        g_sr_child_thread = self;
+    }
+    g_sr_cv.notify_all();
+}
+
+bool WaitSystemRoutineChild() {
+    std::unique_lock lock(g_sr_lock);
+    return g_sr_cv.wait_for(lock, std::chrono::seconds(5), [] { return bool(g_sr_child_thread); });
+}
+
+// The child's own session: the system routine may call the start routine with
+// one argument (callee cleanup), and the start routine may call two permitted
+// callbacks on other pages.
+bool SystemRoutineChildPrepared(kernel::Thread* child) {
+    kernel::SyntheticSessionPolicy policy;
+    policy.image_identity = kernel::kSyntheticWorkerImageIdentity;
+    policy.code_base = X86CodeBase;
+    policy.code_end = X86CodeEnd;
+    policy.max_depth = 3;
+    policy.dispatch_generation = g_sr_generation;
+    policy.slot_count = 3;
+    policy.slots[0].entry = kernel::SyntheticCallbackEntry::kRegisterTarget;
+    policy.slots[0].target = 0x13F50;
+    policy.slots[0].call_pc = 0x13F2D;
+    policy.slots[0].argument_count = 1;
+    policy.slots[0].callee_cleanup = true;
+    policy.slots[1].entry = kernel::SyntheticCallbackEntry::kIndirectSlot;
+    policy.slots[1].slot_address = 0xB00C0;
+    policy.slots[1].target = 0x14020;
+    policy.slots[1].call_pc = 0x13F84;
+    policy.slots[2].entry = kernel::SyntheticCallbackEntry::kIndirectSlot;
+    policy.slots[2].slot_address = 0xB00C4;
+    policy.slots[2].target = 0x13FC0;
+    policy.slots[2].call_pc = 0x13F8A;
+    return kernel::ArmSyntheticSessionForThread(child, policy);
+}
+
+}  // namespace
+
+void CheckSystemRoutineAdmission() {
+    constexpr uint32_t code2_page = 0x13000, code3_page = 0x14000, data_page = 0xB0000;
+    constexpr uint32_t system_routine = 0x13F10, start_routine = 0x13F50;
+    constexpr uint32_t parent_entry = 0x14060, parent_exit = 0x50415245, child_exit = 0xC0DE1602;
+    constexpr uint32_t parent_handle_out = 0xB0080, parent_id_out = 0xB0084;
+    constexpr uint32_t child_handle_out = 0xB0040, child_id_out = 0xB0044;
+    constexpr uint32_t descriptor = 0xB0050, context = 0xB0100;
+    constexpr uint32_t srou = 0x554F5253;  // "SROU"
+
+    kernel::RegisterExport(187, "NtClose", Kernel187FixtureHandler);
+    kernel::RegisterExport(255, "PsCreateSystemThreadEx", Kernel255SyntheticChildHandler);
+    kernel::RegisterExport(258, "PsTerminateSystemThread", Kernel258FixtureHandler);
+    kernel::SetImageIdentity("checked-fixture");
+    std::string error;
+    const bool ready = mem::Init() && mem::Commit(code2_page, 2 * mem::kPage) && mem::Commit(data_page, mem::kPage) &&
+                       mem::Protect(code2_page, 2 * mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                       dispatch::Init(error) && kernel::RestartKernelWorkers() &&
+                       dispatch::SetKernel255FixtureBridge(true) && dispatch::SetKernel187FixtureBridge(true) &&
+                       dispatch::SetKernel258FixtureBridge(true);
+    Check(ready, "system-routine fixture memory, dispatch, bridges and workers initialize");
+    if (!ready) return;
+    const mem::Stats baseline = mem::Query();
+    g_sr_generation = CurrentDispatchGeneration();
+
+    auto write_data = [&] {
+        uint32_t zero = 0;
+        bool ok = true;
+        for (uint32_t address = 0xB0000; address < 0xB0100; address += 4)
+            ok = ok && mem::Write(address, &zero, sizeof(zero)) == mem::AccessStatus::kOk;
+        const std::array<uint32_t, 4> record{kernel::kSyntheticChildDescriptorMagic, child_exit, system_routine, 0};
+        ok = ok && mem::Write(descriptor, record.data(), sizeof(record)) == mem::AccessStatus::kOk;
+        const uint32_t thunk255 = dispatch::KernelThunkAddress(255);
+        const uint32_t thunk258 = dispatch::KernelThunkAddress(258);
+        const uint32_t thunk187 = dispatch::KernelThunkAddress(187);
+        const std::array<std::pair<uint32_t, uint32_t>, 7> slots{{
+            {0xB0070, thunk255},
+            {0xB0074, thunk258},
+            {0xB007C, thunk187},
+            {0xB00C0, 0x14020},
+            {0xB00C4, 0x13FC0},
+            {0xB00C8, thunk258},
+            {0xB00CC, thunk187},
+        }};
+        for (const auto& [address, value] : slots)
+            ok = ok && mem::Write(address, &value, sizeof(value)) == mem::AccessStatus::kOk;
+        return ok && mem::Write(0xB0078, &parent_exit, sizeof(parent_exit)) == mem::AccessStatus::kOk;
+    };
+
+    {
+        // Generated parent creates the child through ordinal 255; the bridge
+        // validates the prepared system-routine request before it can start.
+        kernel::DisarmSyntheticWorker();
+        kernel::DisarmSyntheticSession();
+        const bool wrote = write_data();
+        kernel::SetSyntheticChildPreparedHookForTest(SystemRoutineChildPrepared);
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(SystemRoutinePreCallback);
+        {
+            std::lock_guard lock(g_sr_lock);
+            g_sr_child_thread.reset();
+        }
+        kernel::ThreadRef parent;
+        const bool prepared = wrote && kernel::PrepareSystemThreadEx(parent_handle_out, 0x10000, 0x24, parent_id_out,
+                                                                     parent_entry, context, false, 0,
+                                                                     parent) == kernel::kSuccess &&
+                              bool(parent);
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = parent_entry;
+        authorization.context = context;
+        authorization.expected_exit = parent_exit;
+        authorization.code_base = X86CodeBase;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = g_sr_generation;
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        const bool armed = prepared && kernel::ArmSyntheticWorkerForThread(parent.get(), authorization);
+        const bool started = armed && kernel::StartThread(parent);
+        if (!started) kernel::CancelPreparedThread(parent);
+        const bool child_seen = started && WaitSystemRoutineChild();
+        const kernel::ThreadRef child = child_seen ? g_sr_child_thread : nullptr;
+        const uint32_t parent_wait = started ? LeaseWait(parent) : kernel::kTimeout;
+        const uint32_t child_wait = child ? LeaseWait(child) : kernel::kTimeout;
+        const bool joined = started && kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+        kernel::SetSyntheticChildPreparedHookForTest(nullptr);
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(nullptr);
+
+        uint32_t handle = 0;
+        mem::Read(parent_handle_out, &handle, sizeof(handle));
+        if (handle) kernel::CloseHandle(handle);
+        Check(started && parent_wait == kernel::kWait0 && child_wait == kernel::kWait0 && joined && parent &&
+                  parent->state.load() == kernel::ThreadState::kExited && parent->exit_code.load() == parent_exit &&
+                  parent->resources_released && child &&
+                  child->state.load() == kernel::ThreadState::kExited && child->exit_code.load() == child_exit &&
+                  child->resources_released,
+              "the parent created and closed the system-routine child through the checked ordinal-255 bridge");
+        Check(LeaseWord(0xB0030) == 0 && LeaseWord(0xB0008) == LeaseWord(0xB0014) && LeaseWord(0xB0048) == srou &&
+                  LeaseWord(0xB00A8) == 1 && LeaseWord(0xB00A0) == 1 && LeaseWord(0xB00A4) == 1 &&
+                  LeaseWord(0xB0034) == 0,
+              "the synthetic system routine filled TLS, the start routine read it back and ran both permitted callbacks");
+        Check(LeaseWord(0xB0000) != LeaseWord(0xB0010) && LeaseWord(0xB0004) != LeaseWord(0xB0014) &&
+                  LeaseWord(0xB000C) != LeaseWord(0xB001C) && LeaseWord(0xB0008) != 0,
+              "parent and child own distinct ETHREAD, TLS and KPRCB blocks and the system routine used the child's");
+        Check(kernel::Threads().empty() && kernel::SyntheticWorkerCountForTest() == 0,
+              "both workers finalised after the system-routine run");
+    }
+
+    {
+        // The descriptor and the ordinal-255 argument must agree; a mismatch is
+        // rejected before the child exists, so no unauthorised guest code runs.
+        kernel::DisarmSyntheticWorker();
+        const bool wrote = write_data();
+        uint32_t mismatch = 0x13F60;
+        mem::Write(descriptor + 8, &mismatch, sizeof(mismatch));
+        kernel::SetSyntheticChildPreparedHookForTest(SystemRoutineChildPrepared);
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(SystemRoutinePreCallback);
+        kernel::ThreadRef parent;
+        const bool prepared = wrote && kernel::PrepareSystemThreadEx(parent_handle_out, 0x10000, 0x24, parent_id_out,
+                                                                     parent_entry, context, false, 0,
+                                                                     parent) == kernel::kSuccess &&
+                              bool(parent);
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = parent_entry;
+        authorization.context = context;
+        authorization.expected_exit = parent_exit;
+        authorization.code_base = X86CodeBase;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = g_sr_generation;
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        const bool armed = prepared && kernel::ArmSyntheticWorkerForThread(parent.get(), authorization);
+        const bool started = armed && kernel::StartThread(parent);
+        if (!started) kernel::CancelPreparedThread(parent);
+        const uint32_t parent_wait = started ? LeaseWait(parent) : kernel::kTimeout;
+        const bool joined = started && kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+        kernel::SetSyntheticChildPreparedHookForTest(nullptr);
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(nullptr);
+        uint32_t handle = 0;
+        mem::Read(parent_handle_out, &handle, sizeof(handle));
+        if (handle) kernel::CloseHandle(handle);
+        Check(started && parent_wait == kernel::kWait0 && joined && parent &&
+                  parent->exit_code.load() == parent_exit && LeaseWord(0xB0030) == kernel::kInvalidParameter &&
+                  LeaseWord(0xB0010) == 0 && kernel::SyntheticWorkerCountForTest() == 0 && kernel::Threads().empty(),
+              "a descriptor/argument system-routine mismatch is rejected before any child code runs");
+    }
+
+    {
+        // Checked admission on a prepared thread, without executing anything.
+        kernel::DisarmSyntheticWorker();
+        kernel::ThreadRef thread;
+        const bool prepared = kernel::PrepareSystemThreadEx(child_handle_out, 0x10000, 0x24, child_id_out, start_routine,
+                                                           context, false, system_routine, thread) == kernel::kSuccess &&
+                              bool(thread);
+        Check(prepared, "a prepared system-routine thread initialises for admission checks");
+        if (!prepared) return;
+        const uint64_t generation = CurrentDispatchGeneration();
+        kernel::SystemRoutineAdmissionSpec spec;
+        spec.expected_image_sha1 = "checked-fixture";
+        spec.expected_start_routine = start_routine;
+        spec.expected_system_routine = system_routine;
+        spec.dispatch_generation = generation;
+        spec.memory_generation = mem::Generation();
+        const kernel::SystemRoutineAdmissionResult admitted = kernel::ValidateSystemRoutineAdmission(*thread, spec);
+        Check(admitted.status == kernel::SystemRoutineAdmission::kAdmitted && admitted.detail == thread->id,
+              "the prepared system-routine request passes the checked admission contract");
+        Check(kernel::ValidateSystemRoutineAdmission(*thread, spec).status ==
+                  kernel::SystemRoutineAdmission::kAdmitted &&
+                  kernel::ImageIdentityMatches("checked-fixture") && !kernel::ImageIdentityMatches("other-image"),
+              "the image identity is bound and compared exactly");
+
+        kernel::SystemRoutineAdmissionSpec wrong_image = spec;
+        wrong_image.expected_image_sha1 = "other-image";
+        kernel::SystemRoutineAdmissionSpec wrong_parent = spec;
+        wrong_parent.expected_parent_id = 0xDEAD;
+        kernel::SystemRoutineAdmissionSpec wrong_start = spec;
+        wrong_start.expected_start_routine = 0x14040;
+        kernel::SystemRoutineAdmissionSpec wrong_system = spec;
+        wrong_system.expected_system_routine = 0x14040;
+        kernel::SystemRoutineAdmissionSpec stale_dispatch = spec;
+        stale_dispatch.dispatch_generation = generation + 1;
+        kernel::SystemRoutineAdmissionSpec stale_memory = spec;
+        stale_memory.memory_generation = mem::Generation() + 1;
+        Check(kernel::ValidateSystemRoutineAdmission(*thread, wrong_image).status ==
+                      kernel::SystemRoutineAdmission::kInvalidImage &&
+                  kernel::ValidateSystemRoutineAdmission(*thread, wrong_parent).status ==
+                      kernel::SystemRoutineAdmission::kInvalidParent &&
+                  kernel::ValidateSystemRoutineAdmission(*thread, wrong_start).status ==
+                      kernel::SystemRoutineAdmission::kInvalidStartRoutine &&
+                  kernel::ValidateSystemRoutineAdmission(*thread, wrong_system).status ==
+                      kernel::SystemRoutineAdmission::kInvalidSystemRoutine &&
+                  kernel::ValidateSystemRoutineAdmission(*thread, stale_dispatch).status ==
+                      kernel::SystemRoutineAdmission::kStaleDispatch &&
+                  kernel::ValidateSystemRoutineAdmission(*thread, stale_memory).status ==
+                      kernel::SystemRoutineAdmission::kStaleMemory,
+              "admission rejects a wrong image, parent, routine, dispatch generation or memory generation");
+
+        const uint32_t zero = 0;
+        Check(mem::Write(thread->kpcr + kernel::layout::kKpcrSelf, &zero, sizeof(zero)) == mem::AccessStatus::kOk &&
+                  kernel::ValidateSystemRoutineAdmission(*thread, spec).status ==
+                      kernel::SystemRoutineAdmission::kInvalidThreadBlocks,
+              "admission rejects a scribbled KPCR layout");
+        kernel::InitializeThreadGuestMemory(thread->kpcr, thread->ethread, thread->stack_top, thread->stack_size,
+                                           thread->tls, thread->id);
+        Check(kernel::ValidateSystemRoutineAdmission(*thread, spec).status ==
+                  kernel::SystemRoutineAdmission::kAdmitted,
+              "the restored thread blocks are admitted again");
+
+        X86Context fake{};
+        fake.fs_base = 0;
+        thread->ctx = &fake;
+        const bool rejected_fs =
+            kernel::ValidateSystemRoutineAdmission(*thread, spec).status == kernel::SystemRoutineAdmission::kInvalidFsBase;
+        thread->ctx = nullptr;
+        Check(rejected_fs, "admission rejects an FS base that is not the thread's KPCR");
+
+        Check(mem::Protect(code2_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk &&
+                  kernel::ValidateSystemRoutineAdmission(*thread, spec).status ==
+                      kernel::SystemRoutineAdmission::kInvalidCodePage,
+              "admission rejects a non-executable code page");
+        Check(mem::Protect(code2_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                  kernel::ValidateSystemRoutineAdmission(*thread, spec).status ==
+                      kernel::SystemRoutineAdmission::kAdmitted,
+              "the executable code page is admitted again");
+
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start_routine;
+        authorization.expected_exit = child_exit;
+        authorization.code_base = X86CodeBase;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = generation;
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        const bool armed_four = kernel::ArmSyntheticWorkerForThread(nullptr, authorization) &&
+                                kernel::ArmSyntheticWorkerForThread(nullptr, authorization) &&
+                                kernel::ArmSyntheticWorkerForThread(nullptr, authorization) &&
+                                kernel::ArmSyntheticWorkerForThread(nullptr, authorization);
+        kernel::SystemRoutineAdmissionSpec no_slot = spec;
+        no_slot.require_synthetic_slot = true;
+        const bool no_slot_rejected =
+            armed_four && kernel::ValidateSystemRoutineAdmission(*thread, no_slot).status ==
+                              kernel::SystemRoutineAdmission::kInvalidSession;
+        kernel::DisarmSyntheticWorker();
+        Check(no_slot_rejected, "admission reports a full synthetic claim table");
+
+        const bool stopped = kernel::StopKernelWorkers();
+        const bool shutdown_rejected = stopped && kernel::ValidateSystemRoutineAdmission(*thread, spec).status ==
+                                                    kernel::SystemRoutineAdmission::kShutdown;
+        Check(shutdown_rejected && kernel::RestartKernelWorkers(), "admission fails closed while workers shut down");
+
+        kernel::CancelPreparedThread(thread);
+        Check(kernel::ValidateSystemRoutineAdmission(*thread, spec).status ==
+                      kernel::SystemRoutineAdmission::kInvalidThreadState &&
+                  thread->resources_released,
+              "admission rejects a cancelled thread whose resources were released");
+    }
+
+    kernel::DisarmSyntheticWorker();
+    const bool joined = kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+    Check(joined && kernel::Threads().empty() && kernel::SyntheticWorkerCountForTest() == 0 &&
+              mem::Query().system_used == baseline.system_used,
+          "the system-routine admission fixture returns to its worker and allocation baseline");
+    Check(dispatch::SetKernel255FixtureBridge(false) && dispatch::SetKernel187FixtureBridge(false) &&
+              dispatch::SetKernel258FixtureBridge(false),
+          "system-routine fixture bridges disable after quiescence");
+}
+
 void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t code_page = 0x11000;
     constexpr uint32_t target = code_page + 0x10;
@@ -5126,7 +5711,7 @@ void CheckIndirectCallTests() {
 
     reject_target(0, "null", "checked indirect CALL rejects null target before stack mutation");
     reject_target(0x11001, "unmapped", "checked indirect CALL rejects generated-code gap before stack mutation");
-    reject_target(0x14000, "unknown", "checked indirect CALL rejects unknown target before stack mutation");
+    reject_target(0x15000, "unknown", "checked indirect CALL rejects unknown target before stack mutation");
     reject_target(dispatch::KernelThunkAddress(255), "kernel", "checked indirect CALL rejects kernel export thunk");
     reject_target(dispatch::HostThunk(sub_000111B2), "host", "checked indirect CALL rejects registered host thunk");
 
@@ -7030,6 +7615,8 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckPersistentSyntheticCallbacks();
     CheckStartupThreadLayout();
     CheckMultiWorkerSessions();
+    CheckCodePageLeaseScope();
+    CheckSystemRoutineAdmission();
     CheckSyntheticWorkerLifecycle();
 #endif
     mem::Shutdown();

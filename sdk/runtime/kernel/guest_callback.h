@@ -58,6 +58,7 @@ enum class GuestCallbackStatus : uint8_t {
     kTargetChanged,
     kStaleDispatch,
     kCodePageDenied,
+    kCodePageBusy,
     kInvalidStack,
     kStackWriteDenied,
     kTooManyArguments,

@@ -118,6 +118,7 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
         return false;
     }
     g_image = &g_xbe;
+    SetImageIdentity(kImageSha1);
     if (app::kGame.loaded) app::kGame.loaded();
 
     bool filesystem_mounted = false;

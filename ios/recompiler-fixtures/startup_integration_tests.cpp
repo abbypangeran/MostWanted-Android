@@ -27,7 +27,7 @@ uint8_t* g_base = nullptr;
 namespace {
 
 constexpr uint32_t kImageBase = 0x10000;
-constexpr uint32_t kImageSize = 0x4000;
+constexpr uint32_t kImageSize = 0x5000;
 constexpr uint32_t kEntry = 0x11000;
 constexpr uint32_t kImport = 0x12000;
 constexpr uint32_t kDataBase = 0x30000;
@@ -71,13 +71,13 @@ bool ReadFile(const char* path, std::vector<uint8_t>& bytes) {
 
 bool AddOrdinal255Section(std::vector<uint8_t>& bytes) {
     constexpr uint32_t table = 0x180;
-    constexpr uint32_t data_record = table + 2 * 56;  // .text and .text2 already exist
-    constexpr uint32_t data_name = 0x258;
-    constexpr uint32_t data_raw = 0x3000;             // after .text2's raw bytes
-    if (bytes.size() < 0x1000 || bytes.size() > 0x3000) return false;
+    constexpr uint32_t data_record = table + 3 * 56;  // .text, .text2 and .text3 already exist
+    constexpr uint32_t data_name = 0x268;
+    constexpr uint32_t data_raw = 0x4000;             // after .text3's raw bytes
+    if (bytes.size() < 0x1000 || bytes.size() > kImageSize) return false;
     bytes.resize(kImageSize, 0);
     Put32(bytes, 0x10C, kImageSize);
-    Put32(bytes, 0x11C, 3);
+    Put32(bytes, 0x11C, 4);
     Put32(bytes, 0x158, (kImport ^ xbe::kRetailThunkKey));
     Put32(bytes, data_record + 0, xbe::kPreload);
     Put32(bytes, data_record + 4, kImport);

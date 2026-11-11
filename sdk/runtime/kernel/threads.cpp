@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "kernel/kernel.h"
+#include "cpu/dispatch_table.h"
 #include "kernel/synthetic_worker.h"
 #include "kernel/thread_memory.h"
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
@@ -393,6 +394,121 @@ X86Context& CurrentContext() { return *t_current->ctx; }
 std::vector<ThreadRef> Threads() {
     std::lock_guard<std::mutex> lock(g_threads_lock);
     return g_threads;
+}
+
+namespace {
+
+std::mutex g_image_identity_lock;
+std::array<char, 64> g_image_identity{};
+
+}  // namespace
+
+void SetImageIdentity(const char* sha1) {
+    std::lock_guard lock(g_image_identity_lock);
+    g_image_identity.fill(0);
+    if (sha1) std::snprintf(g_image_identity.data(), g_image_identity.size(), "%s", sha1);
+}
+
+bool ImageIdentityMatches(const char* expected) {
+    if (!expected || !*expected) return false;
+    std::lock_guard lock(g_image_identity_lock);
+    return g_image_identity[0] && std::strcmp(g_image_identity.data(), expected) == 0;
+}
+
+const char* SystemRoutineAdmissionName(SystemRoutineAdmission status) {
+    switch (status) {
+        case SystemRoutineAdmission::kAdmitted: return "admitted";
+        case SystemRoutineAdmission::kNotInitialized: return "memory not initialized";
+        case SystemRoutineAdmission::kShutdown: return "workers are shutting down";
+        case SystemRoutineAdmission::kInvalidImage: return "image identity mismatch";
+        case SystemRoutineAdmission::kInvalidParent: return "parent identity mismatch";
+        case SystemRoutineAdmission::kInvalidThreadState: return "thread state is not prepared";
+        case SystemRoutineAdmission::kInvalidStack: return "guest stack is invalid";
+        case SystemRoutineAdmission::kInvalidTls: return "guest TLS block is invalid";
+        case SystemRoutineAdmission::kInvalidThreadBlocks: return "KPCR/ETHREAD read-back mismatch";
+        case SystemRoutineAdmission::kInvalidFsBase: return "FS base does not match the KPCR";
+        case SystemRoutineAdmission::kInvalidStartRoutine: return "start routine is invalid";
+        case SystemRoutineAdmission::kInvalidSystemRoutine: return "system routine is invalid";
+        case SystemRoutineAdmission::kInvalidCodePage: return "code page is not executable";
+        case SystemRoutineAdmission::kStaleDispatch: return "stale dispatch generation";
+        case SystemRoutineAdmission::kStaleMemory: return "stale memory generation";
+        case SystemRoutineAdmission::kInvalidSession: return "no free synthetic session slot";
+        case SystemRoutineAdmission::kRegistryFull: return "thread registry is full";
+    }
+    return "unknown admission status";
+}
+
+SystemRoutineAdmissionResult ValidateSystemRoutineAdmission(const Thread& prepared,
+                                                            const SystemRoutineAdmissionSpec& spec) {
+    auto fail = [](SystemRoutineAdmission status, uint32_t detail) {
+        return SystemRoutineAdmissionResult{status, detail};
+    };
+    if (!mem::IsInitialized()) return fail(SystemRoutineAdmission::kNotInitialized, 0);
+    if (!KernelWorkersAccepting()) return fail(SystemRoutineAdmission::kShutdown, 0);
+    if (spec.expected_image_sha1 && !ImageIdentityMatches(spec.expected_image_sha1))
+        return fail(SystemRoutineAdmission::kInvalidImage, 0);
+    Thread* parent = Current();
+    if (spec.expected_parent_id &&
+        (!parent || parent->id != spec.expected_parent_id || parent->stop_requested.load()))
+        return fail(SystemRoutineAdmission::kInvalidParent, spec.expected_parent_id);
+    if (Threads().size() >= kMaximumGuestThreads)
+        return fail(SystemRoutineAdmission::kRegistryFull, uint32_t(Threads().size()));
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    if (spec.require_synthetic_slot && SyntheticWorkerCountForTest() >= kMaximumSyntheticWorkers)
+        return fail(SystemRoutineAdmission::kInvalidSession, kMaximumSyntheticWorkers);
+#endif
+    if (prepared.state.load(std::memory_order_acquire) != ThreadState::kPrepared || prepared.activation_started ||
+        prepared.resources_released || !prepared.memory_owner)
+        return fail(SystemRoutineAdmission::kInvalidThreadState, prepared.id);
+    const uint64_t memory_generation = mem::Generation();
+    if (!memory_generation || prepared.memory_generation != memory_generation ||
+        (spec.memory_generation && spec.memory_generation != memory_generation))
+        return fail(SystemRoutineAdmission::kStaleMemory, prepared.id);
+    if (!prepared.kpcr || !prepared.ethread || !prepared.stack_top || !prepared.stack_size ||
+        prepared.stack_size > prepared.stack_top || !prepared.tls)
+        return fail(SystemRoutineAdmission::kInvalidThreadState, prepared.id);
+    const uint64_t stack_bottom = uint64_t(prepared.stack_top) - prepared.stack_size;
+    if (stack_bottom < mem::kStackBase ||
+        uint64_t(prepared.stack_top) > uint64_t(mem::kStackBase) + mem::kStackSize)
+        return fail(SystemRoutineAdmission::kInvalidStack, prepared.stack_top);
+    // The CRT derives the block from the image directory as align16(bytes) + 4
+    // and stores -size/4 at FS:[4+index*4]; the block ends exactly at StackBase.
+    const uint64_t tls_size = uint64_t(prepared.stack_top) - prepared.tls;
+    if (prepared.tls < stack_bottom || tls_size < 4 || tls_size > prepared.stack_size || (tls_size & 3) ||
+        ((tls_size - 4) & 15u))
+        return fail(SystemRoutineAdmission::kInvalidTls, prepared.tls);
+    if (mem::CheckAccess(uint32_t(stack_bottom), prepared.stack_size, mem::kReadWrite) != mem::AccessStatus::kOk)
+        return fail(SystemRoutineAdmission::kInvalidStack, uint32_t(stack_bottom));
+    const uint32_t entry_esp = (prepared.tls & ~15u) - 16;
+    if ((entry_esp & 3u) || uint64_t(entry_esp) < stack_bottom + 16 || entry_esp > prepared.stack_top - 4)
+        return fail(SystemRoutineAdmission::kInvalidStack, entry_esp);
+    if (!ValidateThreadGuestMemory(prepared.kpcr, prepared.ethread, prepared.stack_top, prepared.stack_size,
+                                   prepared.tls, prepared.id))
+        return fail(SystemRoutineAdmission::kInvalidThreadBlocks, prepared.kpcr);
+    if (prepared.ctx && prepared.ctx->fs_base != prepared.kpcr)
+        return fail(SystemRoutineAdmission::kInvalidFsBase, prepared.ctx->fs_base);
+
+    dispatch::CallLease lease;
+    if (spec.dispatch_generation && lease.Generation() != spec.dispatch_generation)
+        return fail(SystemRoutineAdmission::kStaleDispatch, 0);
+    if (spec.expected_start_routine && prepared.start_routine != spec.expected_start_routine)
+        return fail(SystemRoutineAdmission::kInvalidStartRoutine, prepared.start_routine);
+    if (!prepared.start_routine) return fail(SystemRoutineAdmission::kInvalidStartRoutine, 0);
+    const dispatch::ResolvedTarget start = lease.Resolve(prepared.start_routine);
+    if (start.kind != dispatch::TargetKind::kGeneratedFunction || !start.function)
+        return fail(SystemRoutineAdmission::kInvalidStartRoutine, prepared.start_routine);
+    if (mem::CheckAccess(prepared.start_routine, 1, mem::kExecute) != mem::AccessStatus::kOk)
+        return fail(SystemRoutineAdmission::kInvalidCodePage, prepared.start_routine);
+    if (spec.expected_system_routine && prepared.system_routine != spec.expected_system_routine)
+        return fail(SystemRoutineAdmission::kInvalidSystemRoutine, prepared.system_routine);
+    if (prepared.system_routine) {
+        const dispatch::ResolvedTarget system = lease.Resolve(prepared.system_routine);
+        if (system.kind != dispatch::TargetKind::kGeneratedFunction || !system.function)
+            return fail(SystemRoutineAdmission::kInvalidSystemRoutine, prepared.system_routine);
+        if (mem::CheckAccess(prepared.system_routine, 1, mem::kExecute) != mem::AccessStatus::kOk)
+            return fail(SystemRoutineAdmission::kInvalidCodePage, prepared.system_routine);
+    }
+    return {SystemRoutineAdmission::kAdmitted, prepared.id};
 }
 
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
@@ -1069,7 +1185,7 @@ bool StartThread(ThreadRef t) {
                                     if (claimed) FinishSyntheticWorker();
                                 }
                             } synthetic_finish{synthetic_claimed};
-                            const uint32_t claim_target = t->system_routine ? 0 : t->start_routine;
+                            const uint32_t claim_target = t->system_routine ? t->system_routine : t->start_routine;
                             const uint32_t claim_context = t->system_routine ? 0 : t->start_context;
                             const SyntheticWorkerClaim synthetic_claim = ClaimSyntheticWorker(
                                 claim_target, claim_context, t->start_routine_ticket.dispatch_generation);
@@ -1078,10 +1194,17 @@ bool StartThread(ThreadRef t) {
                                 CallSyntheticWorkerPreCallbackHookForTest();
                                 mem::ScopedPageLease callback_slot_lease;
                                 auto invoke_synthetic_callback = [&]() {
+                                    const GuestCallbackTicket& ticket =
+                                        t->system_routine ? t->system_routine_ticket : t->start_routine_ticket;
+                                    const uint32_t target = t->system_routine ? t->system_routine : t->start_routine;
+                                    const uint32_t* arguments =
+                                        t->system_routine ? system_arguments.data() : start_arguments.data();
+                                    const size_t argument_count =
+                                        t->system_routine ? system_arguments.size() : start_arguments.size();
                                     try {
-                                        return CallGuestCallbackForTest(
-                                            ctx, t->start_routine_ticket, t->start_routine, start_arguments,
-                                            stack_base, t->stack_size, code);
+                                        return CallGuestCallbackForTest(ctx, ticket, target,
+                                                                        std::span(arguments, argument_count), stack_base,
+                                                                        t->stack_size, code);
                                     } catch (const SyntheticGuestContinuation& continuation) {
                                         uint32_t continuation_result = 0;
                                         const SyntheticContinuationStatus status =
@@ -1158,37 +1281,57 @@ bool StartThread(ThreadRef t) {
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
 // Test-only ordinal-255 bridge: the parent's guest code passes the synthetic tag
 // in ThreadExtensionSize and a 16-byte descriptor in StartRoutineDebug. The
-// descriptor is { magic, expected_exit, reserved0, reserved1 }.
+// descriptor is { magic, expected_exit, system_routine, reserved }.
 uint32_t CreateSyntheticChildThread(uint32_t handle_out, uint32_t stack_size, uint32_t tls_size, uint32_t id_out,
                                     uint32_t start_routine, uint32_t start_context, uint32_t suspended,
                                     uint32_t system_routine, uint32_t descriptor) {
-    if (suspended || system_routine || !descriptor) return kInvalidParameter;
+    if (suspended || !descriptor) return kInvalidParameter;
     SyntheticWorkerAuthorization authorization;
+    uint64_t dispatch_generation = 0;
+    uint32_t parent_id = 0;
     {
         std::lock_guard lock(g_synthetic_worker_lock);
         SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
         if (!slot || !slot->armed || slot->memory_generation != mem::Generation()) return kInvalidParameter;
         if (start_routine < slot->authorization.code_base || start_routine >= slot->authorization.code_end)
             return kInvalidParameter;
-        authorization.target = start_routine;
-        authorization.context = start_context;
         authorization.code_base = slot->authorization.code_base;
         authorization.code_end = slot->authorization.code_end;
         authorization.dispatch_generation = slot->authorization.dispatch_generation;
         authorization.image_identity = kSyntheticWorkerImageIdentity;
+        dispatch_generation = slot->authorization.dispatch_generation;
+        parent_id = Current() ? Current()->id : 0;
     }
     struct Descriptor {
-        uint32_t magic, expected_exit, reserved0, reserved1;
+        uint32_t magic, expected_exit, system_routine, reserved;
     } record{};
     if (mem::Read(descriptor, &record, sizeof(record)) != mem::AccessStatus::kOk ||
-        record.magic != kSyntheticChildDescriptorMagic || record.reserved0 || record.reserved1)
+        record.magic != kSyntheticChildDescriptorMagic || record.system_routine != system_routine || record.reserved)
         return kInvalidParameter;
     authorization.expected_exit = record.expected_exit;
+    // a system routine claims with its own target and no context (the start
+    // routine and context arrive as its two arguments)
+    authorization.target = system_routine ? system_routine : start_routine;
+    authorization.context = system_routine ? 0 : start_context;
 
     ThreadRef child;
     const uint32_t status = PrepareSystemThreadEx(handle_out, stack_size, tls_size, id_out, start_routine, start_context,
-                                                  false, 0, child);
+                                                  false, system_routine, child);
     if (status != kSuccess) return status;
+    SystemRoutineAdmissionSpec spec;
+    spec.expected_parent_id = parent_id;
+    spec.expected_start_routine = start_routine;
+    spec.expected_system_routine = system_routine;
+    spec.dispatch_generation = dispatch_generation;
+    spec.memory_generation = mem::Generation();
+    spec.require_synthetic_slot = true;
+    const SystemRoutineAdmissionResult admission = ValidateSystemRoutineAdmission(*child, spec);
+    if (admission.status != SystemRoutineAdmission::kAdmitted) {
+        LOGE("synthetic child rejected at admission: %s (%08X)", SystemRoutineAdmissionName(admission.status),
+             admission.detail);
+        CancelPreparedThread(child);
+        return kInvalidParameter;
+    }
     if (!ArmSyntheticWorkerForThread(child.get(), authorization)) {
         CancelPreparedThread(child);
         return kNoMemory;

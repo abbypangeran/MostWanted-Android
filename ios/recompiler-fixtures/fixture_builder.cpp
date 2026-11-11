@@ -21,6 +21,11 @@ constexpr uint32_t kRawCode = 0x1000;
 constexpr uint32_t kEntry2 = 0x13000;
 constexpr uint32_t kSectionName2 = 0x250;
 constexpr uint32_t kRawCode2 = 0x2000;
+// Phase 2D-16: .text3 starts on the 0x13F00 page so a generated function can
+// straddle the 0x14000 boundary, and holds the synthetic system routine.
+constexpr uint32_t kEntry3 = 0x13F00;
+constexpr uint32_t kSectionName3 = 0x260;
+constexpr uint32_t kRawCode3 = 0x3000;
 
 void Put32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
     bytes[offset + 0] = uint8_t(value);
@@ -698,13 +703,138 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
         0xC3
     });
     if (code.size() > 0x1000 || code2.size() > 0x1000) return false;
+    // Phase 2D-16: .text3, a 0x1000 byte section at 0x13F00. The 0x14000 page
+    // boundary falls inside it, so 0x13FF0 crosses pages; the rest is padding.
+    std::vector<uint8_t> code3(0x1000, 0xCC);
+    auto put3 = [&](std::initializer_list<uint8_t> bytes, uint32_t guest) {
+        const size_t offset = guest - kEntry3;
+        if (!guest || guest < kEntry3 || offset + bytes.size() > code3.size()) return false;
+        std::copy(bytes.begin(), bytes.end(), code3.begin() + offset);
+        appended_functions.push_back({guest, uint32_t(guest + bytes.size())});
+        return true;
+    };
+    // Synthetic system routine identity 0x13F10: fills the TLS block the way
+    // 002B5C0F does, calls the start routine with its context, then terminates.
+    const bool code3_ok = put3(
+        {
+            0x55,                                            // push ebp
+            0x8B, 0xEC,                                      // mov ebp, esp
+            0x64, 0xA1, 0x28, 0x00, 0x00, 0x00,              // mov eax, fs:[0x28]
+            0x8B, 0x50, 0x28,                                // mov edx, [eax+0x28] (TlsData)
+            0x89, 0x15, 0x08, 0x00, 0x0B, 0x00,              // save system TlsData
+            0x8D, 0x4A, 0x04,                                // lea ecx, [edx+4]
+            0x89, 0x0A,                                      // mov [edx], ecx (module TLS pointer)
+            0x8B, 0x4D, 0x08,                                // mov ecx, [ebp+8] (start routine)
+            0xFF, 0x75, 0x0C,                                // push dword [ebp+0xC] (context)
+            0xFF, 0xD1,                                      // call ecx (callee ret 4)
+            0x50,                                            // push eax (exit status)
+            0xFF, 0x15, 0x74, 0x00, 0x0B, 0x00,              // call [ordinal 258]
+            0xC7, 0x05, 0x0C, 0x00, 0x0B, 0x00, 0xEF, 0xBE, 0xAD, 0xDE,  // must not run
+            0x5D,                                            // pop ebp
+            0xC2, 0x08, 0x00,                                // ret 8
+        },
+        0x13F10);
+    // Synthetic start routine 0x13F50: reads its own FS/KPCR/TLS, invokes the
+    // two permitted nested callbacks and terminates through ordinal 258.
+    const bool code3_start = code3_ok && put3(
+        {
+            0x55,                                            // push ebp
+            0x8B, 0xEC,                                      // mov ebp, esp
+            0x64, 0xA1, 0x28, 0x00, 0x00, 0x00,              // mov eax, fs:[0x28]
+            0xA3, 0x10, 0x00, 0x0B, 0x00,                    // save ETHREAD
+            0x8B, 0x50, 0x28,                                // mov edx, [eax+0x28] (TlsData)
+            0x89, 0x15, 0x14, 0x00, 0x0B, 0x00,              // save TlsData
+            0x64, 0xA1, 0x04, 0x00, 0x00, 0x00,              // mov eax, fs:[4]
+            0xA3, 0x18, 0x00, 0x0B, 0x00,                    // save stack top
+            0x64, 0xA1, 0x20, 0x00, 0x00, 0x00,              // mov eax, fs:[0x20]
+            0xA3, 0x1C, 0x00, 0x0B, 0x00,                    // save KPRCB
+            0xC7, 0x42, 0x04, 0x53, 0x52, 0x4F, 0x55,        // [TlsData+4] = "SROU"
+            0xFF, 0x15, 0xC0, 0x00, 0x0B, 0x00,              // synthetic callback A
+            0xFF, 0x15, 0xC4, 0x00, 0x0B, 0x00,              // synthetic callback B
+            0x64, 0xA1, 0x28, 0x00, 0x00, 0x00,              // mov eax, fs:[0x28]
+            0x8B, 0x50, 0x28,                                // mov edx, [eax+0x28]
+            0x8B, 0x42, 0x04,                                // read back [TlsData+4]
+            0xA3, 0x48, 0x00, 0x0B, 0x00,                    // save the read-back
+            0x68, 0x02, 0x16, 0xDE, 0xC0,                    // exit status 0xC0DE1602
+            0xFF, 0x15, 0xC8, 0x00, 0x0B, 0x00,              // ordinal 258
+            0xC7, 0x05, 0x34, 0x00, 0x0B, 0x00, 0xEF, 0xBE, 0xAD, 0xDE,  // must not run
+            0x5D,                                            // pop ebp
+            0xC2, 0x04, 0x00,                                // ret 4
+        },
+        0x13F50);
+    // Nested callback on the 0x13000 page: it pauses through NtClose so the
+    // test can watch a mutation of this page wait for the nested lease.
+    const bool code3_nested = code3_start && put3(
+        {
+            0xC7, 0x05, 0xA0, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x00, 0x00,  // nested entered
+            0x6A, 0x00,                                                  // NtClose argument
+            0xFF, 0x15, 0xCC, 0x00, 0x0B, 0x00,                          // call [NtClose pause]
+            0xC7, 0x05, 0xA4, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x00, 0x00,  // nested released
+            0xB8, 0x03, 0x00, 0xAA, 0xAA,                                // mov eax, 0xAAAA0003
+            0xC3
+        },
+        0x13FC0);
+    // Cross-page callback 0x13FF0: the call and store instructions straddle the
+    // 0x14000 boundary; the pause lets the test mutate the second page.
+    const bool code3_cross = code3_nested && put3(
+        {
+            0xC7, 0x05, 0x90, 0x00, 0x0B, 0x00, 0x11, 0x11, 0x11, 0x11,  // cross entry marker
+            0x68, 0x00, 0x00, 0x00, 0x00,                                // NtClose argument
+            0xFF, 0x15, 0xCC, 0x00, 0x0B, 0x00,                          // straddling pause call
+            0xC7, 0x05, 0x94, 0x00, 0x0B, 0x00, 0x22, 0x22, 0x22, 0x22,  // second-page marker
+            0xB8, 0x55, 0x55, 0x55, 0x55,                                // mov eax, 0x55555555
+            0xC3
+        },
+        0x13FF0);
+    // Simple callback on the 0x14000 page.
+    const bool code3_simple = code3_cross && put3(
+        {0xFF, 0x05, 0xA8, 0x00, 0x0B, 0x00, 0xB8, 0x01, 0x00, 0xAA, 0xAA, 0xC3}, 0x14020);
+    // Outer callback on the 0x14000 page calling the nested callback on the
+    // 0x13000 page.
+    const bool code3_outer = code3_simple && put3(
+        {
+            0xC7, 0x05, 0x98, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x00, 0x00,  // outer entered
+            0xFF, 0x15, 0xC0, 0x00, 0x0B, 0x00,                          // call nested callback
+            0xC7, 0x05, 0x9C, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x00, 0x00,  // outer resumed
+            0xB8, 0x04, 0x00, 0xAA, 0xAA,                                // mov eax, 0xAAAA0004
+            0xC3
+        },
+        0x14040);
+    // Parent start routine 0x14040: creates the child through ordinal 255 with
+    // the synthetic system routine, closes the handle and returns.
+    const bool code3_parent = code3_outer && put3(
+        {
+            0x64, 0xA1, 0x28, 0x00, 0x00, 0x00,              // mov eax, fs:[0x28]
+            0xA3, 0x00, 0x00, 0x0B, 0x00,                    // save parent ETHREAD
+            0x8B, 0x50, 0x28,                                // mov edx, [eax+0x28]
+            0x89, 0x15, 0x04, 0x00, 0x0B, 0x00,              // save parent TlsData
+            0xC7, 0x42, 0x04, 0x45, 0x52, 0x41, 0x50,        // [TlsData+4] = "PARE"
+            0x68, 0x10, 0x3F, 0x01, 0x00,                    // a9 system routine
+            0x68, 0x50, 0x00, 0x0B, 0x00,                    // a8 descriptor
+            0x6A, 0x00,                                      // a7 flags
+            0x68, 0x00, 0x01, 0x0B, 0x00,                    // a6 start context
+            0x68, 0x50, 0x3F, 0x01, 0x00,                    // a5 start routine
+            0x68, 0x44, 0x00, 0x0B, 0x00,                    // a4 id out
+            0x68, 0x24, 0x00, 0x00, 0x00,                    // a3 TLS size
+            0x68, 0x00, 0x00, 0x01, 0x00,                    // a2 stack size
+            0x68, 0x31, 0x54, 0x43, 0x53,                    // a1 synthetic tag
+            0x68, 0x40, 0x00, 0x0B, 0x00,                    // a0 handle out
+            0xFF, 0x15, 0x70, 0x00, 0x0B, 0x00,              // ordinal 255
+            0xA3, 0x30, 0x00, 0x0B, 0x00,                    // bridge status
+            0xFF, 0x35, 0x40, 0x00, 0x0B, 0x00,              // push child handle
+            0xFF, 0x15, 0x7C, 0x00, 0x0B, 0x00,              // NtClose
+            0xA1, 0x78, 0x00, 0x0B, 0x00,                    // parent exit code
+            0xC2, 0x04, 0x00,                                // ret 4
+        },
+        0x14060);
+    if (!code3_parent) return false;
     constexpr size_t header_size = 0x1000;
-    std::vector<uint8_t> image(kRawCode2 + code2.size(), 0);
+    std::vector<uint8_t> image(kRawCode3 + code3.size(), 0);
     std::copy_n("XBEH", 4, image.begin());
     Put32(image, 0x104, kBase);
     Put32(image, 0x108, header_size);
-    Put32(image, 0x10C, 0x4000);
-    Put32(image, 0x11C, 2);
+    Put32(image, 0x10C, 0x5000);
+    Put32(image, 0x11C, 3);
     Put32(image, 0x120, kBase + kSectionTable);
     Put32(image, 0x128, kEntry ^ xbe::kRetailEntryKey);
     Put32(image, 0x158, (kBase + 0x280) ^ xbe::kRetailThunkKey);
@@ -719,14 +849,23 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
 
     Put32(image, kSectionTable + 56 + 0, xbe::kExecutable | xbe::kPreload);
     Put32(image, kSectionTable + 56 + 4, kEntry2);
-    Put32(image, kSectionTable + 56 + 8, 0x1000);
+    Put32(image, kSectionTable + 56 + 8, 0x0F00);
     Put32(image, kSectionTable + 56 + 12, kRawCode2);
     Put32(image, kSectionTable + 56 + 16, uint32_t(code2.size()));
     Put32(image, kSectionTable + 56 + 20, kBase + kSectionName2);
     std::copy_n(".text2", 7, image.begin() + kSectionName2);
 
+    Put32(image, kSectionTable + 112 + 0, xbe::kExecutable | xbe::kPreload);
+    Put32(image, kSectionTable + 112 + 4, kEntry3);
+    Put32(image, kSectionTable + 112 + 8, 0x1000);
+    Put32(image, kSectionTable + 112 + 12, kRawCode3);
+    Put32(image, kSectionTable + 112 + 16, uint32_t(code3.size()));
+    Put32(image, kSectionTable + 112 + 20, kBase + kSectionName3);
+    std::copy_n(".text3", 7, image.begin() + kSectionName3);
+
     std::copy(code.begin(), code.end(), image.begin() + kRawCode);
     std::copy(code2.begin(), code2.end(), image.begin() + kRawCode2);
+    std::copy(code3.begin(), code3.end(), image.begin() + kRawCode3);
 
     std::ofstream xbe(xbe_path, std::ios::binary);
     xbe.write(reinterpret_cast<const char*>(image.data()), std::streamsize(image.size()));
@@ -737,7 +876,7 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
               "entry = 0x11000\n"
               "out = \"generated\"\n"
               "partitions = 1\n"
-              "code_sections = [\".text\", \".text2\"]\n"
+              "code_sections = [\".text\", \".text2\", \".text3\"]\n"
               "pointer_seeds = false\n"
               "gap_fill = false\n"
               "checked_memory = true\n\n"

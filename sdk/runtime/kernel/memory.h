@@ -59,7 +59,18 @@ private:
 };
 
 enum Permission : uint8_t { kNoAccess = 0, kRead = 1, kWrite = 2, kExecute = 4, kReadWrite = kRead | kWrite };
-enum class AccessStatus : uint8_t { kOk, kNotInitialized, kInvalidAddress, kUncommitted, kPermissionDenied, kHostError };
+// kBusy: a nested lease request met a range another thread is mutating. A
+// thread that already holds a lease must not wait for the mutation, because the
+// mutator may be waiting for that lease; callers reject the operation instead.
+enum class AccessStatus : uint8_t {
+    kOk,
+    kNotInitialized,
+    kInvalidAddress,
+    kUncommitted,
+    kPermissionDenied,
+    kHostError,
+    kBusy,
+};
 
 class ScopedPageLease {
 public:
@@ -71,6 +82,11 @@ public:
     ScopedPageLease& operator=(ScopedPageLease&& other) noexcept;
 
     AccessStatus Acquire(uint32_t va, std::size_t size, uint8_t permissions);
+    // Leases the maximal run of committed, executable pages that starts at va,
+    // capped at limit. Generated code never fetches its own bytes, so one run
+    // lease covers every page the compiled body can execute from without
+    // pinning a code section's gaps or unrelated pages.
+    AccessStatus AcquireExecutableRun(uint32_t va, uint32_t limit);
     void Release();
 
 private:

@@ -306,6 +306,59 @@ void SetWaitApcHookForTest(WaitApcHook hook);
 #endif
 std::vector<ThreadRef> Threads();
 
+// Phase 2D-16: bounded admission ceiling for the emulator's thread registry.
+// It is not a retail limit; it stops unbounded registration from a malformed
+// image before the process runs out of thread blocks.
+constexpr uint32_t kMaximumGuestThreads = 256;
+
+// The SHA-1 of the image this build was recompiled from
+// (app::game_files sets it at boot). Empty until set.
+void SetImageIdentity(const char* sha1);
+bool ImageIdentityMatches(const char* expected);
+
+// Checked, non-executing admission for a prepared guest thread. The validator
+// inspects the prepared request only: it never starts guest instructions and it
+// does not authorise execution. Starting still goes through StartThread's
+// callback tickets and any active synthetic claim gate.
+enum class SystemRoutineAdmission : uint8_t {
+    kAdmitted,
+    kNotInitialized,
+    kShutdown,
+    kInvalidImage,
+    kInvalidParent,
+    kInvalidThreadState,
+    kInvalidStack,
+    kInvalidTls,
+    kInvalidThreadBlocks,
+    kInvalidFsBase,
+    kInvalidStartRoutine,
+    kInvalidSystemRoutine,
+    kInvalidCodePage,
+    kStaleDispatch,
+    kStaleMemory,
+    kInvalidSession,
+    kRegistryFull,
+};
+const char* SystemRoutineAdmissionName(SystemRoutineAdmission status);
+
+struct SystemRoutineAdmissionSpec {
+    const char* expected_image_sha1 = nullptr;  // null skips the identity check
+    uint32_t expected_parent_id = 0;            // 0 skips; otherwise Current() must match
+    uint32_t expected_start_routine = 0;        // 0 skips
+    uint32_t expected_system_routine = 0;       // 0 skips the identity check
+    uint64_t dispatch_generation = 0;           // 0 skips
+    uint64_t memory_generation = 0;             // 0 skips
+    bool require_synthetic_slot = false;        // a claim slot must still be free
+};
+
+struct SystemRoutineAdmissionResult {
+    SystemRoutineAdmission status = SystemRoutineAdmission::kNotInitialized;
+    uint32_t detail = 0;  // the failing address, argument or thread id
+};
+
+SystemRoutineAdmissionResult ValidateSystemRoutineAdmission(const Thread& prepared,
+                                                            const SystemRoutineAdmissionSpec& spec);
+
 // files
 bool MountDefaults(const std::string& game_dir, const std::string& data_dir);
 void ClearFilesystemMappings();

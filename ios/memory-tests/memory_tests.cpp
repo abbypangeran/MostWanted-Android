@@ -11,11 +11,13 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -26,6 +28,20 @@ uint8_t* g_base = nullptr;
 namespace {
 
 int failures = 0;
+
+// Phase 2D-16: the executable-run lease test reports a mutation blocked behind
+// a lease; the hook runs while the page-lease lock is held, so it only signals.
+std::mutex g_exec_lease_lock;
+std::condition_variable g_exec_lease_cv;
+bool g_exec_mutation_waiting = false;
+
+void SignalExecMutationWait() {
+    {
+        std::lock_guard lock(g_exec_lease_lock);
+        g_exec_mutation_waiting = true;
+    }
+    g_exec_lease_cv.notify_all();
+}
 
 void Check(bool condition, const char *name) {
     std::printf("%s: %s\n", condition ? "PASS" : "FAIL", name);
@@ -249,6 +265,70 @@ extern "C" int RunMemoryTests() {
                                        (fill_status == mem::AccessStatus::kUncommitted && all_sentinel));
     }
     Check(pattern_decommit_serialized, "concurrent pattern fill and decommit make no partial progress");
+
+    {
+        // AcquireExecutableRun leases the contiguous executable run from an
+        // entry: it must span the pages of a multi-page function, stop at a
+        // non-executable page, and never wait while the caller holds a lease.
+        constexpr uint32_t exec_va = 0x90000;
+        const uint32_t entry = exec_va + mem::kPage + 0x800;
+        Check(mem::Commit(exec_va, 3 * mem::kPage), "executable-run fixture pages commit");
+        mem::ScopedPageLease rw_entry;
+        Check(rw_entry.AcquireExecutableRun(exec_va, exec_va + 3 * mem::kPage) ==
+                  mem::AccessStatus::kPermissionDenied,
+              "a readable and writable entry page is not an executable run");
+        rw_entry.Release();
+        Check(mem::Protect(exec_va, 3 * mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+              "executable-run fixture pages become executable");
+        mem::ScopedPageLease run;
+        Check(run.AcquireExecutableRun(entry, exec_va + 3 * mem::kPage) == mem::AccessStatus::kOk,
+              "an executable run leases from a mid-page entry over every contiguous code page");
+        mem::SetPageMutationWaitHookForTest(SignalExecMutationWait);
+        {
+            std::lock_guard lock(g_exec_lease_lock);
+            g_exec_mutation_waiting = false;
+        }
+        std::atomic<bool> mutation_ok{false};
+        std::thread mutation([&] {
+            mutation_ok = mem::Protect(exec_va + 2 * mem::kPage, mem::kPage, mem::kNoAccess) ==
+                          mem::AccessStatus::kOk;
+        });
+        bool waited = false;
+        {
+            std::unique_lock lock(g_exec_lease_lock);
+            waited = g_exec_lease_cv.wait_for(lock, std::chrono::seconds(5),
+                                              [] { return g_exec_mutation_waiting; });
+        }
+        run.Release();
+        mutation.join();
+        mem::SetPageMutationWaitHookForTest(nullptr);
+        Check(waited && mutation_ok.load(), "a mutation of a page inside the leased run waits for the lease");
+
+        Check(mem::Protect(exec_va + mem::kPage, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk,
+              "the middle page of the fixture becomes non-executable");
+        mem::SetPageMutationWaitHookForTest(SignalExecMutationWait);
+        {
+            std::lock_guard lock(g_exec_lease_lock);
+            g_exec_mutation_waiting = false;
+        }
+        mem::ScopedPageLease gap_run;
+        const bool gap_leased = gap_run.AcquireExecutableRun(exec_va, exec_va + 3 * mem::kPage) ==
+                                mem::AccessStatus::kOk;
+        const bool gap_mutation = mem::Protect(exec_va + 2 * mem::kPage, mem::kPage, mem::kNoAccess) ==
+                                  mem::AccessStatus::kOk;
+        bool gap_waited = false;
+        {
+            std::lock_guard lock(g_exec_lease_lock);
+            gap_waited = g_exec_mutation_waiting;
+        }
+        gap_run.Release();
+        mem::SetPageMutationWaitHookForTest(nullptr);
+        Check(gap_leased && gap_mutation && !gap_waited,
+              "a non-executable page ends the run so the pages after it stay unpinned");
+        Check(mem::Protect(exec_va, 3 * mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                  mem::Decommit(exec_va, 3 * mem::kPage),
+              "the executable-run fixture range restores and releases");
+    }
 
     std::array<uint8_t, 48> bulk{};
     for (size_t i = 0; i < bulk.size(); ++i) bulk[i] = uint8_t(i ^ 0x5A);
