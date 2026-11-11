@@ -434,6 +434,7 @@ const char* SystemRoutineAdmissionName(SystemRoutineAdmission status) {
         case SystemRoutineAdmission::kStaleMemory: return "stale memory generation";
         case SystemRoutineAdmission::kInvalidSession: return "no free synthetic session slot";
         case SystemRoutineAdmission::kRegistryFull: return "thread registry is full";
+        case SystemRoutineAdmission::kInvalidRequest: return "ordinal-255 request is malformed";
     }
     return "unknown admission status";
 }
@@ -569,6 +570,70 @@ AuthenticAdmissionResult ValidateAuthenticSystemRoutineAdmission(const Thread& p
     }
     result.status = AuthenticAdmissionStatus::kValidatedButExecutionProhibited;
     result.detail = prepared.id;
+    return result;
+}
+
+AuthenticAdmissionResult AssessAuthenticSystemThreadRequest(const AuthenticSystemThreadRequest& request) {
+    AuthenticAdmissionResult result;
+    result.unresolved = kAuthenticUnresolvedKprcb250 | kAuthenticUnresolvedRetailSeh |
+                        kAuthenticUnresolvedInitializerChain | kAuthenticUnresolvedPhysicalWindow;
+    auto malformed = [&result](SystemRoutineAdmission reason, uint32_t detail) {
+        result.status = AuthenticAdmissionStatus::kRejected;
+        result.reason = reason;
+        result.detail = detail;
+        return result;
+    };
+    // The raw request must match the reviewed call site before anything is
+    // allocated; a mismatch is reported as a call-site violation, the same
+    // status the prepared-thread validator gives a wrong routine.
+    if (!request.handle_out || request.thread_extension_size || request.reserved ||
+        (request.create_flags & 0xFFu))
+        return malformed(SystemRoutineAdmission::kInvalidRequest,
+                         request.thread_extension_size | request.reserved | (request.create_flags & 0xFFu));
+    if (request.call_pc != kAuthenticCreateThreadCallPc ||
+        request.argument_count != kAuthenticCreateThreadArguments ||
+        request.system_routine != kAuthenticSystemRoutine || request.start_routine != kAuthenticStartRoutine) {
+        result.status = AuthenticAdmissionStatus::kInvalidCallSite;
+        result.detail = request.call_pc;
+        return result;
+    }
+    if (request.tls_size != kAuthenticTlsBlockSize)
+        return malformed(SystemRoutineAdmission::kInvalidTls, request.tls_size);
+    if (!request.policy_identity ||
+        std::strcmp(request.policy_identity, kAuthenticCallbackPolicyIdentity) != 0) {
+        result.status = AuthenticAdmissionStatus::kInvalidPolicyIdentity;
+        return result;
+    }
+    if (!mem::IsInitialized()) return malformed(SystemRoutineAdmission::kNotInitialized, 0);
+    if (!KernelWorkersAccepting()) return malformed(SystemRoutineAdmission::kShutdown, 0);
+
+    // Prepare the candidate exactly as the production export would, then run the
+    // same core admission. Nothing is started; the candidate is cancelled and its
+    // resources return to the baseline before this function returns.
+    ThreadRef candidate;
+    const uint32_t status = PrepareSystemThreadEx(
+        request.handle_out, request.stack_size ? request.stack_size : 0x10000, request.tls_size, request.thread_id_out,
+        request.start_routine, request.start_context, false, request.system_routine, candidate);
+    if (status != kSuccess || !candidate)
+        return malformed(SystemRoutineAdmission::kInvalidRequest, status);
+
+    AuthenticAdmissionSpec spec;
+    spec.expected_image_sha1 = kAuthenticImageSha1;
+    spec.expected_system_routine = kAuthenticSystemRoutine;
+    spec.expected_start_routine = kAuthenticStartRoutine;
+    spec.call_pc = kAuthenticCreateThreadCallPc;
+    spec.argument_count = kAuthenticCreateThreadArguments;
+    spec.expected_policy_identity = kAuthenticCallbackPolicyIdentity;
+    spec.dispatch_generation = request.dispatch_generation;
+    spec.memory_generation = request.memory_generation;
+    spec.expected_parent_id = request.parent_id;
+    result = ValidateAuthenticSystemRoutineAdmission(*candidate, spec);
+    if (!CancelPreparedThread(candidate)) {
+        // A candidate that cannot be rolled back is not a valid assessment.
+        result.status = AuthenticAdmissionStatus::kRejected;
+        result.reason = SystemRoutineAdmission::kInvalidThreadState;
+        result.detail = candidate->id;
+    }
     return result;
 }
 

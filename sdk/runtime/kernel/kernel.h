@@ -338,6 +338,7 @@ enum class SystemRoutineAdmission : uint8_t {
     kStaleMemory,
     kInvalidSession,
     kRegistryFull,
+    kInvalidRequest,  // Phase 2D-18: the raw ordinal-255 request is malformed
 };
 const char* SystemRoutineAdmissionName(SystemRoutineAdmission status);
 
@@ -406,6 +407,33 @@ struct AuthenticAdmissionResult {
 
 AuthenticAdmissionResult ValidateAuthenticSystemRoutineAdmission(const Thread& prepared,
                                                                  const AuthenticAdmissionSpec& spec);
+
+// Phase 2D-18: the raw ordinal-255 request as the authentic call site at
+// 002B5CE0 builds it. The assessment prepares a candidate thread from these
+// arguments, runs the same core checks the prepared-thread validator uses,
+// cancels the candidate and reports evidence. It never starts a worker, creates
+// a callback ticket or a synthetic claim, and the result is not an execution
+// token. A fully matching request yields kValidatedButExecutionProhibited.
+struct AuthenticSystemThreadRequest {
+    uint32_t handle_out = 0;            // a0, a writable guest dword
+    uint32_t thread_extension_size = 0; // a1, must be 0
+    uint32_t stack_size = 0;            // a2, 0 selects the production default
+    uint32_t tls_size = 0;              // a3, must be kAuthenticTlsBlockSize
+    uint32_t thread_id_out = 0;         // a4, a writable guest dword or 0
+    uint32_t start_routine = 0;         // a5
+    uint32_t start_context = 0;         // a6
+    uint32_t create_flags = 0;          // a7, the low byte must be 0
+    uint32_t reserved = 0;              // a8, must be 0
+    uint32_t system_routine = 0;        // a9
+    uint32_t call_pc = 0;               // the guest PC that issued the call
+    uint32_t argument_count = 0;        // the export's declared argument count
+    const char* policy_identity = nullptr;
+    uint32_t parent_id = 0;      // 0 skips the parent check
+    uint64_t dispatch_generation = 0;
+    uint64_t memory_generation = 0;
+};
+
+AuthenticAdmissionResult AssessAuthenticSystemThreadRequest(const AuthenticSystemThreadRequest& request);
 
 // files
 bool MountDefaults(const std::string& game_dir, const std::string& data_dir);

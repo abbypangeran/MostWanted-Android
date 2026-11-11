@@ -1849,6 +1849,36 @@ int RunIntegratedPreflight(const std::string& scenario) {
             kernel::CancelPreparedThread(candidate);
             return finish("critical-section import restoration failed", false);
         }
+        // Phase 2D-18: the production assessment runs the same core admission on
+        // the real argument block. It prepares and cancels its own candidate; it
+        // never starts a worker and its result is not an execution token.
+        kernel::SetImageIdentity(Sha1Hex(image.file).c_str());
+        kernel::AuthenticSystemThreadRequest request;
+        request.handle_out = facts.import_args[0];
+        request.thread_extension_size = facts.import_args[1];
+        request.stack_size = facts.import_args[2];
+        request.tls_size = facts.import_args[3];
+        request.thread_id_out = facts.import_args[4];
+        request.start_routine = facts.import_args[5];
+        request.start_context = facts.import_args[6];
+        request.create_flags = facts.import_args[7];
+        request.reserved = facts.import_args[8];
+        request.system_routine = facts.import_args[9];
+        request.call_pc = kernel::kAuthenticCreateThreadCallPc;
+        request.argument_count = kernel::kAuthenticCreateThreadArguments;
+        request.policy_identity = kernel::kAuthenticCallbackPolicyIdentity;
+        const kernel::AuthenticAdmissionResult assessed = kernel::AssessAuthenticSystemThreadRequest(request);
+        const bool assessment_ok =
+            assessed.status == kernel::AuthenticAdmissionStatus::kValidatedButExecutionProhibited &&
+            kernel::Threads().empty();
+        kernel::SetImageIdentity(nullptr);
+        if (!assessment_ok) {
+            candidate->ctx = nullptr;
+            kernel::CancelPreparedThread(candidate);
+            return finish("production authentic assessment did not validate the real request", false);
+        }
+        std::printf("PREFLIGHT production assessment: status=%s unresolved=%X threads=0\n",
+                    kernel::AuthenticAdmissionStatusName(assessed.status), assessed.unresolved);
         PrintIntegratedFacts(facts, secondary);
         candidate->ctx = nullptr;
         if (!CancelCandidateAtOutputs(candidate, facts.import_args[0], facts.import_args[4], error))

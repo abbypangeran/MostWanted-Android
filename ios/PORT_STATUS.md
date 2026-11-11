@@ -4094,3 +4094,91 @@ The fixture grew from 766 to 798 assertions (+32): intra-function jump, direct/r
 Gate A is GO. The next substantial package should be **Gate B's admission route**: bind the production ordinal-255 path to a validated claim and the reviewed system-routine contract without enabling guest execution, then decide the retail SEH `0x00319804` contract that the `0x002B5C0F` prologue requires. That is the smallest package that advances a gate rather than adding synthetic coverage.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-18 — Gate B preparation
+
+**`PHASE_2D18_GATE_B_PREPARATION = PASS`.** The Gate B boundary is now stated exactly and checked by a static preflight, the production ordinal-255 path has a non-executing assessment that reuses the reviewed admission core, and the authentic SEH prologue `0x00319804` has a checked registration/normal-return representation exercised by generated synthetic guest code. No authentic instruction ran; the frozen 143-instruction route is unchanged; Gate A is GO, Gates B and C are NO-GO.
+
+### The exact Gate B boundary
+
+`0x002B38A2`'s first instruction is `call 0x002B58B8`. A boundary that stops before the start routine's first internal CALL therefore executes no start-routine instruction at all. The reviewed boundary is an *entry* boundary:
+
+```
+ordinal-255 activation (frozen root: 72)
+0x002B5C0F..0x002B5C74   system routine prologue and TLS fill (35)
+0x00319804..0x0031983E   SEH prologue registration and return (19)
+0x002B597D..0x002B59B2   pre-start list walk, empty path (17)
+0x002B5C7B              push [ebp+0x0C] (1)
+0x002B5C7E              call [ebp+0x08] (1)
+0x002B38A2              stop, pre-instruction (0)
+```
+
+That is **73 instructions** beyond the frozen secondary segment, **145 with the root**. The boundary excludes `0x002B58B8`, the `0x002B5854` probe, every `KPRCB+0x250` read, the initializer walkers, the 867 live initializer targets, the dynamic list callback and ordinal-258 termination. `KPRCB+0x250` and `[0x8001003C]` are therefore **not on the Gate B path**; the Phase 2D-17 CONDITIONALLY_SAFE conclusion still applies to the wider boundary that starts reading at `0x002B38B2`.
+
+`0x002B5C0F` never returns: after the start routine it walks the list again and calls ordinal 258 at `0x002B5CA0`. `0x002B5BD3` is not an SEH epilogue; it is a one-argument routine on the exception path and reads `KPRCB+0x250`.
+
+### Static Gate B preflight
+
+`ios/recompiler-fixtures/gate_b_preflight.cpp` (target `gate_b_preflight`, Debug/Release) parses the real image, decodes all 79 reviewed instructions, compares bytes and lengths, checks the startup data and prints `GATE_B_*` lines or JSON. It links no generated authentic code.
+
+| Check | Result |
+|---|---|
+| Image SHA-1 / title / entry / base | `f636…4233`, `4541007B`, `002B3916`, `00010000` |
+| Route text and lengths | 79/79 |
+| Executed instructions | 73 (145 with the frozen root) |
+| Kernel imports | 277 at `003C9E44`, 294 at `003C9E40`; 255/258 outside |
+| TLS | copy 0, zero-fill `0x90`, directory block `0x94`, `004EDC74` is BSS written at `002B394E` |
+| List / scope | head `0046C8CC` is its own sentinel; scope table `003ED5B8` starts `FFFFFFFF` |
+| SEH | `00319804` pushes handler `00319858`; handler never runs |
+| Stop | `002B38A2` pre-instruction |
+| Execution | **PROHIBITED** |
+
+### Production ordinal-255 assessment
+
+`kernel::AssessAuthenticSystemThreadRequest` (`sdk/runtime/kernel/threads.cpp`, compiled in production) takes the raw ten arguments plus call-site metadata. It verifies the request against the reviewed constants, prepares a candidate through `PrepareSystemThreadEx`, runs `ValidateAuthenticSystemRoutineAdmission` (the same core the synthetic framework uses), cancels the candidate and returns the result. A matching request yields `VALIDATED_BUT_EXECUTION_PROHIBITED`; mismatches yield `kInvalidCallSite`, `kInvalidImage`, `kInvalidPolicyIdentity` or `kRejected` with the precise `SystemRoutineAdmission` reason. It creates no callback ticket and no synthetic claim; the fixtures assert at compile time that the result cannot convert to `GuestCallbackTicket` or `ThreadRef`, and at runtime that no worker is started or retained and the guest allocation returns to baseline.
+
+The production export is deliberately **not** wired to start from this result. Converting validated evidence into an authenticated execution claim is the Gate B authorisation decision this phase does not make. The integrated real preflight runs the assessment on the real argument block and reports `PREFLIGHT production assessment: status=validated-but-execution-prohibited unresolved=F threads=0`.
+
+### SEH prologue contract
+
+`sdk/runtime/kernel/seh_prologue.h` records the reviewed `00319804` frame. With `E` = ESP at the `call` into the prologue:
+
+| Address | Content |
+|---|---|
+| `E+0x04` | caller EBP (size argument slot) |
+| `E+0x00` | scope flag `-1` while live (table argument slot) |
+| `E-0x04` | scope table after return (helper return address before) |
+| `E-0x08` | handler `00319858` |
+| `E-0x0C` | previous `fs:[0]` and the registration |
+| `E-0x14` | saved ESP (`E-0x30`) |
+| after `ret` | `EBP = E+4`, `ESP = E-0x30`; the caller's own return address is untouched |
+
+`VerifyRegistration` checks the live record, chain position (head or nested), scope flag/table, saved ESP, caller EBP and handler resolution. `VerifyNormalReturn` checks the unlink and the restored frame. The fixture executes generated synthetic guest code that builds this frame at `0x14380`, inspects it while live (`0x11700`), nests a second record (`0x143C0`) and inspects two frames (`0x11704`), unlinks and inspects the restored chain (`0x11708`), then returns with the original EBP and `RET 4` stack. It also rejects a foreign FS base, a wrong handler, a bad scope flag, a bad scope table and a still-installed frame. The handler at `0x143EC` is resolved but never called. Retail exception delivery and `RtlRaiseException`/`RtlUnwind` remain prohibited.
+
+### Legacy dispatch-bypass audit
+
+- Production Apple still returns `kExecutionDisabled` after ticket validation; `x86_icall` traps on Apple without the test macros. The legacy no-session tail/call path is reachable only from a guest entry, and no authentic guest entry exists.
+- The new assessment creates no claim, ticket or worker, and its result has no conversion to any entry API (compile-time assertions).
+- Synthetic claims and authentic identity are disjoint: arming requires `kSyntheticWorkerImageIdentity` and only exists under `MOSTWANTED_SYNTHETIC_WORKER_TESTS`; the authentic validator requires the runtime image identity to equal the recompiled SHA-1.
+- Tail transfers still go through session admission, and the 2D-17 fail-closed cases (unauthorised target, revoked claim, stale generations, changed slot, non-executable page) stay green.
+- No lease architecture change was needed; `AcquireExecutableRun` remains the only code-page protection and page mutation still fails closed with `kBusy`.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Root / secondary / integrated self-test | root 141 / 24 / 68 PASS | same |
+| Root / secondary / integrated `--preflight` | PASS, exit 0 | PASS, exit 0 |
+| `gate_b_preflight` | PASS, exit 0 | PASS, exit 0 |
+| Android ARM64 syntax (`threads.cpp`) | PASS | — |
+
+The fixture grew from 798 to 812 assertions (+14): the production assessment and its ten negative cases, the generated prologue registration/nesting/unlink and the five prologue negatives. One 2D-17 assertion (`a nested target whose page loses execute permission during admission…`) read `resources_released` right after `Wait()`, which only reports the exit transition; it now joins the worker through the existing `StopKernelWorkers`/`RestartKernelWorkers` path before asserting. The suite then passed 40/40 Debug and 5/5 Release repeat runs, so the check is deterministic rather than timing-dependent.
+
+### Next milestone
+
+Gate B's remaining blockers are now small and explicit: a claim-bound authentic execution authorisation (a ticket/claim the worker can present at `0x002B5C0F`), checked indirect admission for the dynamic `0x002B5C7E` call, and an explicit decision on whether the entry boundary may run without retail exception delivery. The next substantial package should be the **first authorised, bounded authentic startup experiment** for exactly the 145-instruction entry boundary — not another synthetic feature phase — and must start from a separately approved execution record.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

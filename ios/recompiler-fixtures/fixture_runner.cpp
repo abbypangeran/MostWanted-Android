@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #if defined(__APPLE__)
@@ -23,6 +24,7 @@
 #include "kernel/kernel.h"
 #include "kernel/guest_exception_chain.h"
 #include "kernel/memory.h"
+#include "kernel/seh_prologue.h"
 #include "kernel/synthetic_worker.h"
 #include "kernel/thread_memory.h"
 #include "xbe/xbe.h"
@@ -59,6 +61,15 @@ std::atomic<kernel::GuestExceptionChainStatus> g_seh_validation_status{kernel::G
 std::atomic<uint32_t> g_seh_validation_count{0};
 std::atomic<uint32_t> g_seh_validation_calls{0};
 std::atomic<uint32_t> g_seh_handler_calls{0};
+kernel::ThreadRef g_seh_prologue_thread;
+kernel::seh::PrologueFrame g_seh_prologue_frame{};
+std::atomic<uint32_t> g_seh_prologue_status{0xFF};
+std::atomic<uint32_t> g_seh_prologue_detail{0};
+std::atomic<uint32_t> g_seh_prologue_chain{0};
+std::atomic<uint32_t> g_seh_prologue_nested_status{0xFF};
+std::atomic<uint32_t> g_seh_prologue_nested_chain{0};
+std::atomic<uint32_t> g_seh_prologue_return_status{0xFF};
+std::atomic<uint32_t> g_seh_prologue_return_detail{0};
 kernel::ThreadRef g_exception_dispatch_thread;
 std::array<kernel::GuestCallbackTicket, 2> g_exception_handler_tickets{};
 std::atomic<kernel::SyntheticExceptionStatus> g_exception_dispatch_status{kernel::SyntheticExceptionStatus::kInvalidOwner};
@@ -286,6 +297,46 @@ void SyntheticSehHandlerMustNotRun(X86Context&, uint8_t*) { ++g_seh_handler_call
 
 void SyntheticSehInspectionCallback(X86Context& ctx, uint8_t* base) {
     SyntheticGuestCallback(ctx, base);
+    x86_checked_ret(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0, 0);
+}
+
+// Phase 2D-18: generated code calls these host thunks while the synthetic SEH
+// prologue record is live. Each one runs the checked representation over the
+// current context and then consumes the call frame like every host callback.
+void SyntheticSehPrologueInspection(X86Context& ctx, uint8_t*) {
+    if (g_seh_prologue_thread) {
+        kernel::seh::PrologueFrame frame = g_seh_prologue_frame;
+        frame.call_esp = ctx.ebp - kernel::seh::kFrameAboveCallEsp;
+        const kernel::seh::PrologueResult result =
+            kernel::seh::VerifyRegistration(ctx, *g_seh_prologue_thread, frame);
+        g_seh_prologue_status = uint32_t(result.status);
+        g_seh_prologue_detail = result.detail;
+        g_seh_prologue_chain = kernel::ValidateGuestExceptionChain(ctx, *g_seh_prologue_thread).frame_count;
+    }
+    x86_checked_ret(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0, 0);
+}
+
+void SyntheticSehPrologueNestedInspection(X86Context& ctx, uint8_t*) {
+    if (g_seh_prologue_thread) {
+        kernel::seh::PrologueFrame frame = g_seh_prologue_frame;
+        frame.call_esp = ctx.ebp - kernel::seh::kFrameAboveCallEsp;
+        const kernel::seh::PrologueResult result =
+            kernel::seh::VerifyRegistration(ctx, *g_seh_prologue_thread, frame);
+        g_seh_prologue_nested_status = uint32_t(result.status);
+        g_seh_prologue_nested_chain = kernel::ValidateGuestExceptionChain(ctx, *g_seh_prologue_thread).frame_count;
+    }
+    x86_checked_ret(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0, 0);
+}
+
+void SyntheticSehPrologueReturnInspection(X86Context& ctx, uint8_t*) {
+    if (g_seh_prologue_thread) {
+        kernel::seh::PrologueFrame frame = g_seh_prologue_frame;
+        frame.call_esp = ctx.ebp - kernel::seh::kFrameAboveCallEsp;
+        const kernel::seh::PrologueResult result =
+            kernel::seh::VerifyNormalReturn(ctx, *g_seh_prologue_thread, frame, 0, 0);
+        g_seh_prologue_return_status = uint32_t(result.status);
+        g_seh_prologue_return_detail = result.detail;
+    }
     x86_checked_ret(ctx, ctx.checked_call ? ctx.checked_call->return_address - 2 : 0, 0);
 }
 
@@ -2477,8 +2528,11 @@ void CheckCodePageLeaseScope() {
             paused && mem::Protect(code2_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk;
         if (started) ReleaseAdmissionPause();
         const uint32_t wait = started ? LeaseWait(worker) : kernel::kTimeout;
+        // Wait() reports the exit transition, not the worker's finalisation; join
+        // the worker before asserting its resources were released.
+        const bool joined_worker = started && kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
         kernel::SetSyntheticSessionAdmissionHookForTest(nullptr);
-        Check(mutated && wait == kernel::kWait0 && worker &&
+        Check(mutated && wait == kernel::kWait0 && joined_worker && worker &&
                   worker->state.load() == kernel::ThreadState::kCancelled && worker->exit_code.load() == 0 &&
                   LeaseWord(0xB00A0) == 0 && worker->resources_released,
               "a nested target whose page loses execute permission during admission is rejected before its body runs");
@@ -2869,6 +2923,77 @@ void CheckAuthenticAdmissionBinding() {
               kernel::Threads().empty() && thread->state.load() == kernel::ThreadState::kPrepared &&
               kernel::KernelWorkerCountForTest() == 0,
           "the authentic readiness result does not register or activate the thread");
+
+    {
+        kernel::AuthenticSystemThreadRequest request;
+        request.handle_out = handle_out;
+        request.stack_size = 0;
+        request.tls_size = kernel::kAuthenticTlsBlockSize;
+        request.thread_id_out = id_out;
+        request.start_routine = kernel::kAuthenticStartRoutine;
+        request.start_context = 0;
+        request.system_routine = kernel::kAuthenticSystemRoutine;
+        request.call_pc = kernel::kAuthenticCreateThreadCallPc;
+        request.argument_count = kernel::kAuthenticCreateThreadArguments;
+        request.policy_identity = kernel::kAuthenticCallbackPolicyIdentity;
+        request.dispatch_generation = CurrentDispatchGeneration();
+        request.memory_generation = mem::Generation();
+        static_assert(!std::is_convertible_v<kernel::AuthenticAdmissionResult, kernel::GuestCallbackTicket>,
+                      "the authentic assessment is not a callback ticket");
+        static_assert(!std::is_convertible_v<kernel::AuthenticAdmissionResult, kernel::ThreadRef>,
+                      "the authentic assessment is not a thread reference");
+        const mem::Stats before = mem::Query();
+        const kernel::AuthenticAdmissionResult assessed = kernel::AssessAuthenticSystemThreadRequest(request);
+        Check(assessed.status == kernel::AuthenticAdmissionStatus::kValidatedButExecutionProhibited &&
+                  assessed.reason == kernel::SystemRoutineAdmission::kAdmitted &&
+                  assessed.unresolved == all_unresolved && kernel::Threads().empty() &&
+                  kernel::KernelWorkerCountForTest() == 0 && mem::Query().system_used == before.system_used,
+              "the production ordinal-255 assessment validates a matching request without starting or retaining a worker");
+
+        auto rejected = [&](void (*mutate)(kernel::AuthenticSystemThreadRequest&)) {
+            kernel::AuthenticSystemThreadRequest wrong = request;
+            mutate(wrong);
+            return kernel::AssessAuthenticSystemThreadRequest(wrong);
+        };
+        const kernel::AuthenticAdmissionResult wrong_call =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.call_pc = 0x002B5CD0; });
+        const kernel::AuthenticAdmissionResult wrong_arguments =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.argument_count = 9; });
+        const kernel::AuthenticAdmissionResult wrong_system =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.system_routine = kernel::kAuthenticStartRoutine; });
+        const kernel::AuthenticAdmissionResult wrong_start =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.start_routine = kernel::kAuthenticSystemRoutine; });
+        const kernel::AuthenticAdmissionResult wrong_tls =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.tls_size = 0x90; });
+        const kernel::AuthenticAdmissionResult wrong_extension =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.thread_extension_size = 4; });
+        const kernel::AuthenticAdmissionResult wrong_policy =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.policy_identity = "0000000000000000000000000000000000000000"; });
+        const kernel::AuthenticAdmissionResult stale_dispatch =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.dispatch_generation += 1; });
+        const kernel::AuthenticAdmissionResult stale_memory =
+            rejected([](kernel::AuthenticSystemThreadRequest& r) { r.memory_generation += 1; });
+        Check(wrong_call.status == kernel::AuthenticAdmissionStatus::kInvalidCallSite &&
+                  wrong_arguments.status == kernel::AuthenticAdmissionStatus::kInvalidCallSite &&
+                  wrong_system.status == kernel::AuthenticAdmissionStatus::kInvalidCallSite &&
+                  wrong_start.status == kernel::AuthenticAdmissionStatus::kInvalidCallSite &&
+                  wrong_tls.status == kernel::AuthenticAdmissionStatus::kRejected &&
+                  wrong_tls.reason == kernel::SystemRoutineAdmission::kInvalidTls &&
+                  wrong_extension.status == kernel::AuthenticAdmissionStatus::kRejected &&
+                  wrong_extension.reason == kernel::SystemRoutineAdmission::kInvalidRequest &&
+                  wrong_policy.status == kernel::AuthenticAdmissionStatus::kInvalidPolicyIdentity &&
+                  stale_dispatch.status == kernel::AuthenticAdmissionStatus::kRejected &&
+                  stale_dispatch.reason == kernel::SystemRoutineAdmission::kStaleDispatch &&
+                  stale_memory.status == kernel::AuthenticAdmissionStatus::kRejected &&
+                  stale_memory.reason == kernel::SystemRoutineAdmission::kStaleMemory,
+              "the production assessment rejects a wrong call site, ABI, routine, TLS size, extension, policy or generation");
+        kernel::SetImageIdentity("checked-fixture");
+        const kernel::AuthenticAdmissionResult wrong_image = kernel::AssessAuthenticSystemThreadRequest(request);
+        kernel::SetImageIdentity(kernel::kAuthenticImageSha1);
+        Check(wrong_image.status == kernel::AuthenticAdmissionStatus::kInvalidImage && kernel::Threads().empty() &&
+                  mem::Query().system_used == before.system_used,
+              "the production assessment rejects a runtime identity that is not the recompiled image");
+    }
 
     {
         kernel::AuthenticAdmissionSpec wrong_image = spec();
@@ -3264,6 +3389,167 @@ void CheckTailTransferAuthorisation() {
     Check(kernel::Threads().empty() && kernel::SyntheticWorkerCountForTest() == 0 &&
               mem::Query().system_used == baseline.system_used,
           "the tail-transfer fixture returns to its worker and allocation baseline");
+}
+
+// Phase 2D-18: the authentic 00319804 prologue contract, exercised by generated
+// synthetic guest code. 0x14380 keeps the reviewed frame layout but returns
+// normally; 0x143EC is only a stored handler address and never runs.
+void CheckSehPrologueContract() {
+    constexpr uint32_t code_base = 0x11000, code_bytes = 0x4000;
+    constexpr uint32_t data_page = 0xB0000;
+    constexpr uint32_t start = 0x14300, handler = 0x143EC;
+    constexpr uint32_t inspect_registration = 0x11700, inspect_nested = 0x11704, inspect_return = 0x11708;
+    constexpr uint32_t scope_table = 0xB0200;
+    constexpr uint32_t log_ethread = 0xB0400, log_marker = 0xB0404, log_entry_esp = 0xB040C, log_ebp = 0xB0410;
+    constexpr uint32_t log_entry_ebp = 0xB0414;
+    constexpr uint32_t handle_out = 0xB0040, id_out = 0xB0044;
+    constexpr uint32_t frame_bytes = 0x18;
+    constexpr uint32_t marker = 0x50524F4C;
+
+    static const X86FuncMapping functions[] = {
+        {start, sub_00014300},
+        {0x14380, sub_00014380},
+        {0x143C0, sub_000143C0},
+        {handler, sub_000143EC},
+        {inspect_registration, SyntheticSehPrologueInspection},
+        {inspect_nested, SyntheticSehPrologueNestedInspection},
+        {inspect_return, SyntheticSehPrologueReturnInspection},
+    };
+    const dispatch::Metadata metadata{code_base, code_base + code_bytes, start, functions, {}};
+
+    std::string error;
+    const bool ready = mem::Init() && mem::Commit(code_base, code_bytes) &&
+                       mem::Protect(code_base, code_bytes, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                       mem::Commit(data_page, mem::kPage) && dispatch::Init(metadata, error) &&
+                       kernel::RestartKernelWorkers();
+    Check(ready, "SEH prologue fixture memory, dispatch and workers initialize");
+    if (!ready) return;
+    const mem::Stats baseline = mem::Query();
+    uint32_t zero = 0;
+    for (uint32_t address = 0xB0000; address < 0xB0500; address += 4) mem::Write(address, &zero, sizeof(zero));
+    const uint32_t empty_chain = 0xFFFFFFFF;
+    Check(mem::Write(scope_table, &empty_chain, sizeof(empty_chain)) == mem::AccessStatus::kOk,
+          "synthetic scope table starts as the empty -1 terminator");
+
+    kernel::ThreadRef thread;
+    const uint32_t prepared =
+        kernel::PrepareSystemThreadEx(handle_out, 0x10000, 0x20, id_out, start, 0, false, 0, thread);
+    X86Context context{};
+    const bool context_ready =
+        prepared == kernel::kSuccess && bool(thread) && kernel::InitializePreparedThreadContextForTest(thread, context);
+    Check(context_ready, "the SEH prologue fixture prepares its generated guest context");
+    if (!context_ready) return;
+    context.ebp = 0x5A5A5A5A;  // proves push ebp / pop ebp actually save and restore the register
+
+    g_seh_prologue_thread = thread;
+    g_seh_prologue_frame = {};
+    g_seh_prologue_frame.scope_bytes = frame_bytes;
+    g_seh_prologue_frame.scope_table = scope_table;
+    g_seh_prologue_frame.handler = handler;
+    g_seh_prologue_frame.previous_head = empty_chain;
+    g_seh_prologue_frame.caller_ebp = context.esp - 12;  // EBP0 = entry ESP - 4
+    g_seh_prologue_status = 0xFF;
+    g_seh_prologue_nested_status = 0xFF;
+    g_seh_prologue_return_status = 0xFF;
+
+    kernel::GuestCallbackTicket ticket;
+    const std::array<uint32_t, 1> arguments{0};
+    uint32_t result = 0, final_esp = 0;
+    bool invoked = false;
+    try {
+        invoked = kernel::PrepareGuestCallback(start, kernel::GuestCallbackClass::kFixture, ticket) ==
+                      kernel::GuestCallbackStatus::kReady &&
+                  kernel::CallGuestCallbackForTest(context, ticket, start, arguments,
+                                                   thread->stack_top - thread->stack_size, thread->stack_size,
+                                                   result, &final_esp) == kernel::GuestCallbackStatus::kInvoked;
+    } catch (const FixtureStop&) {
+        std::fprintf(stderr, "SEH prologue fixture trap at %08X: %s\n", last_trap_pc, last_trap_reason.c_str());
+    }
+    uint32_t entry_esp = 0, entry_ebp = 0, ethread = 0, observed_marker = 0, restored_ebp = 0;
+    const bool log_read = mem::Read(log_entry_esp, &entry_esp, sizeof(entry_esp)) == mem::AccessStatus::kOk &&
+                          mem::Read(log_entry_ebp, &entry_ebp, sizeof(entry_ebp)) == mem::AccessStatus::kOk &&
+                          mem::Read(log_ethread, &ethread, sizeof(ethread)) == mem::AccessStatus::kOk &&
+                          mem::Read(log_marker, &observed_marker, sizeof(observed_marker)) == mem::AccessStatus::kOk &&
+                          mem::Read(log_ebp, &restored_ebp, sizeof(restored_ebp)) == mem::AccessStatus::kOk;
+    Check(invoked && log_read && entry_esp && g_seh_prologue_status.load() ==
+                                                   uint32_t(kernel::seh::PrologueStatus::kVerified) &&
+              g_seh_prologue_chain.load() == 1 &&
+              g_seh_prologue_nested_status.load() == uint32_t(kernel::seh::PrologueStatus::kVerified) &&
+              g_seh_prologue_nested_chain.load() == 2 &&
+              g_seh_prologue_return_status.load() == uint32_t(kernel::seh::PrologueStatus::kVerified) &&
+              ethread == thread->ethread && observed_marker == marker && restored_ebp == context.ebp &&
+              entry_ebp == entry_esp - 4 && final_esp == entry_esp + 8,  // RET 4 pops the return address and one argument
+          "generated guest code registers the prologue frame, nests a record, unlinks and returns cleanly");
+
+    uint32_t head = 0;
+    const auto chain_after = kernel::ValidateGuestExceptionChain(context, *thread);
+    Check(mem::Read(thread->kpcr, &head, sizeof(head)) == mem::AccessStatus::kOk && head == empty_chain &&
+              chain_after.status == kernel::GuestExceptionChainStatus::kValid && chain_after.frame_count == 0,
+          "the normal return leaves the exception chain empty and the record unlinked");
+
+    if (invoked && entry_esp) {
+        const uint32_t e = entry_esp - 12;  // ESP at the call into the prologue
+        const uint32_t registration = e - kernel::seh::kRegistrationBelowCallEsp;
+        const X86Context caller_context = context;
+        context.ebp = e + kernel::seh::kFrameAboveCallEsp;
+        context.esp = e - frame_bytes - 0x18;
+        uint32_t saved = 0;
+        mem::Read(thread->kpcr, &saved, sizeof(saved));
+        Check(mem::Write(thread->kpcr, &registration, sizeof(registration)) == mem::AccessStatus::kOk,
+              "the negative prologue cases install the live record for probing");
+        auto frame = [&] {
+            kernel::seh::PrologueFrame f = g_seh_prologue_frame;
+            f.call_esp = e;
+            return f;
+        };
+        auto verify = [&](const kernel::seh::PrologueFrame& f) {
+            return kernel::seh::VerifyRegistration(context, *thread, f).status;
+        };
+        auto corrupt = [&](uint32_t address, uint32_t value) {
+            return mem::Write(address, &value, sizeof(value)) == mem::AccessStatus::kOk;
+        };
+        const uint32_t fs_base = context.fs_base;
+        context.fs_base = fs_base + 1;
+        const bool owner_rejected = verify(frame()) == kernel::seh::PrologueStatus::kInvalidOwner;
+        context.fs_base = fs_base;
+        const uint32_t handler_location = e - kernel::seh::kHandlerBelowCallEsp;
+        uint32_t old_handler = 0;
+        mem::Read(handler_location, &old_handler, sizeof(old_handler));
+        const bool handler_rejected = corrupt(handler_location, 0xDEADBEEF) &&
+                                      verify(frame()) == kernel::seh::PrologueStatus::kInvalidHandler;
+        corrupt(handler_location, old_handler);
+        const bool scope_rejected = corrupt(e, 0) &&
+                                    verify(frame()) == kernel::seh::PrologueStatus::kInvalidScope;
+        corrupt(e, 0xFFFFFFFF);
+        const bool table_rejected = corrupt(scope_table, 0x12345678) &&
+                                    verify(frame()) == kernel::seh::PrologueStatus::kInvalidScope;
+        corrupt(scope_table, empty_chain);
+        const bool restored_frame = verify(frame()) == kernel::seh::PrologueStatus::kVerified;
+        Check(restored_frame, "live-frame verification accepts the frame again after the record is repaired");
+        // Install the frame as the chain head while claiming it was unlinked: the
+        // normal-return check must see the mismatch instead of accepting it.
+        mem::Write(thread->kpcr, &registration, sizeof(registration));
+        const kernel::seh::PrologueStatus returned =
+            kernel::seh::VerifyNormalReturn(context, *thread, frame(), 0, 0).status;
+        mem::Write(thread->kpcr, &saved, sizeof(saved));
+        Check(owner_rejected && handler_rejected && scope_rejected && table_rejected &&
+                  returned == kernel::seh::PrologueStatus::kInvalidChain,
+              "live-frame verification rejects a foreign FS base, a wrong handler, a bad scope flag and a bad table, and normal return rejects a live frame");
+        context = caller_context;
+    }
+
+    Check(kernel::CancelPreparedThread(thread) && thread->resources_released && kernel::Threads().empty(),
+          "the SEH prologue fixture thread is cancelled without a worker or retained record");
+    const auto released = kernel::ValidateGuestExceptionChain(context, *thread);
+    Check(released.status == kernel::GuestExceptionChainStatus::kInvalidOwner,
+          "the released thread can no longer validate an exception chain");
+
+    g_seh_prologue_thread.reset();
+    const bool restored = dispatch::Init(error);
+    kernel::StopKernelWorkers();
+    kernel::RestartKernelWorkers();
+    Check(restored && kernel::Threads().empty() && mem::Query().system_used == baseline.system_used,
+          "the SEH prologue fixture restores dispatch and its allocation baseline");
 }
 
 void CheckSyntheticWorkerLifecycle() {
@@ -8077,6 +8363,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckCodePageLeaseScope();
     CheckSystemRoutineAdmission();
     CheckAuthenticAdmissionBinding();
+    CheckSehPrologueContract();
     CheckTailTransferAuthorisation();
     CheckSyntheticWorkerLifecycle();
 #endif

@@ -919,6 +919,78 @@ bool Write(const std::filesystem::path& xbe_path, const std::filesystem::path& c
             0x14260) &&
         put3({0xE9, 0x8B, 0x0D, 0x00, 0x00}, 0x14270);  // jmp 0x15000 (outside the code range)
     if (!code3_tail) return false;
+    // Phase 2D-18: the synthetic SEH prologue contract. 0x14300 calls the
+    // prologue helper with a 0x18 frame, inspects the live registration, nests a
+    // second record, unlinks and returns normally. 0x143EC is the stored handler
+    // address; nothing calls it. The helper mirrors the reviewed 00319804 frame
+    // layout with synthetic addresses, not copied authentic bytes.
+    const bool code3_seh_prologue =
+        put3(
+            {
+                0x89, 0x25, 0x0C, 0x04, 0x0B, 0x00,        // mov [0xB040C], esp (entry ESP)
+                0x55,                                      // push ebp
+                0x8B, 0xEC,                                // mov ebp, esp
+                0x89, 0x2D, 0x14, 0x04, 0x0B, 0x00,        // save the caller frame pointer
+                0x6A, 0x18,                                // push 0x18 (frame size)
+                0x68, 0x00, 0x02, 0x0B, 0x00,              // push 0x0B0200 (scope table)
+                0xE8, 0x65, 0x00, 0x00, 0x00,              // call 0x14380
+                0xB8, 0x00, 0x17, 0x01, 0x00,              // mov eax, 0x11700 (registration inspection)
+                0xFF, 0xD0,                                // call eax
+                0x64, 0xA1, 0x28, 0x00, 0x00, 0x00,        // mov eax, fs:[0x28]
+                0xA3, 0x00, 0x04, 0x0B, 0x00,              // save ETHREAD
+                0xC7, 0x05, 0x04, 0x04, 0x0B, 0x00, 0x4C, 0x4F, 0x52, 0x50,  // marker
+                0xB8, 0xC0, 0x43, 0x01, 0x00,              // mov eax, 0x143C0 (nested registration)
+                0xFF, 0xD0,                                // call eax
+                0x8B, 0x45, 0xF0,                          // mov eax, [ebp-0x10] (previous head)
+                0x64, 0xA3, 0x00, 0x00, 0x00, 0x00,        // mov fs:[0], eax
+                0xB8, 0x08, 0x17, 0x01, 0x00,              // mov eax, 0x11708 (normal-return inspection)
+                0xFF, 0xD0,                                // call eax
+                0x8D, 0x65, 0x04,                          // lea esp, [ebp+4]
+                0x5D,                                      // pop ebp
+                0x89, 0x2D, 0x10, 0x04, 0x0B, 0x00,        // save restored EBP
+                0xC2, 0x04, 0x00,                          // ret 4
+            },
+            0x14300) &&
+        put3(
+            {
+                0x68, 0xEC, 0x43, 0x01, 0x00,              // push 0x143EC (handler)
+                0x64, 0xA1, 0x00, 0x00, 0x00, 0x00,        // mov eax, fs:[0]
+                0x50,                                      // push eax
+                0x8B, 0x44, 0x24, 0x10,                    // mov eax, [esp+0x10] (frame size)
+                0x89, 0x6C, 0x24, 0x10,                    // mov [esp+0x10], ebp
+                0x8D, 0x6C, 0x24, 0x10,                    // lea ebp, [esp+0x10]
+                0x29, 0xC4,                                // sub esp, eax
+                0x53,                                      // push ebx
+                0x56,                                      // push esi
+                0x57,                                      // push edi
+                0x8B, 0x45, 0xF8,                          // mov eax, [ebp-8]
+                0x89, 0x65, 0xE8,                          // mov [ebp-0x18], esp (saved ESP)
+                0x50,                                      // push eax
+                0x8B, 0x45, 0xFC,                          // mov eax, [ebp-4] (scope table)
+                0xC7, 0x45, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF,  // mov dword [ebp-4], -1
+                0x89, 0x45, 0xF8,                          // mov [ebp-8], eax
+                0x8D, 0x45, 0xF0,                          // lea eax, [ebp-0x10]
+                0x64, 0xA3, 0x00, 0x00, 0x00, 0x00,        // mov fs:[0], eax
+                0xC3,                                      // ret
+            },
+            0x14380) &&
+        put3(
+            {
+                0x68, 0xEC, 0x43, 0x01, 0x00,              // push 0x143EC (handler)
+                0x64, 0xA1, 0x00, 0x00, 0x00, 0x00,        // mov eax, fs:[0]
+                0x50,                                      // push eax
+                0x89, 0xE0,                                // mov eax, esp
+                0x64, 0xA3, 0x00, 0x00, 0x00, 0x00,        // mov fs:[0], eax
+                0xB8, 0x04, 0x17, 0x01, 0x00,              // mov eax, 0x11704 (nested inspection)
+                0xFF, 0xD0,                                // call eax
+                0x8B, 0x04, 0x24,                          // mov eax, [esp] (previous)
+                0x64, 0xA3, 0x00, 0x00, 0x00, 0x00,        // mov fs:[0], eax
+                0x83, 0xC4, 0x08,                          // add esp, 8
+                0xC3,                                      // ret
+            },
+            0x143C0) &&
+        put3({0x31, 0xC0, 0xC3}, 0x143EC);  // stored handler: xor eax, eax; ret
+    if (!code3_seh_prologue) return false;
     constexpr size_t header_size = 0x1000;
     std::vector<uint8_t> image(kRawCode3 + code3.size(), 0);
     std::copy_n("XBEH", 4, image.begin());

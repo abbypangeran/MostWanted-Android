@@ -281,6 +281,15 @@ target_compile_definitions(execution_probe_integrated_real_preflight PRIVATE
 target_link_libraries(execution_probe_integrated_real_preflight PRIVATE Threads::Threads Zydis)
 set_target_properties(execution_probe_integrated_real_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
+# Phase 2D-18: the static Gate B boundary preflight. It decodes the real image
+# and never links the generated authentic code, so it cannot execute it.
+add_executable(gate_b_preflight gate_b_preflight.cpp ${XBE_SDK}/runtime/kernel/crypto.cpp)
+target_compile_features(gate_b_preflight PRIVATE cxx_std_20)
+target_include_directories(gate_b_preflight PRIVATE ${XBE_SDK}/runtime ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(gate_b_preflight PRIVATE EXECUTION_PROBE_REAL_XBE="${EXECUTION_PROBE_REAL_XBE}")
+target_link_libraries(gate_b_preflight PRIVATE Zydis)
+set_target_properties(gate_b_preflight PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
 # Phase 2C-31: a separate synthetic fixture for the authentic secondary-thread
 # entry contract.  It deliberately does not share the root route's generated
 # mapping, so the Phase 2C-30 route stays byte-for-byte unchanged.
