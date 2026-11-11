@@ -1808,6 +1808,420 @@ void CheckStartupThreadLayout() {
 }
 #endif
 
+// Phase 2D-15: two managed synthetic workers in one process. The parent's
+// generated code creates the child through the test-gated ordinal-255 bridge,
+// closes the child handle, then waits; the child runs its own callback session
+// and terminates through ordinal 258.
+namespace {
+
+enum class TwoWorkerMode { kChildFirst, kParentFirst };
+
+std::mutex g_mw_lock;
+std::condition_variable g_mw_cv;
+kernel::ThreadRef g_mw_parent, g_mw_child;
+kernel::Thread* g_mw_parent_thread = nullptr;
+kernel::Thread* g_mw_child_thread = nullptr;
+bool g_mw_child_started = false;
+bool g_mw_child_exited = false;
+bool g_mw_parent_exited = false;
+std::atomic<bool> g_mw_reset_blocked{false};
+TwoWorkerMode g_mw_mode = TwoWorkerMode::kChildFirst;
+uint64_t g_mw_generation = 0;
+uint32_t g_mw_parent_admissions = 0, g_mw_child_admissions = 0;
+uint32_t g_mw_parent_own = 0, g_mw_child_own = 0;
+uint64_t g_mw_parent_identity = 0, g_mw_child_identity = 0;
+uint32_t g_mw_parent_kpcr = 0, g_mw_parent_ethread = 0, g_mw_parent_tls = 0, g_mw_parent_top = 0;
+uint32_t g_mw_child_kpcr = 0, g_mw_child_ethread = 0, g_mw_child_tls = 0, g_mw_child_top = 0;
+
+constexpr uint32_t kMwParentStart = 0x13094;
+constexpr uint32_t kMwParentEarly = 0x13137;
+constexpr uint32_t kMwChildStart = 0x13030;
+constexpr uint32_t kMwParentCallbackA = 0x13018;
+constexpr uint32_t kMwParentCallbackB = 0x13024;
+constexpr uint32_t kMwChildCallbackA = 0x13000;
+constexpr uint32_t kMwChildCallbackB = 0x1300C;
+constexpr uint32_t kMwParentCallA = 0x130C5;
+constexpr uint32_t kMwParentCallB = 0x1310E;
+constexpr uint32_t kMwParentEarlyCallA = 0x13152;
+constexpr uint32_t kMwChildCallA = 0x13061;
+constexpr uint32_t kMwChildCallB = 0x13067;
+constexpr uint32_t kMwParentExit = 0x50415245;
+constexpr uint32_t kMwChildExit = 0xC0DE1502;
+
+void MultiWorkerPreCallback() {
+    kernel::ThreadRef self = kernel::CurrentRef();
+    if (!self) return;
+    std::lock_guard lock(g_mw_lock);
+    if (g_mw_parent && self.get() == g_mw_parent.get()) {
+        g_mw_parent_thread = self.get();
+        g_mw_parent_kpcr = self->kpcr;
+        g_mw_parent_ethread = self->ethread;
+        g_mw_parent_tls = self->tls;
+        g_mw_parent_top = self->stack_top;
+    } else {
+        g_mw_child = self;
+        g_mw_child_thread = self.get();
+        g_mw_child_kpcr = self->kpcr;
+        g_mw_child_ethread = self->ethread;
+        g_mw_child_tls = self->tls;
+        g_mw_child_top = self->stack_top;
+        g_mw_child_started = true;
+        // the parent's callback still holds a dispatch lease: reset must wait
+        g_mw_reset_blocked = dispatch::ResetWouldBlockForTest();
+    }
+    g_mw_cv.notify_all();
+}
+
+void MultiWorkerAdmission() {
+    kernel::Thread* me = kernel::Current();
+    std::unique_lock lock(g_mw_lock);
+    if (me && me == g_mw_parent_thread) {
+        ++g_mw_parent_admissions;
+        g_mw_parent_own = kernel::SyntheticSessionAdmissionsForThread(me);
+        g_mw_parent_identity = kernel::SyntheticWorkerIdentityForTest().id;
+        if (g_mw_mode == TwoWorkerMode::kChildFirst && g_mw_parent_admissions == 2)
+            g_mw_cv.wait(lock, [] { return g_mw_child_exited; });
+        return;
+    }
+    if (me && me == g_mw_child_thread) {
+        ++g_mw_child_admissions;
+        g_mw_child_own = kernel::SyntheticSessionAdmissionsForThread(me);
+        g_mw_child_identity = kernel::SyntheticWorkerIdentityForTest().id;
+        if (g_mw_mode == TwoWorkerMode::kParentFirst && g_mw_child_admissions == 2)
+            g_mw_cv.wait(lock, [] { return g_mw_parent_exited; });
+    }
+}
+
+bool MultiWorkerChildPrepared(kernel::Thread* child) {
+    kernel::SyntheticSessionPolicy policy;
+    policy.image_identity = kernel::kSyntheticWorkerImageIdentity;
+    policy.code_base = X86CodeBase;
+    policy.code_end = X86CodeEnd;
+    policy.max_depth = 2;
+    policy.dispatch_generation = g_mw_generation;
+    policy.slot_count = 2;
+    policy.slots[0].entry = kernel::SyntheticCallbackEntry::kIndirectSlot;
+    policy.slots[0].slot_address = 0xB0068;
+    policy.slots[0].target = kMwChildCallbackA;
+    policy.slots[0].call_pc = kMwChildCallA;
+    policy.slots[1].entry = kernel::SyntheticCallbackEntry::kIndirectSlot;
+    policy.slots[1].slot_address = 0xB006C;
+    policy.slots[1].target = kMwChildCallbackB;
+    policy.slots[1].call_pc = kMwChildCallB;
+    return kernel::ArmSyntheticSessionForThread(child, policy);
+}
+
+void Kernel187FixtureHandler(X86Context& ctx, uint8_t*) {
+    kernel::Return(ctx, kernel::CloseHandle(kernel::R32(ctx.esp + 4)) ? kernel::kSuccess : kernel::kInvalidHandle, 1);
+}
+
+// Ordinal-255 bridge for the synthetic parent: the reviewed argument layout
+// (handle, extension tag, stack, TLS, id, start, context, flags, descriptor,
+// system routine) reaches the test-only child-creation gate.
+void Kernel255SyntheticChildHandler(X86Context& ctx, uint8_t*) {
+    std::array<uint32_t, 10> args{};
+    if (mem::Read(ctx.esp + 4, args.data(), sizeof(args)) != mem::AccessStatus::kOk) {
+        kernel::Return(ctx, kernel::kAccessViolation, 10);
+        return;
+    }
+    kernel::Return(ctx, kernel::CreateSyntheticChildThread(args[0], args[2] ? args[2] : 0x10000, args[3], args[4],
+                                                           args[5], args[6], args[7] & 0xFF, args[9], args[8]),
+                   10);
+}
+
+struct MultiWorkerResult {
+    bool ok = false;
+    kernel::ThreadState parent_state = kernel::ThreadState::kPrepared;
+    kernel::ThreadState child_state = kernel::ThreadState::kPrepared;
+    uint32_t parent_exit = 0, child_exit = 0;
+    uint32_t bridge_status = 1;
+    uint32_t p_ethread = 0, p_tls = 0, p_top = 0, p_prcb = 0, p_readback = 0;
+    uint32_t c_ethread = 0, c_tls = 0, c_top = 0, c_prcb = 0, c_readback = 0;
+    uint32_t p_cb_a = 0, p_cb_b = 0, c_cb_a = 0, c_cb_b = 0;
+    uint32_t c_post = 1, p_post = 0;
+    bool parent_resources_released = false, child_resources_released = false;
+};
+
+}  // namespace
+
+void CheckMultiWorkerSessions() {
+    constexpr uint32_t code_page = 0x11000, code2_page = 0x13000, data_page = 0xB0000;
+    constexpr uint32_t parent_handle_out = 0xB0080, parent_id_out = 0xB0084;
+    constexpr uint32_t child_handle_out = 0xB0040, child_id_out = 0xB0044;
+    constexpr uint32_t descriptor = 0xB0050, context = 0xB0100;
+
+    std::string error;
+    kernel::RegisterExport(187, "NtClose", Kernel187FixtureHandler);
+    kernel::RegisterExport(255, "PsCreateSystemThreadEx", Kernel255SyntheticChildHandler);
+    kernel::RegisterExport(258, "PsTerminateSystemThread", Kernel258FixtureHandler);
+    const bool ready = mem::Init() && mem::Commit(code_page, 2 * mem::kPage) && mem::Commit(code2_page, mem::kPage) &&
+                       mem::Commit(data_page, mem::kPage) &&
+                       mem::Protect(code_page, 2 * mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                       mem::Protect(code2_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                       dispatch::Init(error) && kernel::RestartKernelWorkers() &&
+                       dispatch::SetKernel255FixtureBridge(true) && dispatch::SetKernel187FixtureBridge(true) &&
+                       dispatch::SetKernel258FixtureBridge(true);
+    Check(ready, "multi-worker fixture memory, dispatch, bridges and workers initialize");
+    if (!ready) return;
+    const mem::Stats baseline = mem::Query();
+    auto generation = [] {
+        dispatch::CallLease lease;
+        return lease.Generation();
+    };
+    auto add_slot = [](kernel::SyntheticSessionPolicy& policy, uint32_t slot_address, uint32_t target,
+                       uint32_t call_pc) {
+        kernel::SyntheticCallbackSlotPolicy& slot = policy.slots[policy.slot_count++];
+        slot.entry = kernel::SyntheticCallbackEntry::kIndirectSlot;
+        slot.slot_address = slot_address;
+        slot.target = target;
+        slot.call_pc = call_pc;
+    };
+    auto word = [](uint32_t address) {
+        uint32_t value = 0;
+        mem::Read(address, &value, sizeof(value));
+        return value;
+    };
+    const uint32_t thunk255 = dispatch::KernelThunkAddress(255);
+    const uint32_t thunk258 = dispatch::KernelThunkAddress(258);
+    const uint32_t thunk187 = dispatch::KernelThunkAddress(187);
+    const std::array<uint32_t, 4> child_descriptor{kernel::kSyntheticChildDescriptorMagic, kMwChildExit, 0, 0};
+    const std::array<std::pair<uint32_t, uint32_t>, 7> slots{{
+        {0xB0060, kMwParentCallbackA},
+        {0xB0064, kMwParentCallbackB},
+        {0xB0068, kMwChildCallbackA},
+        {0xB006C, kMwChildCallbackB},
+        {0xB0070, thunk255},
+        {0xB0074, thunk258},
+        {0xB007C, thunk187},
+    }};
+    auto write_data = [&] {
+        bool ok = mem::Write(descriptor, child_descriptor.data(), sizeof(child_descriptor)) == mem::AccessStatus::kOk;
+        for (const auto& [address, value] : slots)
+            ok = ok && mem::Write(address, &value, sizeof(value)) == mem::AccessStatus::kOk;
+        uint32_t zero = 0;
+        for (uint32_t address = 0xB0000; address < 0xB0040; address += 4)
+            ok = ok && mem::Write(address, &zero, sizeof(zero)) == mem::AccessStatus::kOk;
+        return ok && mem::Write(0xB0078, &kMwParentExit, sizeof(kMwParentExit)) == mem::AccessStatus::kOk;
+    };
+    auto wait_thread = [](const kernel::ThreadRef& thread) {
+        return thread ? kernel::Wait({std::static_pointer_cast<kernel::Object>(thread)}, false, -100'000'000, false)
+                      : kernel::kTimeout;
+    };
+
+    auto run = [&](TwoWorkerMode mode) {
+        MultiWorkerResult result;
+        kernel::DisarmSyntheticWorker();
+        kernel::DisarmSyntheticSession();
+        if (!write_data()) return result;
+        const uint64_t dispatch_generation = generation();
+        {
+            std::lock_guard lock(g_mw_lock);
+            g_mw_parent.reset();
+            g_mw_child.reset();
+            g_mw_parent_thread = g_mw_child_thread = nullptr;
+            g_mw_child_started = g_mw_child_exited = g_mw_parent_exited = false;
+            g_mw_reset_blocked = false;
+            g_mw_mode = mode;
+            g_mw_generation = dispatch_generation;
+            g_mw_parent_admissions = g_mw_child_admissions = 0;
+            g_mw_parent_own = g_mw_child_own = 0;
+            g_mw_parent_identity = g_mw_child_identity = 0;
+            g_mw_parent_kpcr = g_mw_parent_ethread = g_mw_parent_tls = g_mw_parent_top = 0;
+            g_mw_child_kpcr = g_mw_child_ethread = g_mw_child_tls = g_mw_child_top = 0;
+        }
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(MultiWorkerPreCallback);
+        kernel::SetSyntheticSessionAdmissionHookForTest(MultiWorkerAdmission);
+        kernel::SetSyntheticChildPreparedHookForTest(MultiWorkerChildPrepared);
+
+        const uint32_t start = mode == TwoWorkerMode::kChildFirst ? kMwParentStart : kMwParentEarly;
+        kernel::ThreadRef parent;
+        const bool prepared = kernel::PrepareSystemThreadEx(parent_handle_out, 0x10000, 0x24, parent_id_out, start,
+                                                            context, false, 0, parent) == kernel::kSuccess &&
+                              bool(parent);
+        {
+            std::lock_guard lock(g_mw_lock);
+            g_mw_parent = parent;
+        }
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.context = context;
+        authorization.expected_exit = kMwParentExit;
+        authorization.code_base = X86CodeBase;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = dispatch_generation;
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        kernel::SyntheticSessionPolicy parent_policy;
+        parent_policy.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        parent_policy.code_base = X86CodeBase;
+        parent_policy.code_end = X86CodeEnd;
+        parent_policy.max_depth = 2;
+        parent_policy.dispatch_generation = dispatch_generation;
+        if (mode == TwoWorkerMode::kChildFirst) {
+            add_slot(parent_policy, 0xB0060, kMwParentCallbackA, kMwParentCallA);
+            add_slot(parent_policy, 0xB0064, kMwParentCallbackB, kMwParentCallB);
+        } else {
+            add_slot(parent_policy, 0xB0060, kMwParentCallbackA, kMwParentEarlyCallA);
+        }
+        const bool armed = prepared && kernel::ArmSyntheticWorkerForThread(parent.get(), authorization) &&
+                           kernel::ArmSyntheticSessionForThread(parent.get(), parent_policy);
+        const bool started = armed && kernel::StartThread(parent);
+        if (!started) {
+            kernel::CancelPreparedThread(parent);
+            return result;
+        }
+
+        kernel::ThreadRef child;
+        uint32_t parent_wait = kernel::kTimeout, child_wait = kernel::kTimeout;
+        if (mode == TwoWorkerMode::kChildFirst) {
+            {
+                std::unique_lock lock(g_mw_lock);
+                g_mw_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_mw_child_started; });
+                child = g_mw_child;
+            }
+            child_wait = wait_thread(child);
+            {
+                std::lock_guard lock(g_mw_lock);
+                g_mw_child_exited = true;
+            }
+            g_mw_cv.notify_all();
+            parent_wait = wait_thread(parent);
+        } else {
+            parent_wait = wait_thread(parent);
+            {
+                std::lock_guard lock(g_mw_lock);
+                g_mw_parent_exited = true;
+            }
+            g_mw_cv.notify_all();
+            {
+                std::unique_lock lock(g_mw_lock);
+                g_mw_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_mw_child_started; });
+                child = g_mw_child;
+            }
+            child_wait = wait_thread(child);
+        }
+        const bool joined = kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+
+        result.parent_state = parent->state.load();
+        result.child_state = child ? child->state.load() : kernel::ThreadState::kPrepared;
+        result.parent_exit = parent->exit_code.load();
+        result.child_exit = child ? child->exit_code.load() : 0;
+        result.parent_resources_released = parent->resources_released;
+        result.child_resources_released = child && child->resources_released;
+        result.bridge_status = word(0xB0030);
+        result.p_ethread = word(0xB0000);
+        result.p_tls = word(0xB0004);
+        result.p_top = word(0xB0008);
+        result.p_prcb = word(0xB000C);
+        result.c_ethread = word(0xB0010);
+        result.c_tls = word(0xB0014);
+        result.c_top = word(0xB0018);
+        result.c_prcb = word(0xB001C);
+        result.p_cb_a = word(0xB0020);
+        result.p_cb_b = word(0xB0024);
+        result.c_cb_a = word(0xB0028);
+        result.c_cb_b = word(0xB002C);
+        result.c_post = word(0xB0034);
+        result.p_post = word(0xB0038);
+        result.p_readback = word(0xB003C);
+        result.c_readback = word(0xB0048);
+
+        uint32_t parent_handle = 0;
+        mem::Read(parent_handle_out, &parent_handle, sizeof(parent_handle));
+        if (parent_handle) kernel::CloseHandle(parent_handle);
+        kernel::SetSyntheticWorkerPreCallbackHookForTest(nullptr);
+        kernel::SetSyntheticSessionAdmissionHookForTest(nullptr);
+        kernel::SetSyntheticChildPreparedHookForTest(nullptr);
+        kernel::DisarmSyntheticWorker();
+        result.ok = armed && started && parent_wait == kernel::kWait0 && child_wait == kernel::kWait0 && joined;
+        return result;
+    };
+
+    {
+        const MultiWorkerResult child_first = run(TwoWorkerMode::kChildFirst);
+        Check(child_first.ok && child_first.parent_state == kernel::ThreadState::kExited &&
+                  child_first.child_state == kernel::ThreadState::kExited &&
+                  child_first.parent_exit == kMwParentExit && child_first.child_exit == kMwChildExit &&
+                  child_first.parent_resources_released && child_first.child_resources_released &&
+                  child_first.bridge_status == 0 && g_mw_reset_blocked.load(),
+              "the parent creates a real child worker that exits through ordinal 258 while the parent stays alive and a dispatch reset waits");
+        Check(child_first.p_ethread == g_mw_parent_ethread && child_first.c_ethread == g_mw_child_ethread &&
+                  child_first.p_tls == g_mw_parent_tls && child_first.c_tls == g_mw_child_tls &&
+                  child_first.p_top == g_mw_parent_top && child_first.c_top == g_mw_child_top &&
+                  child_first.p_prcb == g_mw_parent_kpcr + 0x28 && child_first.c_prcb == g_mw_child_kpcr + 0x28,
+              "both guests read their own KPCR, KPRCB, ETHREAD, stack top and TlsData through FS");
+        Check(child_first.p_ethread != child_first.c_ethread && child_first.p_tls != child_first.c_tls &&
+                  child_first.p_top != child_first.c_top && child_first.p_prcb != child_first.c_prcb,
+              "the parent and child have disjoint thread blocks, stacks and TLS");
+        Check(child_first.p_readback == 0x50415245 && child_first.c_readback == 0x4C494843,
+              "each worker's TLS write survives the other worker's execution");
+        Check(child_first.p_cb_a == 1 && child_first.p_cb_b == 1 && child_first.c_cb_a == 1 &&
+                  child_first.c_cb_b == 1 && child_first.c_post == 0 && child_first.p_post == 0x4B4F,
+              "both persistent sessions admit exactly their own callbacks and the child never resumes after termination");
+        Check(g_mw_parent_admissions == 2 && g_mw_child_admissions == 2 && g_mw_parent_own == 1 &&
+                  g_mw_child_own == 1 && g_mw_parent_identity && g_mw_child_identity &&
+                  g_mw_parent_identity != g_mw_child_identity,
+              "each worker owns a distinct claim identity and its session counters stay independent");
+    }
+
+    {
+        const MultiWorkerResult parent_first = run(TwoWorkerMode::kParentFirst);
+        Check(parent_first.ok && parent_first.parent_state == kernel::ThreadState::kExited &&
+                  parent_first.child_state == kernel::ThreadState::kExited &&
+                  parent_first.parent_exit == kMwParentExit && parent_first.child_exit == kMwChildExit &&
+                  parent_first.parent_resources_released && parent_first.child_resources_released &&
+                  parent_first.p_cb_a == 1 && parent_first.p_cb_b == 0 && parent_first.c_cb_a == 1 &&
+                  parent_first.c_cb_b == 1 && parent_first.bridge_status == 0,
+              "a parent that terminates straight after creating the child neither kills nor corrupts it");
+    }
+
+    {
+        kernel::DisarmSyntheticWorker();
+        kernel::ThreadRef first, second;
+        const bool prepared = kernel::PrepareSystemThreadEx(child_handle_out, 0x10000, 0x24, child_id_out, kMwChildStart,
+                                                            context, false, 0, first) == kernel::kSuccess &&
+                              kernel::PrepareSystemThreadEx(0xB0088, 0x10000, 0x24, 0xB008C, kMwChildStart,
+                                                            context + 4, false, 0, second) == kernel::kSuccess;
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = kMwChildStart;
+        authorization.context = context;
+        authorization.expected_exit = kMwChildExit;
+        authorization.code_base = X86CodeBase;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = generation();
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        kernel::SyntheticWorkerHandle first_handle, second_handle;
+        const bool armed = prepared && kernel::ArmSyntheticWorkerForThread(first.get(), authorization, &first_handle) &&
+                           kernel::ArmSyntheticWorkerForThread(second.get(), authorization, &second_handle) &&
+                           first_handle.id != second_handle.id && kernel::SyntheticWorkerCountForTest() == 2;
+        kernel::SetSyntheticWorkerThreadIdentityForTest(first.get());
+        const auto first_claim = kernel::ClaimSyntheticWorker(kMwChildStart, context, authorization.dispatch_generation);
+        const auto duplicate = kernel::ClaimSyntheticWorker(kMwChildStart, context, authorization.dispatch_generation);
+        kernel::SetSyntheticWorkerThreadIdentityForTest(nullptr);
+        const bool revoked = armed && kernel::RevokeSyntheticWorker(second_handle) &&
+                             kernel::SyntheticWorkerCountForTest() == 1;
+        const bool second_started = revoked && kernel::StartThread(second);
+        const bool second_joined =
+            second_started && wait_thread(second) == kernel::kWait0 && kernel::StopKernelWorkers() &&
+            kernel::RestartKernelWorkers();
+        const bool rejected = second_joined && second->state.load() == kernel::ThreadState::kCancelled &&
+                              second->exit_code.load() == 0 && second->resources_released;
+        if (!second_started) kernel::CancelPreparedThread(second);
+        Check(armed && first_claim == kernel::SyntheticWorkerClaim::kClaimed && rejected &&
+                  duplicate != kernel::SyntheticWorkerClaim::kClaimed,
+              "a revoked child claim and a duplicate claim are both rejected before guest execution");
+        kernel::CancelPreparedThread(first);
+        kernel::DisarmSyntheticWorker();
+        const bool joined = kernel::StopKernelWorkers() && kernel::RestartKernelWorkers();
+        Check(joined && kernel::Threads().empty() && kernel::SyntheticWorkerCountForTest() == 0 &&
+                  mem::Query().system_used == baseline.system_used,
+              "the multi-worker fixture returns to its worker and allocation baseline");
+    }
+
+    Check(dispatch::SetKernel255FixtureBridge(false) && dispatch::SetKernel187FixtureBridge(false) &&
+              dispatch::SetKernel258FixtureBridge(false),
+          "multi-worker fixture bridges disable after quiescence");
+}
+
 void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t code_page = 0x11000;
     constexpr uint32_t target = code_page + 0x10;
@@ -4712,13 +5126,13 @@ void CheckIndirectCallTests() {
 
     reject_target(0, "null", "checked indirect CALL rejects null target before stack mutation");
     reject_target(0x11001, "unmapped", "checked indirect CALL rejects generated-code gap before stack mutation");
-    reject_target(0x13000, "unknown", "checked indirect CALL rejects unknown target before stack mutation");
+    reject_target(0x14000, "unknown", "checked indirect CALL rejects unknown target before stack mutation");
     reject_target(dispatch::KernelThunkAddress(255), "kernel", "checked indirect CALL rejects kernel export thunk");
     reject_target(dispatch::HostThunk(sub_000111B2), "host", "checked indirect CALL rejects registered host thunk");
 
     ctx = X86Context{};
     ctx.esp = top;
-    ctx.eax = 0x13000;
+    ctx.eax = 0x14000;
     SeedFlags(ctx);
     const X86Context before_register_reject = ctx;
     traps = 0;
@@ -6615,6 +7029,7 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
     CheckPersistentSyntheticCallbacks();
     CheckStartupThreadLayout();
+    CheckMultiWorkerSessions();
     CheckSyntheticWorkerLifecycle();
 #endif
     mem::Shutdown();

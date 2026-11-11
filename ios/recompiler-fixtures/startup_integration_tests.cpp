@@ -27,7 +27,7 @@ uint8_t* g_base = nullptr;
 namespace {
 
 constexpr uint32_t kImageBase = 0x10000;
-constexpr uint32_t kImageSize = 0x3000;
+constexpr uint32_t kImageSize = 0x4000;
 constexpr uint32_t kEntry = 0x11000;
 constexpr uint32_t kImport = 0x12000;
 constexpr uint32_t kDataBase = 0x30000;
@@ -71,22 +71,23 @@ bool ReadFile(const char* path, std::vector<uint8_t>& bytes) {
 
 bool AddOrdinal255Section(std::vector<uint8_t>& bytes) {
     constexpr uint32_t table = 0x180;
-    constexpr uint32_t data_record = table + 56;
-    constexpr uint32_t data_name = 0x248;
-    if (bytes.size() < 0x1000 || bytes.size() > 0x2000) return false;
+    constexpr uint32_t data_record = table + 2 * 56;  // .text and .text2 already exist
+    constexpr uint32_t data_name = 0x258;
+    constexpr uint32_t data_raw = 0x3000;             // after .text2's raw bytes
+    if (bytes.size() < 0x1000 || bytes.size() > 0x3000) return false;
     bytes.resize(kImageSize, 0);
     Put32(bytes, 0x10C, kImageSize);
-    Put32(bytes, 0x11C, 2);
+    Put32(bytes, 0x11C, 3);
     Put32(bytes, 0x158, (kImport ^ xbe::kRetailThunkKey));
     Put32(bytes, data_record + 0, xbe::kPreload);
     Put32(bytes, data_record + 4, kImport);
     Put32(bytes, data_record + 8, 0x1000);
-    Put32(bytes, data_record + 12, 0x2000);
+    Put32(bytes, data_record + 12, data_raw);
     Put32(bytes, data_record + 16, 0x1000);
     Put32(bytes, data_record + 20, kImageBase + data_name);
     std::memcpy(bytes.data() + data_name, ".data", 6);
-    Put32(bytes, 0x2000, 0x800000FF);
-    Put32(bytes, 0x2004, 0);
+    Put32(bytes, data_raw, 0x800000FF);
+    Put32(bytes, data_raw + 4, 0);
     return true;
 }
 

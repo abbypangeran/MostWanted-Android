@@ -35,31 +35,151 @@ std::mutex g_threads_lock;
 std::vector<ThreadRef> g_threads;
 std::atomic<uint32_t> g_next_id{0x10};
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+// One claim per managed worker. A slot is either armed (authorization loaded,
+// optionally bound to a prepared Thread) or claimed by the thread that started
+// on it. id, owner, owner_thread_id and memory_generation together make the
+// identity: a recycled Thread address or guest allocation cannot reuse a claim.
+struct SyntheticWorkerSlot {
+    bool armed = false;
+    bool claimed = false;
+    bool callback_entered = false;
+    uint64_t id = 0;
+    Thread* owner = nullptr;
+    uint32_t owner_thread_id = 0;
+    // host threads have no guest Thread; the claim is then bound to the host
+    // thread that made it, so another host thread cannot use it
+    std::thread::id claim_thread{};
+    uint64_t memory_generation = 0;
+    SyntheticWorkerAuthorization authorization;
+
+    bool session_armed = false;
+    SyntheticSessionPolicy session;
+    uint64_t session_memory_generation = 0;
+    uint32_t session_depth = 0;
+    uint32_t session_admissions = 0;
+    uint32_t session_max_depth = 0;
+};
+
 std::mutex g_synthetic_worker_lock;
-SyntheticWorkerAuthorization g_synthetic_worker_auth;
-bool g_synthetic_worker_armed = false;
-bool g_synthetic_worker_claimed = false;
-bool g_synthetic_worker_callback_entered = false;
-Thread* g_synthetic_worker_owner = nullptr;
+std::array<SyntheticWorkerSlot, kMaximumSyntheticWorkers> g_synthetic_workers;
+uint64_t g_next_synthetic_worker_id = 1;
 SyntheticWorkerPreCallbackHook g_synthetic_worker_hook = nullptr;
+SyntheticContinuationAdmissionHook g_synthetic_continuation_hook = nullptr;
+SyntheticSessionAdmissionHook g_synthetic_session_hook = nullptr;
+SyntheticChildPreparedHook g_synthetic_child_hook = nullptr;
 std::atomic<SyntheticContinuationStatus> g_synthetic_continuation_status{
     SyntheticContinuationStatus::kNotAuthorized};
 SyntheticContinuationFault g_synthetic_continuation_fault = SyntheticContinuationFault::kNone;
-SyntheticContinuationAdmissionHook g_synthetic_continuation_hook = nullptr;
-SyntheticSessionPolicy g_synthetic_session_policy;
-bool g_synthetic_session_armed = false;
-uint64_t g_synthetic_session_memory_generation = 0;
-uint32_t g_synthetic_session_depth = 0;
-uint32_t g_synthetic_session_admissions = 0;
-uint32_t g_synthetic_session_max_depth = 0;
-SyntheticSessionAdmissionHook g_synthetic_session_hook = nullptr;
+// Completed sessions are reported to the host after their slot is gone, which is
+// how every single-worker test reads admissions and nesting.
+uint32_t g_last_session_admissions = 0;
+uint32_t g_last_session_max_depth = 0;
 
-void ClearSyntheticSessionLocked() {
-    g_synthetic_session_armed = false;
-    g_synthetic_session_policy = {};
-    g_synthetic_session_memory_generation = 0;
-    g_synthetic_session_depth = 0;
-    g_synthetic_session_hook = nullptr;
+void RetireSessionLocked(SyntheticWorkerSlot& slot) {
+    if (!slot.session_armed) return;
+    g_last_session_admissions = slot.session_admissions;
+    g_last_session_max_depth = slot.session_max_depth;
+    slot.session_armed = false;
+    slot.session = {};
+    slot.session_memory_generation = 0;
+    slot.session_depth = 0;
+    slot.session_admissions = 0;
+    slot.session_max_depth = 0;
+}
+
+void ReleaseSlotLocked(SyntheticWorkerSlot& slot) {
+    RetireSessionLocked(slot);
+    slot = SyntheticWorkerSlot{};
+}
+
+SyntheticWorkerSlot* SlotForOwnerLocked(Thread* owner) {
+    if (!owner) return nullptr;
+    for (auto& slot : g_synthetic_workers)
+        if ((slot.armed || slot.claimed) && slot.owner == owner) return &slot;
+    return nullptr;
+}
+
+SyntheticWorkerSlot* ClaimedSlotLocked(Thread* owner) {
+    if (owner) {
+        for (auto& slot : g_synthetic_workers)
+            if (slot.claimed && slot.owner == owner) return &slot;
+        return nullptr;
+    }
+    const std::thread::id self = std::this_thread::get_id();
+    for (auto& slot : g_synthetic_workers)
+        if (slot.claimed && !slot.owner && slot.claim_thread == self) return &slot;
+    return nullptr;
+}
+
+SyntheticWorkerSlot* FreeSlotLocked() {
+    for (auto& slot : g_synthetic_workers)
+        if (!slot.armed && !slot.claimed) return &slot;
+    return nullptr;
+}
+
+uint32_t LiveSessionSlotsLocked() {
+    uint32_t count = 0;
+    for (auto& slot : g_synthetic_workers)
+        if (slot.session_armed) ++count;
+    return count;
+}
+
+SyntheticWorkerSlot* OnlyLiveSlotLocked() {
+    SyntheticWorkerSlot* only = nullptr;
+    uint32_t count = 0;
+    for (auto& slot : g_synthetic_workers) {
+        if (!slot.armed && !slot.claimed) continue;
+        only = &slot;
+        ++count;
+    }
+    return count == 1 ? only : nullptr;
+}
+
+bool ValidAuthorization(const SyntheticWorkerAuthorization& authorization) {
+    return authorization.image_identity == kSyntheticWorkerImageIdentity && authorization.target &&
+           authorization.code_base && authorization.code_end > authorization.code_base &&
+           authorization.target >= authorization.code_base && authorization.target < authorization.code_end &&
+           (!authorization.continuation_target ||
+            (authorization.continuation_target >= authorization.code_base &&
+             authorization.continuation_target < authorization.code_end)) &&
+           authorization.dispatch_generation &&
+           (!authorization.callback_ticket.target ||
+            (authorization.callback_ticket.callback_class == GuestCallbackClass::kThreadStart &&
+             authorization.callback_ticket.dispatch_generation == authorization.dispatch_generation &&
+             authorization.callback_ticket.target >= authorization.code_base &&
+             authorization.callback_ticket.target < authorization.code_end));
+}
+
+bool ValidSessionPolicy(const SyntheticSessionPolicy& policy) {
+    if (policy.image_identity != kSyntheticWorkerImageIdentity || !policy.code_base ||
+        policy.code_end <= policy.code_base || !policy.dispatch_generation || !policy.max_depth ||
+        policy.max_depth > kMaximumSyntheticSessionDepth || !policy.slot_count ||
+        policy.slot_count > kMaximumSyntheticSessionSlots)
+        return false;
+    for (uint32_t i = 0; i < policy.slot_count; ++i) {
+        const SyntheticCallbackSlotPolicy& slot = policy.slots[i];
+        if (!slot.target || slot.target < policy.code_base || slot.target >= policy.code_end || !slot.call_pc ||
+            slot.call_pc < policy.code_base || slot.call_pc >= policy.code_end || slot.argument_count > 4)
+            return false;
+        if (slot.entry == SyntheticCallbackEntry::kIndirectSlot) {
+            if (!slot.slot_address) return false;
+        } else if (slot.slot_address) {
+            return false;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            const SyntheticCallbackSlotPolicy& other = policy.slots[j];
+            if (other.call_pc == slot.call_pc && other.target == slot.target) return false;
+        }
+    }
+    return true;
+}
+
+// Disarms a worker whose slot is abandoned with its Thread (cancellation, failed
+// start, memory shutdown), so an armed authorization never outlives its thread.
+void ReleaseSyntheticWorkerForThread(Thread* thread) {
+    if (!thread) return;
+    std::lock_guard lock(g_synthetic_worker_lock);
+    if (SyntheticWorkerSlot* slot = SlotForOwnerLocked(thread)) ReleaseSlotLocked(*slot);
 }
 #endif
 #ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
@@ -75,6 +195,9 @@ bool FailAt(ThreadPreparationFailPoint point) {
 // guest structures per thread
 
 bool FinalizeThreadResources(const ThreadRef& thread, bool memory_shutdown);
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+void ReleaseSyntheticWorkerForThread(Thread* thread);
+#endif
 
 bool TrackThreadOwner(const ThreadRef& thread) {
     if (!thread || thread->memory_owner) return bool(thread);
@@ -383,6 +506,9 @@ bool FinalizeThreadResources(const ThreadRef& thread, bool memory_shutdown) {
     thread->resources_released = true;
     mem::UnregisterGuestThreadOwner(thread->memory_owner);
     thread->memory_owner = 0;
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    ReleaseSyntheticWorkerForThread(thread.get());
+#endif
     return true;
 }
 
@@ -390,69 +516,144 @@ bool FinalizeThreadResources(const ThreadRef& thread, bool memory_shutdown) {
 
 #ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
 bool ArmSyntheticWorker(const SyntheticWorkerAuthorization& authorization) {
-    if (authorization.image_identity != kSyntheticWorkerImageIdentity || !authorization.target ||
-        !authorization.code_base || authorization.code_end <= authorization.code_base ||
-        authorization.target < authorization.code_base || authorization.target >= authorization.code_end ||
-        (authorization.continuation_target &&
-         (authorization.continuation_target < authorization.code_base ||
-          authorization.continuation_target >= authorization.code_end)) ||
-        !authorization.dispatch_generation ||
-        (authorization.callback_ticket.target &&
-         (authorization.callback_ticket.callback_class != GuestCallbackClass::kThreadStart ||
-          authorization.callback_ticket.dispatch_generation != authorization.dispatch_generation ||
-          authorization.callback_ticket.target < authorization.code_base ||
-          authorization.callback_ticket.target >= authorization.code_end)))
-        return false;
+    return ArmSyntheticWorkerForThread(nullptr, authorization, nullptr);
+}
+
+bool ArmSyntheticWorkerForThread(Thread* thread, const SyntheticWorkerAuthorization& authorization,
+                                 SyntheticWorkerHandle* handle) {
+    if (handle) handle->id = 0;
+    if (!ValidAuthorization(authorization) || !mem::IsInitialized() || !mem::Generation()) return false;
+    if (thread && (!thread->memory_generation || thread->memory_generation != mem::Generation())) return false;
     std::lock_guard lock(g_synthetic_worker_lock);
-    if (g_synthetic_worker_armed || g_synthetic_worker_claimed) return false;
-    g_synthetic_worker_auth = authorization;
-    g_synthetic_worker_armed = true;
+    SyntheticWorkerSlot* slot = FreeSlotLocked();
+    if (!slot) return false;
+    const uint64_t generation = mem::Generation();
+    slot->armed = true;
+    slot->claimed = false;
+    slot->callback_entered = false;
+    slot->id = g_next_synthetic_worker_id++;
+    slot->owner = thread;
+    slot->owner_thread_id = thread ? thread->id : 0;
+    slot->memory_generation = generation;
+    slot->authorization = authorization;
+    if (thread) thread->synthetic_bound = true;
+    if (handle) handle->id = slot->id;
     g_synthetic_continuation_status = SyntheticContinuationStatus::kNotAuthorized;
-    g_synthetic_continuation_fault = SyntheticContinuationFault::kNone;
     return true;
+}
+
+bool RevokeSyntheticWorker(const SyntheticWorkerHandle& handle) {
+    if (!handle.id) return false;
+    std::lock_guard lock(g_synthetic_worker_lock);
+    for (auto& slot : g_synthetic_workers) {
+        if (slot.id != handle.id) continue;
+        if (slot.claimed) {
+            // the owner keeps running so it can unwind; its authority is gone
+            RetireSessionLocked(slot);
+            slot.armed = false;
+            slot.authorization = {};
+            return true;
+        }
+        ReleaseSlotLocked(slot);
+        return true;
+    }
+    return false;
+}
+
+SyntheticWorkerHandle SyntheticWorkerIdentityForTest() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+    return SyntheticWorkerHandle{slot ? slot->id : 0};
+}
+
+uint32_t SyntheticWorkerCountForTest() {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    uint32_t count = 0;
+    for (auto& slot : g_synthetic_workers)
+        if (slot.armed || slot.claimed) ++count;
+    return count;
 }
 
 void DisarmSyntheticWorker() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    g_synthetic_worker_armed = false;
-    g_synthetic_worker_claimed = false;
-    g_synthetic_worker_callback_entered = false;
-    g_synthetic_worker_owner = nullptr;
-    g_synthetic_worker_auth = {};
-    g_synthetic_continuation_fault = SyntheticContinuationFault::kNone;
-    ClearSyntheticSessionLocked();
+    if (SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current())) {
+        ReleaseSlotLocked(*slot);
+        return;
+    }
+    if (SyntheticWorkerSlot* slot = SlotForOwnerLocked(Current())) {
+        ReleaseSlotLocked(*slot);
+        return;
+    }
+    for (auto& slot : g_synthetic_workers)
+        if (!slot.claimed) ReleaseSlotLocked(slot);
 }
 
 bool SyntheticWorkerArmed() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_worker_armed;
+    for (auto& slot : g_synthetic_workers)
+        if (slot.armed || slot.claimed) return true;
+    return false;
 }
 
+namespace {
+
+bool SlotMatchesLocked(const SyntheticWorkerSlot& slot, uint32_t target, uint32_t context, uint64_t generation) {
+    return target == slot.authorization.target && context == slot.authorization.context &&
+           generation == slot.authorization.dispatch_generation && target >= slot.authorization.code_base &&
+           target < slot.authorization.code_end && mem::Generation() == slot.memory_generation;
+}
+
+}  // namespace
+
 SyntheticWorkerClaim ClaimSyntheticWorker(uint32_t target, uint32_t context, uint64_t dispatch_generation) {
+    Thread* me = Current();
     std::lock_guard lock(g_synthetic_worker_lock);
-    if (!g_synthetic_worker_armed) return SyntheticWorkerClaim::kNotAuthorized;
-    if (g_synthetic_worker_claimed) return SyntheticWorkerClaim::kRejected;
-    if (target != g_synthetic_worker_auth.target || context != g_synthetic_worker_auth.context ||
-        dispatch_generation != g_synthetic_worker_auth.dispatch_generation ||
-        target < g_synthetic_worker_auth.code_base || target >= g_synthetic_worker_auth.code_end)
-        return SyntheticWorkerClaim::kRejected;
-    g_synthetic_worker_claimed = true;
-    g_synthetic_worker_callback_entered = false;
-    g_synthetic_worker_owner = Current();
+    bool any_armed = false;
+    bool bound_to_me = false;
+    SyntheticWorkerSlot* bound = nullptr;
+    for (auto& slot : g_synthetic_workers) {
+        if (slot.armed && !slot.claimed) any_armed = true;
+        if (me && slot.owner == me && (slot.armed || slot.claimed)) bound_to_me = true;
+        if (!slot.armed || slot.claimed || slot.owner != me) continue;
+        if (slot.owner_thread_id != (me ? me->id : 0)) continue;
+        if (!SlotMatchesLocked(slot, target, context, dispatch_generation)) continue;
+        bound = &slot;
+        break;
+    }
+    SyntheticWorkerSlot* chosen = bound;
+    if (!chosen) {
+        for (auto& slot : g_synthetic_workers) {
+            if (!slot.armed || slot.claimed || slot.owner) continue;
+            if (!SlotMatchesLocked(slot, target, context, dispatch_generation)) continue;
+            chosen = &slot;
+            break;
+        }
+    }
+    if (!chosen) return (bound_to_me || any_armed) ? SyntheticWorkerClaim::kRejected
+                                                   : SyntheticWorkerClaim::kNotAuthorized;
+    chosen->claimed = true;
+    chosen->callback_entered = false;
+    chosen->owner = me;
+    chosen->owner_thread_id = me ? me->id : 0;
+    chosen->claim_thread = std::this_thread::get_id();
+    chosen->memory_generation = mem::Generation();
     return SyntheticWorkerClaim::kClaimed;
 }
 
 bool SyntheticWorkerClaimHeld() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_worker_claimed && g_synthetic_worker_owner == Current();
+    SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+    return slot && mem::Generation() == slot->memory_generation;
 }
 
 bool SyntheticWorkerContinuationAuthorized(uint32_t target, uint64_t dispatch_generation) {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_worker_claimed && g_synthetic_worker_owner == Current() &&
-           g_synthetic_worker_auth.continuation_target && target == g_synthetic_worker_auth.continuation_target &&
-           dispatch_generation == g_synthetic_worker_auth.dispatch_generation &&
-           target >= g_synthetic_worker_auth.code_base && target < g_synthetic_worker_auth.code_end;
+    SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+    if (!slot || !slot->armed || mem::Generation() != slot->memory_generation) return false;
+    const SyntheticWorkerAuthorization& authorization = slot->authorization;
+    return authorization.continuation_target && target == authorization.continuation_target &&
+           dispatch_generation == authorization.dispatch_generation && target >= authorization.code_base &&
+           target < authorization.code_end;
 }
 
 SyntheticContinuationStatus LastSyntheticContinuationStatusForTest() {
@@ -485,35 +686,34 @@ void CallSyntheticContinuationAdmissionHookForTest() {
 
 bool SyntheticWorkerHasNestedCallback() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_worker_armed && g_synthetic_worker_auth.callback_ticket.target;
+    SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+    return slot && slot->armed && slot->authorization.callback_ticket.target;
 }
 
 bool SyntheticWorkerAuthorizesNestedCallback(uint32_t target, uint64_t dispatch_generation) {
     std::lock_guard lock(g_synthetic_worker_lock);
-    const GuestCallbackTicket& ticket = g_synthetic_worker_auth.callback_ticket;
-    if (!g_synthetic_worker_claimed || g_synthetic_worker_owner != Current() || g_synthetic_worker_callback_entered ||
-        ticket.target != target || ticket.callback_class != GuestCallbackClass::kThreadStart ||
+    SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+    if (!slot || !slot->armed || slot->callback_entered || mem::Generation() != slot->memory_generation) return false;
+    const SyntheticWorkerAuthorization& authorization = slot->authorization;
+    const GuestCallbackTicket& ticket = authorization.callback_ticket;
+    if (ticket.target != target || ticket.callback_class != GuestCallbackClass::kThreadStart ||
         ticket.dispatch_generation != dispatch_generation ||
-        dispatch_generation != g_synthetic_worker_auth.dispatch_generation || target < g_synthetic_worker_auth.code_base ||
-        target >= g_synthetic_worker_auth.code_end)
+        dispatch_generation != authorization.dispatch_generation || target < authorization.code_base ||
+        target >= authorization.code_end)
         return false;
-    g_synthetic_worker_callback_entered = true;
+    slot->callback_entered = true;
     return true;
 }
 
 void FinishSyntheticWorker() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    g_synthetic_worker_claimed = false;
-    g_synthetic_worker_callback_entered = false;
-    g_synthetic_worker_owner = nullptr;
-    g_synthetic_worker_armed = false;
-    g_synthetic_worker_auth = {};
-    ClearSyntheticSessionLocked();
+    if (SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current())) ReleaseSlotLocked(*slot);
 }
 
 bool SyntheticWorkerExitMatches(uint32_t code) {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_worker_claimed && code == g_synthetic_worker_auth.expected_exit;
+    SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+    return slot && slot->armed && code == slot->authorization.expected_exit;
 }
 
 const char* SyntheticCallbackAdmissionName(SyntheticCallbackAdmission admission) {
@@ -533,85 +733,71 @@ const char* SyntheticCallbackAdmissionName(SyntheticCallbackAdmission admission)
     return "unknown admission status";
 }
 
-bool ArmSyntheticSession(const SyntheticSessionPolicy& policy) {
-    if (policy.image_identity != kSyntheticWorkerImageIdentity || !policy.code_base ||
-        policy.code_end <= policy.code_base || !policy.dispatch_generation || !policy.max_depth ||
-        policy.max_depth > kMaximumSyntheticSessionDepth || !policy.slot_count ||
-        policy.slot_count > kMaximumSyntheticSessionSlots) {
-        LOGE("session: basic policy rejected");
+namespace {
+
+SyntheticWorkerSlot* SessionSlotLocked() {
+    SyntheticWorkerSlot* slot = SlotForOwnerLocked(Current());
+    if (slot) return slot;
+    return OnlyLiveSlotLocked();
+}
+
+bool ArmSessionLocked(SyntheticWorkerSlot& slot, const SyntheticSessionPolicy& policy) {
+    if (slot.session_armed) return false;
+    if (policy.dispatch_generation != slot.authorization.dispatch_generation ||
+        policy.code_base != slot.authorization.code_base || policy.code_end != slot.authorization.code_end)
         return false;
-    }
     for (uint32_t i = 0; i < policy.slot_count; ++i) {
-        const SyntheticCallbackSlotPolicy& slot = policy.slots[i];
-        if (!slot.target || slot.target < policy.code_base || slot.target >= policy.code_end || !slot.call_pc ||
-            slot.call_pc < policy.code_base || slot.call_pc >= policy.code_end || slot.argument_count > 4) {
-            LOGE("session: slot %u range rejected", i);
-            return false;
-        }
-        if (slot.entry == SyntheticCallbackEntry::kIndirectSlot) {
-            if (!slot.slot_address) {
-                LOGE("session: slot %u indirect address rejected", i);
-                return false;
-            }
-        } else if (slot.slot_address) {
-            LOGE("session: slot %u address rejected", i);
-            return false;
-        }
-        for (uint32_t j = 0; j < i; ++j) {
-            const SyntheticCallbackSlotPolicy& other = policy.slots[j];
-            if (other.call_pc == slot.call_pc && other.target == slot.target) {
-                LOGE("session: slot %u duplicate", i);
-                return false;
-            }
-        }
-    }
-    if (!mem::IsInitialized() || !mem::Generation()) {
-        LOGE("session: memory not initialized");
-        return false;
-    }
-    std::lock_guard lock(g_synthetic_worker_lock);
-    if (g_synthetic_session_armed) {
-        LOGE("session: already armed");
-        return false;
-    }
-    if (!g_synthetic_worker_armed && !g_synthetic_worker_claimed) {
-        LOGE("session: no worker authorization");
-        return false;
-    }
-    if (policy.dispatch_generation != g_synthetic_worker_auth.dispatch_generation ||
-        policy.code_base != g_synthetic_worker_auth.code_base || policy.code_end != g_synthetic_worker_auth.code_end) {
-        LOGE("session: worker authorization mismatch %llX/%llX %X/%X %X/%X",
-             (unsigned long long)policy.dispatch_generation, (unsigned long long)g_synthetic_worker_auth.dispatch_generation,
-             policy.code_base, g_synthetic_worker_auth.code_base, policy.code_end, g_synthetic_worker_auth.code_end);
-        return false;
-    }
-    for (uint32_t i = 0; i < policy.slot_count; ++i) {
-        const SyntheticCallbackSlotPolicy& slot = policy.slots[i];
-        if (slot.entry != SyntheticCallbackEntry::kIndirectSlot) continue;
+        const SyntheticCallbackSlotPolicy& entry = policy.slots[i];
+        if (entry.entry != SyntheticCallbackEntry::kIndirectSlot) continue;
         uint32_t value = 0;
-        if (mem::Read(slot.slot_address, &value, sizeof(value)) != mem::AccessStatus::kOk || value != slot.target) {
-            LOGE("session: slot %u contents %08X expected %08X", i, value, slot.target);
+        if (mem::Read(entry.slot_address, &value, sizeof(value)) != mem::AccessStatus::kOk || value != entry.target)
             return false;
-        }
     }
-    g_synthetic_session_policy = policy;
-    g_synthetic_session_memory_generation = mem::Generation();
-    g_synthetic_session_depth = 0;
-    g_synthetic_session_admissions = 0;
-    g_synthetic_session_max_depth = 0;
-    g_synthetic_session_hook = nullptr;
-    g_synthetic_session_armed = true;
+    slot.session = policy;
+    slot.session_memory_generation = mem::Generation();
+    slot.session_depth = 0;
+    slot.session_admissions = 0;
+    slot.session_max_depth = 0;
+    slot.session_armed = true;
     return true;
+}
+
+}  // namespace
+
+bool ArmSyntheticSession(const SyntheticSessionPolicy& policy) {
+    if (!ValidSessionPolicy(policy) || !mem::IsInitialized() || !mem::Generation()) return false;
+    std::lock_guard lock(g_synthetic_worker_lock);
+    SyntheticWorkerSlot* slot = SessionSlotLocked();
+    if (!slot || !slot->armed) return false;
+    return ArmSessionLocked(*slot, policy);
+}
+
+bool ArmSyntheticSessionForThread(Thread* thread, const SyntheticSessionPolicy& policy) {
+    if (!thread || !ValidSessionPolicy(policy) || !mem::IsInitialized() || !mem::Generation()) return false;
+    std::lock_guard lock(g_synthetic_worker_lock);
+    SyntheticWorkerSlot* slot = SlotForOwnerLocked(thread);
+    if (!slot || !slot->armed) return false;
+    return ArmSessionLocked(*slot, policy);
 }
 
 void DisarmSyntheticSession() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    ClearSyntheticSessionLocked();
+    SyntheticWorkerSlot* slot = nullptr;
+    if (LiveSessionSlotsLocked() == 1) {
+        for (auto& candidate : g_synthetic_workers)
+            if (candidate.session_armed) {
+                slot = &candidate;
+                break;
+            }
+    }
+    if (!slot) slot = ClaimedSlotLocked(Current());
+    if (slot) RetireSessionLocked(*slot);
 }
 
 bool SyntheticSessionArmed() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_session_armed;
+    SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+    return slot && slot->session_armed;
 }
 
 SyntheticCallbackAdmission AdmitSyntheticCallback(SyntheticCallbackEntry entry_kind, uint32_t slot_address,
@@ -622,19 +808,19 @@ SyntheticCallbackAdmission AdmitSyntheticCallback(SyntheticCallbackEntry entry_k
     SyntheticSessionAdmissionHook hook = nullptr;
     {
         std::lock_guard lock(g_synthetic_worker_lock);
-        if (!g_synthetic_session_armed) return SyntheticCallbackAdmission::kNoSession;
-        if (!g_synthetic_worker_claimed || g_synthetic_worker_owner != Current())
-            return SyntheticCallbackAdmission::kInvalidOwner;
-        if (dispatch_generation != g_synthetic_session_policy.dispatch_generation)
+        SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+        if (!slot) return LiveSessionSlotsLocked() ? SyntheticCallbackAdmission::kInvalidOwner
+                                                   : SyntheticCallbackAdmission::kNoSession;
+        if (!slot->armed) return SyntheticCallbackAdmission::kInvalidOwner;
+        if (!slot->session_armed) return SyntheticCallbackAdmission::kNoSession;
+        if (dispatch_generation != slot->session.dispatch_generation)
             return SyntheticCallbackAdmission::kStaleDispatch;
-        if (mem::Generation() != g_synthetic_session_memory_generation)
-            return SyntheticCallbackAdmission::kStaleMemory;
-        if (g_synthetic_session_depth >= g_synthetic_session_policy.max_depth)
-            return SyntheticCallbackAdmission::kDepthExceeded;
+        if (mem::Generation() != slot->session_memory_generation) return SyntheticCallbackAdmission::kStaleMemory;
+        if (slot->session_depth >= slot->session.max_depth) return SyntheticCallbackAdmission::kDepthExceeded;
         bool found = false;
         bool abi_mismatch = false;
-        for (uint32_t i = 0; i < g_synthetic_session_policy.slot_count; ++i) {
-            const SyntheticCallbackSlotPolicy& candidate = g_synthetic_session_policy.slots[i];
+        for (uint32_t i = 0; i < slot->session.slot_count; ++i) {
+            const SyntheticCallbackSlotPolicy& candidate = slot->session.slots[i];
             if (candidate.entry != entry_kind || candidate.target != target) continue;
             if (entry_kind == SyntheticCallbackEntry::kIndirectSlot && candidate.slot_address != slot_address) continue;
             if (candidate.call_pc != call_pc) {
@@ -660,24 +846,21 @@ SyntheticCallbackAdmission AdmitSyntheticCallback(SyntheticCallbackEntry entry_k
     if (hook) hook();
     {
         std::lock_guard lock(g_synthetic_worker_lock);
-        if (!g_synthetic_session_armed) return SyntheticCallbackAdmission::kNoSession;
-        if (!g_synthetic_worker_claimed || g_synthetic_worker_owner != Current())
-            return SyntheticCallbackAdmission::kInvalidOwner;
-        if (dispatch_generation != g_synthetic_session_policy.dispatch_generation)
+        SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+        if (!slot || !slot->armed) return SyntheticCallbackAdmission::kInvalidOwner;
+        if (!slot->session_armed) return SyntheticCallbackAdmission::kNoSession;
+        if (dispatch_generation != slot->session.dispatch_generation)
             return SyntheticCallbackAdmission::kStaleDispatch;
-        if (mem::Generation() != g_synthetic_session_memory_generation)
-            return SyntheticCallbackAdmission::kStaleMemory;
-        if (g_synthetic_session_depth >= g_synthetic_session_policy.max_depth)
-            return SyntheticCallbackAdmission::kDepthExceeded;
+        if (mem::Generation() != slot->session_memory_generation) return SyntheticCallbackAdmission::kStaleMemory;
+        if (slot->session_depth >= slot->session.max_depth) return SyntheticCallbackAdmission::kDepthExceeded;
         if (entry.entry == SyntheticCallbackEntry::kIndirectSlot) {
             uint32_t value = 0;
             if (mem::Read(entry.slot_address, &value, sizeof(value)) != mem::AccessStatus::kOk || value != target)
                 return SyntheticCallbackAdmission::kSlotChanged;
         }
-        ++g_synthetic_session_depth;
-        ++g_synthetic_session_admissions;
-        if (g_synthetic_session_depth > g_synthetic_session_max_depth)
-            g_synthetic_session_max_depth = g_synthetic_session_depth;
+        ++slot->session_depth;
+        ++slot->session_admissions;
+        if (slot->session_depth > slot->session_max_depth) slot->session_max_depth = slot->session_depth;
         if (expected_esp)
             *expected_esp = esp + (entry.callee_cleanup ? entry.argument_count * sizeof(uint32_t) : 0);
     }
@@ -686,22 +869,61 @@ SyntheticCallbackAdmission AdmitSyntheticCallback(SyntheticCallbackEntry entry_k
 
 void ReleaseSyntheticCallbackAdmission() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    if (g_synthetic_session_depth) --g_synthetic_session_depth;
+    SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+    if (slot && slot->session_depth) --slot->session_depth;
 }
 
 uint32_t SyntheticSessionDepthForTest() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_session_depth;
+    if (SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current())) return slot->session_depth;
+    uint32_t depth = 0;
+    for (auto& slot : g_synthetic_workers)
+        if (slot.session_armed) depth = std::max(depth, slot.session_depth);
+    return depth;
 }
 
 uint32_t SyntheticSessionAdmissionsForTest() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_session_admissions;
+    if (SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current())) return slot->session_admissions;
+    uint32_t value = 0;
+    bool any = false;
+    for (auto& slot : g_synthetic_workers)
+        if (slot.session_armed) {
+            any = true;
+            value = std::max(value, slot.session_admissions);
+        }
+    return any ? value : g_last_session_admissions;
 }
 
 uint32_t SyntheticSessionMaxDepthForTest() {
     std::lock_guard lock(g_synthetic_worker_lock);
-    return g_synthetic_session_max_depth;
+    if (SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current())) return slot->session_max_depth;
+    uint32_t value = 0;
+    bool any = false;
+    for (auto& slot : g_synthetic_workers)
+        if (slot.session_armed) {
+            any = true;
+            value = std::max(value, slot.session_max_depth);
+        }
+    return any ? value : g_last_session_max_depth;
+}
+
+uint32_t SyntheticSessionAdmissionsForThread(Thread* worker) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    SyntheticWorkerSlot* slot = SlotForOwnerLocked(worker);
+    return slot ? slot->session_admissions : 0;
+}
+
+uint32_t SyntheticSessionDepthForThread(Thread* worker) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    SyntheticWorkerSlot* slot = SlotForOwnerLocked(worker);
+    return slot ? slot->session_depth : 0;
+}
+
+uint32_t SyntheticSessionMaxDepthForThread(Thread* worker) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    SyntheticWorkerSlot* slot = SlotForOwnerLocked(worker);
+    return slot ? slot->session_max_depth : 0;
 }
 
 void SetSyntheticSessionAdmissionHookForTest(SyntheticSessionAdmissionHook hook) {
@@ -723,6 +945,11 @@ void CallSyntheticWorkerPreCallbackHookForTest() {
         hook = g_synthetic_worker_hook;
     }
     if (hook) hook();
+}
+
+void SetSyntheticChildPreparedHookForTest(SyntheticChildPreparedHook hook) {
+    std::lock_guard lock(g_synthetic_worker_lock);
+    g_synthetic_child_hook = hook;
 }
 #endif
 
@@ -875,7 +1102,8 @@ bool StartThread(ThreadRef t) {
                                 if (callback_status == GuestCallbackStatus::kInvoked &&
                                     !SyntheticWorkerExitMatches(code))
                                     callback_status = GuestCallbackStatus::kRejectedTarget;
-                            } else if (synthetic_claim == SyntheticWorkerClaim::kRejected) {
+                            } else if (synthetic_claim == SyntheticWorkerClaim::kRejected || t->synthetic_bound) {
+                                // a revoked or unmatched binding must never fall back to unguarded execution
                                 callback_status = GuestCallbackStatus::kRejectedTarget;
                             } else {
                                 callback_status =
@@ -926,6 +1154,61 @@ bool StartThread(ThreadRef t) {
 #endif
     return true;
 }
+
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+// Test-only ordinal-255 bridge: the parent's guest code passes the synthetic tag
+// in ThreadExtensionSize and a 16-byte descriptor in StartRoutineDebug. The
+// descriptor is { magic, expected_exit, reserved0, reserved1 }.
+uint32_t CreateSyntheticChildThread(uint32_t handle_out, uint32_t stack_size, uint32_t tls_size, uint32_t id_out,
+                                    uint32_t start_routine, uint32_t start_context, uint32_t suspended,
+                                    uint32_t system_routine, uint32_t descriptor) {
+    if (suspended || system_routine || !descriptor) return kInvalidParameter;
+    SyntheticWorkerAuthorization authorization;
+    {
+        std::lock_guard lock(g_synthetic_worker_lock);
+        SyntheticWorkerSlot* slot = ClaimedSlotLocked(Current());
+        if (!slot || !slot->armed || slot->memory_generation != mem::Generation()) return kInvalidParameter;
+        if (start_routine < slot->authorization.code_base || start_routine >= slot->authorization.code_end)
+            return kInvalidParameter;
+        authorization.target = start_routine;
+        authorization.context = start_context;
+        authorization.code_base = slot->authorization.code_base;
+        authorization.code_end = slot->authorization.code_end;
+        authorization.dispatch_generation = slot->authorization.dispatch_generation;
+        authorization.image_identity = kSyntheticWorkerImageIdentity;
+    }
+    struct Descriptor {
+        uint32_t magic, expected_exit, reserved0, reserved1;
+    } record{};
+    if (mem::Read(descriptor, &record, sizeof(record)) != mem::AccessStatus::kOk ||
+        record.magic != kSyntheticChildDescriptorMagic || record.reserved0 || record.reserved1)
+        return kInvalidParameter;
+    authorization.expected_exit = record.expected_exit;
+
+    ThreadRef child;
+    const uint32_t status = PrepareSystemThreadEx(handle_out, stack_size, tls_size, id_out, start_routine, start_context,
+                                                  false, 0, child);
+    if (status != kSuccess) return status;
+    if (!ArmSyntheticWorkerForThread(child.get(), authorization)) {
+        CancelPreparedThread(child);
+        return kNoMemory;
+    }
+    SyntheticChildPreparedHook hook = nullptr;
+    {
+        std::lock_guard lock(g_synthetic_worker_lock);
+        hook = g_synthetic_child_hook;
+    }
+    if (hook && !hook(child.get())) {
+        CancelPreparedThread(child);
+        return kInvalidParameter;
+    }
+    if (!StartThread(child)) {
+        CancelPreparedThread(child);
+        return kNoMemory;
+    }
+    return kSuccess;
+}
+#endif
 
 #ifdef MOSTWANTED_THREAD_PREPARATION_TESTS
 void SetThreadPreparationFailureForTest(ThreadPreparationFailPoint point) { g_thread_fail_point = point; }

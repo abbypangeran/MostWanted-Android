@@ -574,10 +574,10 @@ GuestCallbackStatus ValidateCallbackTicket(const GuestCallbackTicket& ticket, ui
         return GuestCallbackStatus::kStaleDispatch;
     const GuestCallbackStatus mapped = ValidateMappedCallback(target, lease, function);
     if (mapped != GuestCallbackStatus::kReady) return mapped;
-    const uint32_t code_base = lease.CodeBase();
-    const uint32_t code_end = lease.CodeEnd();
-    return code_end > code_base &&
-                   code_lease.Acquire(code_base, code_end - code_base, mem::kExecute) == mem::AccessStatus::kOk
+    // Pin only the page the entry point lives on, the same scope the nested
+    // callback path uses. Leasing the whole code range made every extra code
+    // section a precondition on unrelated (and possibly uncommitted) pages.
+    return code_lease.Acquire(target, 1, mem::kExecute) == mem::AccessStatus::kOk
                ? GuestCallbackStatus::kReady
                : GuestCallbackStatus::kCodePageDenied;
 }

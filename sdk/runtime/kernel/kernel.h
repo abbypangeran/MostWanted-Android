@@ -235,6 +235,9 @@ struct Thread : Object {
     GuestCallbackTicket system_routine_ticket, start_routine_ticket;
     uint32_t handle_out = 0, id_out = 0;
     bool handle_published = false, id_published = false;
+    // set when a test-only synthetic claim was bound to this thread: a missing
+    // claim then rejects activation instead of falling back to unguarded code
+    bool synthetic_bound = false;
     std::atomic<uint32_t> exit_code{0};
     int priority = 0;
     std::atomic<ThreadState> state{ThreadState::kPrepared};

@@ -3867,3 +3867,81 @@ The checked fixture grew from 703 to 721 assertions (+18). Apple `kExecutionDisa
 The next substantial package should be the **multi-worker execution-session architecture**: per-worker claim identities, deterministic scheduling and parent/child activation, so `PsCreateSystemThreadEx` can start the `0x002B5C0F` system routine as a second synthetic worker. The layout and TLS preconditions it depends on are now established and tested; the worker claim, dispatch identity and finalizer ownership are the remaining gaps.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-15 — multi-worker synthetic sessions
+
+**`PHASE_2D15_MULTIWORKER_SESSIONS = PASS`.** The synthetic runtime now holds up to four independent worker claims instead of one global Boolean, and the checked fixture runs two managed guest workers at the same time: a parent creates a child through the reviewed ordinal-255 argument layout, the child runs its own persistent callback session and terminates through ordinal 258, and both contexts are validated independently. No authentic instruction ran.
+
+### Per-worker ownership
+
+`sdk/runtime/kernel/threads.cpp` replaces the singleton claim/session globals with `SyntheticWorkerSlot[kMaximumSyntheticWorkers]`. Each slot carries an id, the bound `Thread*`, that thread's id, the memory generation at binding, and — for host-thread claims, which have no guest `Thread` — the claiming `std::thread::id`. Rules:
+
+- `ArmSyntheticWorker` keeps its single-worker behaviour (unbound slot, legacy tests unchanged); `ArmSyntheticWorkerForThread` binds an authorization to one prepared thread.
+- `ClaimSyntheticWorker` prefers the slot bound to the calling thread, then a legacy unbound slot. A bound thread whose authorization is missing or revoked gets `kRejected`, and `Thread::synthetic_bound` makes `StartThread` reject the activation instead of falling back to unguarded `CallGuestCallback`.
+- A claim cannot be inherited: the owner pointer, thread id and memory generation are all re-checked, and a recycled address with a different id is refused.
+- `FinalizeThreadResources` retires the slot bound to the thread, so cancellation, failed launch and memory shutdown cannot leave an armed authorization behind.
+- Sessions are per slot (policy, memory generation, depth, admissions, peak depth). Dispatch asks the *current* worker's slot, so one worker's session never admits another's call; host-side accessors report the current or last-completed session, preserving every single-worker test.
+- `RevokeSyntheticWorker(handle)` clears an unclaimed slot, or strips a claimed worker's session and authority while letting it unwind.
+
+### Code-lease scope
+
+The callback gate in `sdk/runtime/cpu/dispatch.cpp` leased `[code_base, code_end)` for every ticket. With a second code section that made unrelated pages a precondition (and denied callbacks on pages the test never committed). `ValidateCallbackTicket` now leases the entry page, the same scope the nested-callback path already used; the target page is still pinned across the call.
+
+### Parent/child fixture
+
+The checked fixture gained a second code section `.text2` at `0x13000` (`X86CodeEnd = 0x131A5`) with generated routines `0x13000..0x131A5`, and a data page at `0xB0000`:
+
+| Function | Address | Role |
+|---|---|---|
+| child callback A / B | `13000` / `1300C` | child session entries |
+| parent callback A / B | `13018` / `13024` | parent session entries |
+| child start | `13030` | markers, two admitted callbacks, ordinal 258 |
+| parent start | `13094` | markers, callback A, ordinal-255 child creation, `NtClose`, callback B, normal return |
+| parent early start | `13137` | markers, callback A, child creation, ordinal 258 |
+
+The parent's guest code passes `handle_out, 0x53435431 ("SCT1"), stack, TLS size, id_out, start, context, 0, descriptor, 0` through `CALL [KernelThunkAddress(255)]`; the descriptor holds `{magic "SCTD", expected_exit, 0, 0}`. The fixture's ordinal-255 handler calls `kernel::CreateSyntheticChildThread`, which validates the caller's claim, code range, descriptor and sizes, prepares the child, arms a claim bound to it, lets the test arm the child's session through `SyntheticChildPreparedHook`, and only then starts it. `xboxkrnl.cpp` is untouched: production ordinal 255 keeps its existing behaviour.
+
+### Generated evidence
+
+- **Child-first run.** Both workers are live at once; the parent closes the child handle while the child runs, then its second callback admission waits for the child's exit. Both workers report distinct KPCR, KPRCB (`kpcr+0x28`), ETHREAD, TLS and stack top through `FS:[0x28]`, `FS:[0x20]` and `FS:[4]`; each TLS read-back keeps its own marker (`"PARE"` / `"CHIL"`). Both sessions admit exactly two callbacks, the child's post-termination marker stays zero, exits are `0x50415245` (parent, normal return) and `0xC0DE1502` (child, ordinal 258), and `dispatch::ResetWouldBlockForTest()` is true while both are active.
+- **Parent-first run.** The parent terminates through ordinal 258 immediately after creating the child; the child still runs both callbacks and exits with its own status. `p_cb_b` stays zero, proving the parent's session ended with it.
+- **Identities.** Each admission records a distinct nonzero claim id; `SyntheticSessionAdmissionsForThread(self)` reads 1 at each worker's second admission, so the counters did not mix.
+- **Negative.** A revoked child claim is rejected before guest entry (thread cancelled, exit 0, blocks released), a duplicate claim returns non-claimed, and a host thread cannot claim another thread's bound slot.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 732 PASS / 0 FAIL | 732 PASS / 0 FAIL |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Root / secondary / integrated self-test | 38 / 24 / 68 PASS | 38 / 24 / 68 PASS |
+| Root / secondary `--static-real` | PASS | PASS |
+| Root / secondary / integrated `--preflight` | PASS, exit 0 | PASS, exit 0 |
+| Integrated preflight route | 143/143 instructions, 72 + 71, hashes and four imports unchanged | same |
+| Android ARM64 syntax (`threads.cpp`, `dispatch.cpp`, `xboxkrnl.cpp`) | PASS | — |
+
+The fixture grew from 721 to 732 assertions. `synthetic_startup_integration_tests` now builds its extra `.data` section around the fixture's two code sections (three sections, import at `0x12000`, raw `0x3000`).
+
+### Readiness after D15
+
+| Dependency | Evidence after D15 | Status |
+|---|---|---|
+| Per-worker claim and sessions | Slot table, bound identities, generations, revocation, release on finalize | implemented, synthetically validated |
+| Two concurrent guest workers | Generated parent/child, disjoint contexts, independent sessions, termination, shutdown joins | implemented, synthetically validated |
+| Child creation ABI | Ordinal-255 argument order exercised from generated code through a test handler | synthetic only |
+| `PsCreateSystemThreadEx` production path | Unchanged; no synthetic tag reaches it | untouched |
+| Guest termination | Ordinal 258 from the child, exact status, no resume | implemented, synthetically validated |
+| Shared code pages | Entry-page lease; decommit waits; dispatch reset blocked while active | implemented, validated |
+| Authentic guest-worker scheduling | Only synthetic claims exist; authentic workers still require a production admission route | unresolved |
+| 867 initializer targets, dynamic list callback, `00316DA8` | Phase 2D-12 policy only | unresolved |
+| `KPRCB+0x250`, `KTHREAD+0x24` | Still zero and fail-closed | unresolved |
+| Retail SEH 302/312, `00319858`, `002B5BD3` | No change | prohibited / unresolved |
+| `[0x8001003C]` physical-window global | Read-only, not on the build-5838 path | unresolved |
+| Protection 179/182/204 | Phase 2D-11 ABI only | fail-closed |
+
+### Remaining blockers and next package
+
+The scheduling and ownership layer is no longer the blocker: two managed workers can run, isolate state and finalise independently. What remains before a controlled authentic startup is **an authentic admission route** — a reviewed way for the real `PsCreateSystemThreadEx` call at `0x002B5CD0` to start the `0x002B5C0F` system routine under a validated claim — together with the initializer chain, `KPRCB+0x250` and retail SEH. The next package should be the **authentic system-routine admission design**: bind `0x002B5C0F` to the now-working worker/session machinery with static argument and memory preconditions, without enabling any authentic instruction yet.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
