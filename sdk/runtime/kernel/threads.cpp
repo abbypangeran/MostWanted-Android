@@ -511,6 +511,67 @@ SystemRoutineAdmissionResult ValidateSystemRoutineAdmission(const Thread& prepar
     return {SystemRoutineAdmission::kAdmitted, prepared.id};
 }
 
+const char* AuthenticAdmissionStatusName(AuthenticAdmissionStatus status) {
+    switch (status) {
+        case AuthenticAdmissionStatus::kValidatedButExecutionProhibited: return "validated-but-execution-prohibited";
+        case AuthenticAdmissionStatus::kInvalidImage: return "invalid image identity";
+        case AuthenticAdmissionStatus::kInvalidCallSite: return "invalid ordinal-255 caller contract";
+        case AuthenticAdmissionStatus::kInvalidPolicyIdentity: return "invalid callback-policy identity";
+        case AuthenticAdmissionStatus::kRejected: return "rejected";
+    }
+    return "unknown authentic admission status";
+}
+
+AuthenticAdmissionResult ValidateAuthenticSystemRoutineAdmission(const Thread& prepared,
+                                                                 const AuthenticAdmissionSpec& spec) {
+    AuthenticAdmissionResult result;
+    // This boundary still depends on these unresolved items; report them even
+    // when the request itself validates.
+    result.unresolved = kAuthenticUnresolvedKprcb250 | kAuthenticUnresolvedRetailSeh |
+                        kAuthenticUnresolvedInitializerChain | kAuthenticUnresolvedPhysicalWindow;
+    if (!spec.expected_image_sha1 || std::strcmp(spec.expected_image_sha1, kAuthenticImageSha1) != 0 ||
+        !ImageIdentityMatches(kAuthenticImageSha1)) {
+        result.status = AuthenticAdmissionStatus::kInvalidImage;
+        return result;
+    }
+    if (spec.expected_system_routine != kAuthenticSystemRoutine ||
+        spec.expected_start_routine != kAuthenticStartRoutine || spec.call_pc != kAuthenticCreateThreadCallPc ||
+        spec.argument_count != kAuthenticCreateThreadArguments) {
+        result.status = AuthenticAdmissionStatus::kInvalidCallSite;
+        result.detail = spec.call_pc;
+        return result;
+    }
+    if (!spec.expected_policy_identity ||
+        std::strcmp(spec.expected_policy_identity, kAuthenticCallbackPolicyIdentity) != 0) {
+        result.status = AuthenticAdmissionStatus::kInvalidPolicyIdentity;
+        return result;
+    }
+    SystemRoutineAdmissionSpec routine;
+    routine.expected_image_sha1 = kAuthenticImageSha1;
+    routine.expected_parent_id = spec.expected_parent_id;
+    routine.expected_start_routine = kAuthenticStartRoutine;
+    routine.expected_system_routine = kAuthenticSystemRoutine;
+    routine.dispatch_generation = spec.dispatch_generation;
+    routine.memory_generation = spec.memory_generation;
+    const SystemRoutineAdmissionResult checked = ValidateSystemRoutineAdmission(prepared, routine);
+    result.reason = checked.status;
+    result.detail = checked.detail;
+    if (checked.status != SystemRoutineAdmission::kAdmitted) {
+        result.status = AuthenticAdmissionStatus::kRejected;
+        return result;
+    }
+    // The real image's CRT derives exactly this block from the TLS directory.
+    if (uint64_t(prepared.stack_top) - prepared.tls != kAuthenticTlsBlockSize) {
+        result.status = AuthenticAdmissionStatus::kRejected;
+        result.reason = SystemRoutineAdmission::kInvalidTls;
+        result.detail = uint32_t(uint64_t(prepared.stack_top) - prepared.tls);
+        return result;
+    }
+    result.status = AuthenticAdmissionStatus::kValidatedButExecutionProhibited;
+    result.detail = prepared.id;
+    return result;
+}
+
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
                        uint32_t start_context, bool suspended) {
     ThreadRef t;

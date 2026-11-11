@@ -88,7 +88,7 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
         uint32_t next = va + info->len;
         if (falls && next_body != next) {
             if (an_.InsnAt(next) || an_.functions.count(next))
-                Line("\t" + Target(next));
+                Line("\t" + Target(next, next));
             else
                 Line(F("\t%s(ctx, 0x%X, \"fell off decoded code\");", an_.cfg.checked_memory ? "x86_checked_trap" : "x86_trap", next));
         }
@@ -185,7 +185,7 @@ void CodeGen::EmitHooks(uint32_t va, bool after) {
         if (h.after != after) continue;
         auto leave = [&](const Hook::Exit& x) {
             if (x.ret) return F("ctx.esp += %d; return;", 4 + ret_bytes_);  // return address plus the ret n bytes
-            return (x.to <= va ? std::string("X86_BARRIER(); ") : std::string()) + Target(x.to);
+            return (x.to <= va ? std::string("X86_BARRIER(); ") : std::string()) + Target(x.to, va);
         };
         Line("\tX86_SAVE_FLAGS();");
         std::string reload = "cf = ctx.cf; zf = ctx.zf; sf = ctx.sf; of = ctx.of; pf = ctx.pf; af = ctx.af;";

@@ -33,7 +33,7 @@ private:
     std::string CType(unsigned bits, bool is_signed = false) const;
 
     std::string Cond(ZydisMnemonic m);
-    std::string Target(uint32_t t);  // goto or tail call
+    std::string Target(uint32_t t, uint32_t va);  // goto or checked tail transfer
     std::string Hex(uint32_t v) const;
     std::string FuncName(uint32_t va) const;
     void Line(const std::string& s) { body_ += s; body_ += '\n'; }

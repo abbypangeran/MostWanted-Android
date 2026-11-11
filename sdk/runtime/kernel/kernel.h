@@ -359,6 +359,54 @@ struct SystemRoutineAdmissionResult {
 SystemRoutineAdmissionResult ValidateSystemRoutineAdmission(const Thread& prepared,
                                                             const SystemRoutineAdmissionSpec& spec);
 
+// Phase 2D-17: the reviewed authentic startup contract for this build. These
+// values come from static evidence in the local Black Edition XBE; the call site
+// is the ordinal-255 call at 0x002B5CE0 inside the wrapper at 0x002B5CA7.
+inline constexpr char kAuthenticImageSha1[] = "f636a16af04171089f879a4bed646e185c734233";
+inline constexpr uint32_t kAuthenticSystemRoutine = 0x002B5C0F;
+inline constexpr uint32_t kAuthenticStartRoutine = 0x002B38A2;
+inline constexpr uint32_t kAuthenticCreateThreadCallPc = 0x002B5CE0;
+inline constexpr uint32_t kAuthenticCreateThreadArguments = 10;
+inline constexpr uint32_t kAuthenticTlsBlockSize = 0x94;
+// SHA-1 of ios/recompiler-fixtures/callback_policy_manifest.txt, checked by the
+// integrated real-image preflight.
+inline constexpr char kAuthenticCallbackPolicyIdentity[] = "7eec0a102a0485f4aa6e2036aece1aa00381fd99";
+
+// A matching authentic request yields kValidatedButExecutionProhibited. The
+// result carries evidence only: no enum value or token is accepted by
+// StartThread, CallGuestCallback or any other guest-entry function.
+enum class AuthenticAdmissionStatus : uint8_t { kValidatedButExecutionProhibited, kInvalidImage, kInvalidCallSite, kInvalidPolicyIdentity, kRejected };
+const char* AuthenticAdmissionStatusName(AuthenticAdmissionStatus status);
+
+enum : uint32_t {
+    kAuthenticUnresolvedKprcb250 = 1u << 0,
+    kAuthenticUnresolvedRetailSeh = 1u << 1,
+    kAuthenticUnresolvedInitializerChain = 1u << 2,
+    kAuthenticUnresolvedPhysicalWindow = 1u << 3,
+};
+
+struct AuthenticAdmissionSpec {
+    const char* expected_image_sha1 = nullptr;   // must equal kAuthenticImageSha1
+    uint32_t expected_system_routine = 0;        // must equal kAuthenticSystemRoutine
+    uint32_t expected_start_routine = 0;         // must equal kAuthenticStartRoutine
+    uint32_t call_pc = 0;                        // must equal kAuthenticCreateThreadCallPc
+    uint32_t argument_count = 0;                 // must equal kAuthenticCreateThreadArguments
+    const char* expected_policy_identity = nullptr;  // must equal kAuthenticCallbackPolicyIdentity
+    uint64_t dispatch_generation = 0;
+    uint64_t memory_generation = 0;
+    uint32_t expected_parent_id = 0;             // 0 skips the parent check
+};
+
+struct AuthenticAdmissionResult {
+    AuthenticAdmissionStatus status = AuthenticAdmissionStatus::kRejected;
+    SystemRoutineAdmission reason = SystemRoutineAdmission::kNotInitialized;  // precise check when rejected
+    uint32_t detail = 0;                                                     // failing address or thread id
+    uint32_t unresolved = 0;  // kAuthenticUnresolved* flags for this boundary
+};
+
+AuthenticAdmissionResult ValidateAuthenticSystemRoutineAdmission(const Thread& prepared,
+                                                                 const AuthenticAdmissionSpec& spec);
+
 // files
 bool MountDefaults(const std::string& game_dir, const std::string& data_dir);
 void ClearFilesystemMappings();

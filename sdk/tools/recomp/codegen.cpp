@@ -157,7 +157,7 @@ void CodeGen::Unimpl(uint32_t va, const ZydisDecodedInstruction& in, const Zydis
              esc.c_str()));
 }
 
-std::string CodeGen::Target(uint32_t t) {
+std::string CodeGen::Target(uint32_t t, uint32_t va) {
     if (body_set_.count(t) && t != entry_) {
         labels_.insert(t);
         return Fmt("goto loc_%08X;", t);
@@ -166,6 +166,11 @@ std::string CodeGen::Target(uint32_t t) {
         labels_.insert(t);
         return Fmt("goto loc_%08X;", t);
     }
+    // A jump leaving this function is a tail transfer: the target's RET completes
+    // the caller's frame, so no return address is pushed. Checked code admits it
+    // exactly like a checked CALL instead of calling the host function directly.
+    if (an_.cfg.checked_memory)
+        return Fmt("{ X86_SAVE_FLAGS(); x86_checked_jmp(ctx, base, 0x%Xu, 0x%Xu); return; }", t, va);
     if (an_.functions.count(t)) return Fmt("{ X86_SAVE_FLAGS(); %s(ctx, base); return; }", FuncName(t).c_str());
     return Fmt("{ X86_SAVE_FLAGS(); x86_icall(ctx, base, 0x%Xu); return; }", t);
 }
@@ -374,8 +379,13 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                               ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
         checked_jmp = m == ZYDIS_MNEMONIC_JMP && in.operand_count_visible == 1 &&
                       ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && in.operand_width == 32 &&
-                      (in.raw.imm[0].size == 8 || in.raw.imm[0].size == 32) &&
-                      body_set_.count(uint32_t(next + ops[0].imm.value.s));
+                      (in.raw.imm[0].size == 8 || in.raw.imm[0].size == 32);
+        bool checked_indirect_jmp = m == ZYDIS_MNEMONIC_JMP && in.operand_count_visible == 1 &&
+                                    in.operand_width == 32 && in.address_width == 32 &&
+                                    ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[0].size == 32 &&
+                                    is_flat_guest_memory(ops[0]);
+        bool checked_indirect_register_jmp =
+            m == ZYDIS_MNEMONIC_JMP && in.operand_count_visible == 1 && in.operand_width == 32 && is_register32(ops[0]);
         uint32_t call_target = m == ZYDIS_MNEMONIC_CALL && in.operand_count_visible == 1 &&
                                        ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE
                                    ? uint32_t(next + ops[0].imm.value.s)
@@ -399,7 +409,8 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
               checked_and || checked_or || checked_push || checked_pop || checked_cdq || checked_idiv || checked_xor ||
               checked_test || checked_shl || checked_shr || checked_leave || checked_lea || checked_not_al ||
               checked_rep_string || checked_branch || checked_call || checked_indirect_call ||
-              checked_indirect_register_call || checked_jmp || checked_ret) || locked) {
+              checked_indirect_register_call || checked_jmp || checked_indirect_jmp ||
+              checked_indirect_register_jmp || checked_ret) || locked) {
             Unimpl(va, in, ops);
             pending_.valid = false;
             return;
@@ -452,26 +463,25 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         case ZYDIS_MNEMONIC_JMP: {
             if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 uint32_t t = uint32_t(next + ops[0].imm.value.s);
-                if (an_.cfg.checked_memory && !checked_jmp) {
-                    Unimpl(va, in, ops);
-                    pending_.valid = false;
-                    return;
-                }
                 // backward jumps get a compiler barrier so spin loops reread memory other threads write
                 if (t <= va) Line("\tX86_BARRIER();");
-                Line("\t" + Target(t));
+                Line("\t" + Target(t, va));
             } else {
                 auto jt = an_.jump_tables.find(va);
                 std::string ea = ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY ? AddrExpr(ops[0]) : "";
                 if (jt != an_.jump_tables.end()) {
-                    Line(Fmt("\tswitch (%s) {", Read(ops[0], ea).c_str()));
+                    Line(Fmt("\t{ uint32_t t = %s;", Read(ops[0], ea).c_str()));
+                    Line("\tswitch (t) {");
                     std::set<uint32_t> done;
                     for (uint32_t t : jt->second.targets) {
                         if (!done.insert(t).second) continue;
-                        Line(Fmt("\tcase 0x%Xu: %s", t, Target(t).c_str()));
+                        Line(Fmt("\tcase 0x%Xu: %s", t, Target(t, va).c_str()));
                     }
-                    Line(Fmt("\tdefault: { X86_SAVE_FLAGS(); x86_icall(ctx, base, %s); return; }", Read(ops[0], ea).c_str()));
-                    Line("\t}");
+                    if (an_.cfg.checked_memory)
+                        Line(Fmt("\tdefault: { X86_SAVE_FLAGS(); x86_checked_jmp(ctx, base, t, 0x%Xu); return; }", va));
+                    else
+                        Line("\tdefault: { X86_SAVE_FLAGS(); x86_icall(ctx, base, t); return; }");
+                    Line("\t} }");
                 } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[0].mem.base == ZYDIS_REGISTER_NONE &&
                            ops[0].mem.index == ZYDIS_REGISTER_NONE &&
                            uint32_t(ops[0].mem.disp.value) >= an_.img.kernel_thunk &&
@@ -479,6 +489,13 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                     uint32_t ord = 0;
                     an_.img.Read32(uint32_t(ops[0].mem.disp.value), ord);
                     Line(Fmt("\tx86_kernel(ctx, base, %u); return;", ord & 0x7FFFFFFF));
+                } else if (an_.cfg.checked_memory) {
+                    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                        Line(Fmt("\t{ uint32_t t = %s; X86_SAVE_FLAGS(); x86_checked_register_jmp(ctx, base, t, 0x%Xu); return; }",
+                                 Read(ops[0], ea).c_str(), va));
+                    else
+                        Line(Fmt("\t{ X86_SAVE_FLAGS(); x86_checked_indirect_jmp(ctx, base, %s, 0x%Xu); return; }",
+                                 ea.c_str(), va));
                 } else {
                     Line(Fmt("\t{ uint32_t t = %s; X86_SAVE_FLAGS(); x86_icall(ctx, base, t); return; }", Read(ops[0], ea).c_str()));
                 }
@@ -502,7 +519,7 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         case ZYDIS_MNEMONIC_LOOPNE: {
             uint32_t t = uint32_t(next + ops[0].imm.value.s);
             const char* extra = m == ZYDIS_MNEMONIC_LOOPE ? " && zf" : m == ZYDIS_MNEMONIC_LOOPNE ? " && !zf" : "";
-            Line(Fmt("\tif (--ctx.ecx != 0%s) { X86_BARRIER(); %s }", extra, Target(t).c_str()));
+            Line(Fmt("\tif (--ctx.ecx != 0%s) { X86_BARRIER(); %s }", extra, Target(t, va).c_str()));
             pending_.valid = false;
             return;
         }
@@ -512,7 +529,7 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
     if (in.meta.category == ZYDIS_CATEGORY_COND_BR) {
         uint32_t t = uint32_t(next + ops[0].imm.value.s);
         std::string c = Cond(m);
-        Line(Fmt("\tif (%s) { %s%s }", c.c_str(), t <= va ? "X86_BARRIER(); " : "", Target(t).c_str()));
+        Line(Fmt("\tif (%s) { %s%s }", c.c_str(), t <= va ? "X86_BARRIER(); " : "", Target(t, va).c_str()));
         pending_.valid = false;
         return;
     }

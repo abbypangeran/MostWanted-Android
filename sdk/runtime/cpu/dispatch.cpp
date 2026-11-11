@@ -403,6 +403,86 @@ void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_
     CheckedIndirectCall(ctx, base, target, return_address, call_pc, operand_address);
 }
 
+namespace {
+
+// A tail jump enters another generated function without pushing a return
+// address. It must satisfy the same admission a checked CALL would, but it must
+// not invent a call frame: the target's own RET completes the caller's frame.
+void CheckedTailJump(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t pc, uint32_t slot_address,
+                     bool register_target) {
+#ifdef MOSTWANTED_SYNTHETIC_WORKER_TESTS
+    if (kernel::SyntheticSessionArmed()) {
+        dispatch::CallLease resolution;
+        const dispatch::ResolvedTarget resolved = resolution.Resolve(target);
+        if (resolved.kind != dispatch::TargetKind::kGeneratedFunction || !resolved.function)
+            x86_checked_trap(ctx, pc, "checked tail target is not a generated function");
+        const kernel::SyntheticCallbackEntry entry =
+            slot_address ? kernel::SyntheticCallbackEntry::kIndirectSlot
+                         : (register_target ? kernel::SyntheticCallbackEntry::kRegisterTarget
+                                            : kernel::SyntheticCallbackEntry::kDirectCall);
+        uint32_t expected_esp = 0;
+        const kernel::SyntheticCallbackAdmission admission = kernel::AdmitSyntheticCallback(
+            entry, slot_address, target, pc, resolution.Generation(), ctx.esp, &expected_esp);
+        if (admission != kernel::SyntheticCallbackAdmission::kAdmitted) {
+            char reason[160];
+            std::snprintf(reason, sizeof(reason), "synthetic tail transfer rejected: %s",
+                          kernel::SyntheticCallbackAdmissionName(admission));
+            x86_checked_trap(ctx, pc, reason);
+        }
+        struct ReleaseAdmission {
+            ~ReleaseAdmission() { kernel::ReleaseSyntheticCallbackAdmission(); }
+        } release;
+        mem::ScopedPageLease code_lease;
+        if (code_lease.AcquireExecutableRun(target, resolution.CodeEnd()) != mem::AccessStatus::kOk)
+            x86_checked_trap(ctx, pc, "checked tail target code pages unavailable");
+        ctx.last_icall = target;
+        resolved.function(ctx, base);
+        return;
+    }
+    mem::ScopedPageLease tail_code_lease;
+    if (kernel::SyntheticWorkerClaimHeld()) {
+        dispatch::CallLease lease;
+        const dispatch::ResolvedTarget resolved = lease.Resolve(target);
+        if (resolved.kind == dispatch::TargetKind::kGeneratedFunction) {
+            if (!kernel::SyntheticWorkerHasNestedCallback() ||
+                !kernel::SyntheticWorkerAuthorizesNestedCallback(target, lease.Generation()))
+                x86_checked_trap(ctx, pc, "unauthorized synthetic tail target");
+            if (tail_code_lease.AcquireExecutableRun(target, lease.CodeEnd()) != mem::AccessStatus::kOk)
+                x86_checked_trap(ctx, pc, "checked tail target code pages unavailable");
+            ctx.last_icall = target;
+            resolved.function(ctx, base);
+            return;
+        }
+    }
+#endif
+    // No synthetic claim or session is active (production Android, or a test
+    // entry): resolve the destination and tail into it without a return address.
+    // A mapping miss still goes through the fail-closed indirect path.
+    dispatch::CallLease lease;
+    const dispatch::ResolvedTarget resolved = lease.Resolve(target);
+    if (resolved.kind == dispatch::TargetKind::kGeneratedFunction && resolved.function) {
+        ctx.last_icall = target;
+        resolved.function(ctx, base);
+        return;
+    }
+    x86_icall(ctx, base, target);
+}
+
+}  // namespace
+
+void x86_checked_jmp(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t pc) {
+    CheckedTailJump(ctx, base, target, pc, 0, false);
+}
+
+void x86_checked_register_jmp(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t pc) {
+    CheckedTailJump(ctx, base, target, pc, 0, true);
+}
+
+void x86_checked_indirect_jmp(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t pc) {
+    const uint32_t target = x86_mem_read<uint32_t>(pc, operand_address);
+    CheckedTailJump(ctx, base, target, pc, operand_address, false);
+}
+
 void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
     if (X86CheckedCallFrame* frame = ctx.checked_call) {
         const uint32_t actual = x86_mem_read<uint32_t>(pc, ctx.esp);

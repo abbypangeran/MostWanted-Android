@@ -2807,6 +2807,465 @@ void CheckSystemRoutineAdmission() {
           "system-routine fixture bridges disable after quiescence");
 }
 
+// Phase 2D-17: the authentic readiness binding. A matching request validates
+// and explicitly stays non-executable; no guest code runs and the thread remains
+// prepared.
+void CheckAuthenticAdmissionBinding() {
+    constexpr uint32_t start_page = 0x002B3000, system_page = 0x002B5000;
+    constexpr uint32_t handle_out = 0xB0040, id_out = 0xB0044;
+    constexpr uint32_t all_unresolved = kernel::kAuthenticUnresolvedKprcb250 |
+                                        kernel::kAuthenticUnresolvedRetailSeh |
+                                        kernel::kAuthenticUnresolvedInitializerChain |
+                                        kernel::kAuthenticUnresolvedPhysicalWindow;
+
+    std::string error;
+    const bool memory_ready =
+        mem::Init() && mem::Commit(start_page, mem::kPage) && mem::Commit(system_page, mem::kPage) &&
+        mem::Protect(start_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+        mem::Protect(system_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk;
+    // the authentic addresses resolve as generated entries for this check only;
+    // the fixture stubs are never called
+    const std::array<X86FuncMapping, 2> mappings{{
+        {kernel::kAuthenticStartRoutine, sub_00014100},
+        {kernel::kAuthenticSystemRoutine, sub_00014260},
+    }};
+    const dispatch::Metadata metadata{0x002B0000, 0x002B6000, kernel::kAuthenticSystemRoutine, mappings, {}};
+    const bool ready = memory_ready && dispatch::Init(metadata, error) && kernel::RestartKernelWorkers();
+    Check(ready, "authentic admission fixture memory, dispatch and workers initialize");
+    if (!ready) return;
+    const mem::Stats baseline = mem::Query();
+    kernel::SetImageIdentity(kernel::kAuthenticImageSha1);
+
+    kernel::ThreadRef thread;
+    const bool prepared = kernel::PrepareSystemThreadEx(handle_out, 0x10000, kernel::kAuthenticTlsBlockSize, id_out,
+                                                        kernel::kAuthenticStartRoutine, 0, false,
+                                                        kernel::kAuthenticSystemRoutine, thread) == kernel::kSuccess &&
+                          bool(thread);
+    Check(prepared && thread->state.load() == kernel::ThreadState::kPrepared,
+          "the authentic system-routine request prepares without executing guest code");
+    if (!prepared) return;
+    auto spec = [&] {
+        kernel::AuthenticAdmissionSpec s;
+        s.expected_image_sha1 = kernel::kAuthenticImageSha1;
+        s.expected_system_routine = kernel::kAuthenticSystemRoutine;
+        s.expected_start_routine = kernel::kAuthenticStartRoutine;
+        s.call_pc = kernel::kAuthenticCreateThreadCallPc;
+        s.argument_count = kernel::kAuthenticCreateThreadArguments;
+        s.expected_policy_identity = kernel::kAuthenticCallbackPolicyIdentity;
+        s.dispatch_generation = CurrentDispatchGeneration();
+        s.memory_generation = mem::Generation();
+        return s;
+    };
+
+    const kernel::AuthenticAdmissionResult admitted =
+        kernel::ValidateAuthenticSystemRoutineAdmission(*thread, spec());
+    Check(admitted.status == kernel::AuthenticAdmissionStatus::kValidatedButExecutionProhibited &&
+              admitted.reason == kernel::SystemRoutineAdmission::kAdmitted && admitted.detail == thread->id &&
+              admitted.unresolved == all_unresolved && thread->state.load() == kernel::ThreadState::kPrepared &&
+              kernel::KernelWorkerCountForTest() == 0 && kernel::Threads().empty(),
+          "a matching authentic request validates but explicitly cannot authorise execution");
+    Check(kernel::ValidateAuthenticSystemRoutineAdmission(*thread, spec()).status ==
+              kernel::AuthenticAdmissionStatus::kValidatedButExecutionProhibited &&
+              kernel::Threads().empty() && thread->state.load() == kernel::ThreadState::kPrepared &&
+              kernel::KernelWorkerCountForTest() == 0,
+          "the authentic readiness result does not register or activate the thread");
+
+    {
+        kernel::AuthenticAdmissionSpec wrong_image = spec();
+        wrong_image.expected_image_sha1 = "0000000000000000000000000000000000000000";
+        kernel::AuthenticAdmissionSpec wrong_system = spec();
+        wrong_system.expected_system_routine = kernel::kAuthenticStartRoutine;
+        kernel::AuthenticAdmissionSpec wrong_start = spec();
+        wrong_start.expected_start_routine = kernel::kAuthenticSystemRoutine;
+        kernel::AuthenticAdmissionSpec wrong_call = spec();
+        wrong_call.call_pc = 0x002B5CD0;  // the wrapper entry, not the ordinal-255 call
+        kernel::AuthenticAdmissionSpec wrong_arguments = spec();
+        wrong_arguments.argument_count = 9;
+        kernel::AuthenticAdmissionSpec wrong_policy = spec();
+        wrong_policy.expected_policy_identity = "0000000000000000000000000000000000000000";
+        Check(kernel::ValidateAuthenticSystemRoutineAdmission(*thread, wrong_image).status ==
+                          kernel::AuthenticAdmissionStatus::kInvalidImage &&
+                      kernel::ValidateAuthenticSystemRoutineAdmission(*thread, wrong_system).status ==
+                          kernel::AuthenticAdmissionStatus::kInvalidCallSite &&
+                      kernel::ValidateAuthenticSystemRoutineAdmission(*thread, wrong_start).status ==
+                          kernel::AuthenticAdmissionStatus::kInvalidCallSite &&
+                      kernel::ValidateAuthenticSystemRoutineAdmission(*thread, wrong_call).status ==
+                          kernel::AuthenticAdmissionStatus::kInvalidCallSite &&
+                      kernel::ValidateAuthenticSystemRoutineAdmission(*thread, wrong_arguments).status ==
+                          kernel::AuthenticAdmissionStatus::kInvalidCallSite &&
+                      kernel::ValidateAuthenticSystemRoutineAdmission(*thread, wrong_policy).status ==
+                          kernel::AuthenticAdmissionStatus::kInvalidPolicyIdentity,
+                  "the authentic binding rejects a wrong image, routine, call site, argument count or policy identity");
+    }
+
+    kernel::SetImageIdentity("checked-fixture");
+    Check(kernel::ValidateAuthenticSystemRoutineAdmission(*thread, spec()).status ==
+              kernel::AuthenticAdmissionStatus::kInvalidImage,
+          "the authentic binding rejects a runtime identity that is not the recompiled image");
+    kernel::SetImageIdentity(kernel::kAuthenticImageSha1);
+
+    {
+        kernel::AuthenticAdmissionSpec stale_dispatch = spec();
+        stale_dispatch.dispatch_generation += 1;
+        kernel::AuthenticAdmissionSpec stale_memory = spec();
+        stale_memory.memory_generation += 1;
+        const kernel::AuthenticAdmissionResult dispatch_result =
+            kernel::ValidateAuthenticSystemRoutineAdmission(*thread, stale_dispatch);
+        const kernel::AuthenticAdmissionResult memory_result =
+            kernel::ValidateAuthenticSystemRoutineAdmission(*thread, stale_memory);
+        Check(dispatch_result.status == kernel::AuthenticAdmissionStatus::kRejected &&
+                  dispatch_result.reason == kernel::SystemRoutineAdmission::kStaleDispatch &&
+                  memory_result.status == kernel::AuthenticAdmissionStatus::kRejected &&
+                  memory_result.reason == kernel::SystemRoutineAdmission::kStaleMemory,
+              "the authentic binding rejects stale dispatch and memory generations");
+    }
+
+    {
+        const uint32_t zero = 0;
+        Check(mem::Write(thread->ethread + kernel::layout::kThreadTlsData, &zero, sizeof(zero)) ==
+                      mem::AccessStatus::kOk &&
+                  kernel::ValidateAuthenticSystemRoutineAdmission(*thread, spec()).reason ==
+                      kernel::SystemRoutineAdmission::kInvalidThreadBlocks,
+              "the authentic binding rejects a scribbled ETHREAD layout");
+        kernel::InitializeThreadGuestMemory(thread->kpcr, thread->ethread, thread->stack_top, thread->stack_size,
+                                            thread->tls, thread->id);
+        Check(kernel::ValidateAuthenticSystemRoutineAdmission(*thread, spec()).status ==
+                  kernel::AuthenticAdmissionStatus::kValidatedButExecutionProhibited,
+              "the restored authentic thread blocks validate again");
+    }
+
+    Check(mem::Protect(system_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk &&
+              kernel::ValidateAuthenticSystemRoutineAdmission(*thread, spec()).reason ==
+                  kernel::SystemRoutineAdmission::kInvalidCodePage,
+          "the authentic binding rejects a non-executable system-routine page");
+    Check(mem::Protect(system_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+          "the authentic system-routine page becomes executable again");
+
+    {
+        const bool stopped = kernel::StopKernelWorkers();
+        const kernel::AuthenticAdmissionResult shutdown =
+            stopped ? kernel::ValidateAuthenticSystemRoutineAdmission(*thread, spec())
+                    : kernel::AuthenticAdmissionResult{};
+        Check(shutdown.status == kernel::AuthenticAdmissionStatus::kRejected &&
+                  shutdown.reason == kernel::SystemRoutineAdmission::kShutdown && kernel::RestartKernelWorkers(),
+              "the authentic binding fails closed while workers shut down");
+    }
+
+    kernel::CancelPreparedThread(thread);
+    Check(kernel::ValidateAuthenticSystemRoutineAdmission(*thread, spec()).reason ==
+                  kernel::SystemRoutineAdmission::kInvalidThreadState &&
+              thread->resources_released,
+          "the authentic binding rejects a cancelled thread whose resources were released");
+
+    const bool restored = dispatch::Init(error);
+    kernel::SetImageIdentity("checked-fixture");
+    kernel::StopKernelWorkers();
+    kernel::RestartKernelWorkers();
+    Check(restored && kernel::Threads().empty() && mem::Query().system_used == baseline.system_used,
+          "the authentic admission fixture restores dispatch and its allocation baseline");
+}
+
+namespace {
+
+struct TailSlot {
+    kernel::SyntheticCallbackEntry entry = kernel::SyntheticCallbackEntry::kDirectCall;
+    uint32_t slot_address = 0;
+    uint32_t target = 0;
+    uint32_t call_pc = 0;
+};
+
+struct TailRunResult {
+    bool started = false;
+    uint32_t wait = kernel::kTimeout;
+    kernel::ThreadState state = kernel::ThreadState::kPrepared;
+    uint32_t exit = 0;
+    bool released = false;
+};
+
+std::atomic<bool> g_tail_slot_mutation_armed{false};
+uint32_t g_tail_slot_mutation_address = 0;
+uint32_t g_tail_slot_mutation_value = 0;
+
+void TailSlotMutationHook() {
+    if (!g_tail_slot_mutation_armed.exchange(false)) return;
+    const uint32_t value = g_tail_slot_mutation_value;
+    mem::Write(g_tail_slot_mutation_address, &value, sizeof(value));
+}
+
+}  // namespace
+
+// Phase 2D-17: a jump leaving its function is a tail transfer. It must satisfy
+// the same session admission a checked CALL gets, must not push a return
+// address, and must leave the target's RET to complete the caller's frame.
+void CheckTailTransferAuthorisation() {
+    constexpr uint32_t code_page = 0x14000, other_code_page = 0x11000, data_page = 0xB0000;
+    constexpr uint32_t handle_out = 0xB0040, id_out = 0xB0044;
+    constexpr uint32_t other_target = 0x11E80;  // fixture function on the .text page
+    constexpr uint32_t intra_start = 0x14100;
+    constexpr uint32_t direct_start = 0x14130;
+    constexpr uint32_t register_start = 0x14150;
+    constexpr uint32_t memory_start = 0x141C0;
+    constexpr uint32_t target_function = 0x14170;
+    constexpr uint32_t chain_start = 0x14190, chain_mid = 0x141A0, chain_end = 0x141B0;
+    constexpr uint32_t nested_start = 0x141E0;
+    constexpr uint32_t nested_tail = 0x14200, nested_corrupt = 0x14230;
+    constexpr uint32_t folded_start = 0x14260, outside_start = 0x14270, other_page_start = 0x14220;
+    constexpr uint32_t corrupt_target = 0x14240;
+    constexpr uint32_t ticket_sentinel = 0xFFFFFFF0;
+    constexpr uint32_t tail_exit = 0xABAB0002;
+    constexpr uint32_t chain_exit = 0xABAB0003;
+    constexpr uint32_t nested_exit = 0xABAB0004;
+    constexpr uint32_t nested_return_address = 0x141E6;
+    constexpr uint32_t saved_ebx = 0xB00B0, corrupt_marker = 0xB00B4;
+    constexpr uint32_t tail_entries = 0xB00E0, indirect_slot = 0xB00E4, chain_count = 0xB00E8;
+    constexpr uint32_t source_esp = 0xB00EC, target_esp = 0xB00F0, target_return = 0xB00F4;
+    constexpr uint32_t intra_marker = 0xB00F8, nested_resumed = 0xB00FC;
+
+    std::string error;
+    const bool ready = mem::Init() && mem::Commit(code_page, mem::kPage) && mem::Commit(other_code_page, mem::kPage) &&
+                       mem::Commit(data_page, mem::kPage) &&
+                       mem::Protect(code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                       mem::Protect(other_code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk &&
+                       dispatch::Init(error) && kernel::RestartKernelWorkers();
+    Check(ready, "tail-transfer fixture memory, dispatch and workers initialize");
+    if (!ready) return;
+    const mem::Stats baseline = mem::Query();
+    auto word = [](uint32_t address) {
+        uint32_t value = 0;
+        mem::Read(address, &value, sizeof(value));
+        return value;
+    };
+    auto reset_data = [&](uint32_t slot_value) {
+        uint32_t zero = 0;
+        for (uint32_t address = 0xB0000; address < 0xB0100; address += 4)
+            mem::Write(address, &zero, sizeof(zero));
+        mem::Write(indirect_slot, &slot_value, sizeof(slot_value));
+        mem::Write(0xB0060, &zero, sizeof(zero));
+    };
+    auto run = [&](uint32_t start, uint32_t expected_exit, uint32_t max_depth, std::initializer_list<TailSlot> slots,
+                   uint32_t callback_slot_value = 0) {
+        TailRunResult result;
+        kernel::DisarmSyntheticWorker();
+        kernel::DisarmSyntheticSession();
+        if (callback_slot_value)
+            mem::Write(0xB00C0, &callback_slot_value, sizeof(callback_slot_value));
+        kernel::ThreadRef thread;
+        if (kernel::PrepareSystemThreadEx(handle_out, 0x10000, 0x24, id_out, start, 0, false, 0, thread) !=
+                kernel::kSuccess ||
+            !thread) {
+            return result;
+        }
+        kernel::SyntheticWorkerHandle handle;
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = start;
+        authorization.expected_exit = expected_exit;
+        authorization.code_base = X86CodeBase;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = CurrentDispatchGeneration();
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        bool armed = kernel::ArmSyntheticWorkerForThread(thread.get(), authorization, &handle);
+        if (armed && slots.size()) {
+            kernel::SyntheticSessionPolicy policy;
+            policy.image_identity = kernel::kSyntheticWorkerImageIdentity;
+            policy.code_base = X86CodeBase;
+            policy.code_end = X86CodeEnd;
+            policy.max_depth = max_depth;
+            policy.dispatch_generation = authorization.dispatch_generation;
+            policy.slot_count = uint32_t(slots.size());
+            uint32_t index = 0;
+            for (const TailSlot& slot : slots) {
+                policy.slots[index].entry = slot.entry;
+                policy.slots[index].slot_address = slot.slot_address;
+                policy.slots[index].target = slot.target;
+                policy.slots[index].call_pc = slot.call_pc;
+                ++index;
+            }
+            armed = kernel::ArmSyntheticSessionForThread(thread.get(), policy);
+        }
+        result.started = armed && kernel::StartThread(thread);
+        if (!result.started) kernel::CancelPreparedThread(thread);
+        result.wait = result.started ? LeaseWait(thread) : kernel::kTimeout;
+        kernel::StopKernelWorkers();
+        kernel::RestartKernelWorkers();
+        result.state = thread->state.load();
+        result.exit = thread->exit_code.load();
+        result.released = thread->resources_released;
+        kernel::DisarmSyntheticWorker();
+        kernel::DisarmSyntheticSession();
+        return result;
+    };
+
+    {
+        // An intra-function jump stays a label transfer: no policy, no claim of
+        // a tail transfer, and the skipped store never runs.
+        reset_data(0);
+        const TailRunResult result = run(intra_start, 0xABAB0001, 1, {});
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kExited &&
+                  result.exit == 0xABAB0001 && word(intra_marker) == 2 && result.released,
+              "an intra-function jump executes without a tail-transfer admission");
+    }
+
+    const auto check_tail_run = [&](const TailRunResult& result, const char* message) {
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kExited &&
+                  result.exit == tail_exit && result.released && word(tail_entries) == 1 &&
+                  word(source_esp) == word(target_esp) && word(target_return) == ticket_sentinel &&
+                  word(saved_ebx) == 0x12345678,
+              message);
+    };
+    {
+        reset_data(0);
+        check_tail_run(run(direct_start, tail_exit, 2,
+                           {{kernel::SyntheticCallbackEntry::kDirectCall, 0, target_function, 0x1413B}}),
+                       "a direct tail jump is admitted, preserves ESP/EBX and returns without a pushed address");
+    }
+    {
+        reset_data(0);
+        check_tail_run(run(register_start, tail_exit, 2,
+                           {{kernel::SyntheticCallbackEntry::kRegisterTarget, 0, target_function, 0x14160}}),
+                       "a register-indirect tail jump validates the resolved destination");
+    }
+    {
+        reset_data(target_function);
+        check_tail_run(run(memory_start, tail_exit, 2,
+                           {{kernel::SyntheticCallbackEntry::kIndirectSlot, indirect_slot, target_function, 0x141CB}}),
+                       "a memory-indirect tail jump re-reads its slot at admission");
+    }
+    {
+        reset_data(0);
+        const TailRunResult result = run(chain_start, chain_exit, 3,
+                                         {{kernel::SyntheticCallbackEntry::kDirectCall, 0, chain_mid, 0x14196},
+                                          {kernel::SyntheticCallbackEntry::kDirectCall, 0, chain_end, 0x141A6}});
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kExited &&
+                  result.exit == chain_exit && word(chain_count) == 3 && result.released,
+              "one session admits successive tail transfers and each return restores the depth");
+    }
+    {
+        reset_data(0);
+        const TailRunResult result = run(nested_start, nested_exit, 3,
+                                         {{kernel::SyntheticCallbackEntry::kIndirectSlot, 0xB00C0, nested_tail, 0x141E0},
+                                          {kernel::SyntheticCallbackEntry::kDirectCall, 0, target_function, 0x14200}},
+                                         nested_tail);
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kExited &&
+                  result.exit == nested_exit && word(nested_resumed) == 1 && word(tail_entries) == 1 &&
+                  word(target_return) == nested_return_address && result.released,
+              "a nested callback tail-jumps back through its own checked call frame");
+    }
+
+    {
+        // Target not in the policy: rejected before the target body runs.
+        reset_data(0);
+        const TailRunResult result = run(direct_start, tail_exit, 2,
+                                         {{kernel::SyntheticCallbackEntry::kDirectCall, 0, target_function, 0x14140}});
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kCancelled &&
+                  result.exit == 0 && word(tail_entries) == 0 && result.released,
+              "a tail target outside the session policy is rejected before guest code runs");
+    }
+    {
+        // A target outside the generated code range has no mapping.
+        reset_data(0);
+        const TailRunResult result = run(outside_start, 0xABAB0005, 2,
+                                         {{kernel::SyntheticCallbackEntry::kDirectCall, 0, target_function, 0x14270}});
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kCancelled &&
+                  result.exit == 0 && word(tail_entries) == 0 && result.released,
+              "a tail target outside the generated code is rejected before dispatch");
+    }
+    {
+        // A statically reachable interior block is folded into the admitted
+        // function's own body: it is not a new entry and consumes no policy slot.
+        reset_data(0);
+        const TailRunResult result = run(folded_start, 0xABAB0002, 1, {});
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kExited &&
+                  result.exit == 0xABAB0002 && word(tail_entries) == 0 && word(saved_ebx) == 0x12345678 &&
+                  result.released,
+              "a reachable interior jump stays inside the admitted function body and needs no new entry");
+    }
+    {
+        // The destination page loses execute permission before the transfer.
+        reset_data(0);
+        Check(mem::Protect(other_code_page, mem::kPage, mem::kNoAccess) == mem::AccessStatus::kOk,
+              "the tail destination page becomes non-executable");
+        const TailRunResult result = run(other_page_start, 0x11111111, 2,
+                                         {{kernel::SyntheticCallbackEntry::kDirectCall, 0, other_target, 0x14220}});
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kCancelled &&
+                  result.exit == 0 && word(tail_entries) == 0 && result.released,
+              "a non-executable tail destination is rejected before dispatch");
+        Check(mem::Protect(other_code_page, mem::kPage, mem::kRead | mem::kExecute) == mem::AccessStatus::kOk,
+              "the tail destination page becomes executable again");
+    }
+    {
+        // The slot changes between the generated read and the admission re-read.
+        reset_data(target_function);
+        g_tail_slot_mutation_address = indirect_slot;
+        g_tail_slot_mutation_value = 0x14171;
+        g_tail_slot_mutation_armed = true;
+        kernel::SetSyntheticSessionAdmissionHookForTest(TailSlotMutationHook);
+        const TailRunResult result = run(memory_start, tail_exit, 2,
+                                         {{kernel::SyntheticCallbackEntry::kIndirectSlot, indirect_slot, target_function, 0x141CB}});
+        kernel::SetSyntheticSessionAdmissionHookForTest(nullptr);
+        g_tail_slot_mutation_armed = false;
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kCancelled &&
+                  result.exit == 0 && word(tail_entries) == 0 && word(indirect_slot) == 0x14171 && result.released,
+              "a tail slot changed during admission is detected before the target runs");
+    }
+    {
+        // The target corrupts the checked call frame's return address.
+        reset_data(0);
+        const TailRunResult result = run(nested_start, nested_exit, 3,
+                                         {{kernel::SyntheticCallbackEntry::kIndirectSlot, 0xB00C0, nested_corrupt, 0x141E0},
+                                          {kernel::SyntheticCallbackEntry::kDirectCall, 0, corrupt_target, 0x14230}},
+                                         nested_corrupt);
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kCancelled &&
+                  result.exit == 0 && word(corrupt_marker) == 0x63 && word(nested_resumed) == 0 &&
+                  word(target_return) == 0 && result.released,
+              "a tail target that corrupts the return address fails the checked RET and cannot resume the caller");
+    }
+    {
+        // Nesting limit: the second tail admission meets max_depth 1.
+        reset_data(0);
+        const TailRunResult result = run(chain_start, chain_exit, 1,
+                                         {{kernel::SyntheticCallbackEntry::kDirectCall, 0, chain_mid, 0x14196},
+                                          {kernel::SyntheticCallbackEntry::kDirectCall, 0, chain_end, 0x141A6}});
+        Check(result.started && result.wait == kernel::kWait0 && result.state == kernel::ThreadState::kCancelled &&
+                  result.exit == 0 && word(chain_count) == 2 && result.released,
+              "a tail chain beyond the session nesting limit is rejected before the next target runs");
+    }
+    {
+        // Revocation before activation: the claim is refused, not downgraded.
+        reset_data(0);
+        kernel::DisarmSyntheticWorker();
+        kernel::DisarmSyntheticSession();
+        kernel::ThreadRef thread;
+        const bool prepared = kernel::PrepareSystemThreadEx(handle_out, 0x10000, 0x24, id_out, direct_start, 0, false, 0,
+                                                            thread) == kernel::kSuccess &&
+                              bool(thread);
+        kernel::SyntheticWorkerHandle handle;
+        kernel::SyntheticWorkerAuthorization authorization;
+        authorization.target = direct_start;
+        authorization.expected_exit = tail_exit;
+        authorization.code_base = X86CodeBase;
+        authorization.code_end = X86CodeEnd;
+        authorization.dispatch_generation = CurrentDispatchGeneration();
+        authorization.image_identity = kernel::kSyntheticWorkerImageIdentity;
+        const bool armed = prepared && kernel::ArmSyntheticWorkerForThread(thread.get(), authorization, &handle);
+        const bool revoked = armed && handle && kernel::RevokeSyntheticWorker(handle);
+        const bool started = revoked && kernel::StartThread(thread);
+        if (!started) kernel::CancelPreparedThread(thread);
+        const uint32_t wait = started ? LeaseWait(thread) : kernel::kTimeout;
+        kernel::StopKernelWorkers();
+        kernel::RestartKernelWorkers();
+        Check(started && wait == kernel::kWait0 && thread->state.load() == kernel::ThreadState::kCancelled &&
+                  thread->exit_code.load() == 0 && word(tail_entries) == 0 && thread->resources_released,
+              "a revoked worker claim cannot be used for a tail transfer");
+        kernel::DisarmSyntheticWorker();
+    }
+
+    kernel::StopKernelWorkers();
+    kernel::RestartKernelWorkers();
+    Check(kernel::Threads().empty() && kernel::SyntheticWorkerCountForTest() == 0 &&
+              mem::Query().system_used == baseline.system_used,
+          "the tail-transfer fixture returns to its worker and allocation baseline");
+}
+
 void CheckSyntheticWorkerLifecycle() {
     constexpr uint32_t code_page = 0x11000;
     constexpr uint32_t target = code_page + 0x10;
@@ -7617,6 +8076,8 @@ extern "C" int RunCheckedRecompilerFixtureTests() {
     CheckMultiWorkerSessions();
     CheckCodePageLeaseScope();
     CheckSystemRoutineAdmission();
+    CheckAuthenticAdmissionBinding();
+    CheckTailTransferAuthorisation();
     CheckSyntheticWorkerLifecycle();
 #endif
     mem::Shutdown();

@@ -4024,3 +4024,73 @@ See [`STARTUP_READINESS.md`](STARTUP_READINESS.md) (machine-readable copy: [`sta
 5. **Remaining traps and imports** — `CLI`/`STI`, `INT3` and any unimplemented instruction on the startup path, plus the fail-closed protection imports (not on the build-5838 path).
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-17 — checked tail transfers and authentic admission binding
+
+**`PHASE_2D17_CONTROL_FLOW_AND_ADMISSION = PASS`.** Guest control flow that leaves a generated function now requires the same admission a checked CALL gets, and the authentic system-routine contract has a production-facing, non-executing readiness binding that yields `VALIDATED_BUT_EXECUTION_PROHIBITED`. The `KPRCB+0x250` conclusion is **CONDITIONALLY_SAFE** for a precisely stated boundary. No authentic instruction ran; the frozen 143-instruction route is unchanged.
+
+### Checked tail transfers
+
+A jump leaving its function is a tail transfer: no return address, no call frame, and the target's `RET` completes the caller's frame. In checked mode the recompiler now emits `x86_checked_jmp` / `x86_checked_register_jmp` / `x86_checked_indirect_jmp` for every non-body transfer instead of calling the host function directly. This covers `JMP rel32` out of the function, `JMP r32`, flat `JMP [mem]`, `Jcc`/`LOOP` out of the function, jump-table cases and defaults, hook exits and fallthrough into another function. `CheckedTailJump` (`sdk/runtime/cpu/dispatch.cpp`) applies the session policy, target identity, slot re-read, depth, dispatch/memory generations and the executable-run lease, then calls the generated function without touching `ctx.esp`. Unsupported forms (`JMP` with FS/segment or 16-bit memory operands, far jumps) remain checked traps.
+
+Two behaviours are worth stating explicitly:
+
+- **Reachable interior targets are folded** into the admitted function's body by the recompiler (`body_set_`). They are not new entries, consume no policy slot, and stay under the same admission, lease and checked-memory rules. The fixture proves the folded block does not execute the other function's entry instruction.
+- **The legacy tail path** (no synthetic claim or session: production Android and test entries) resolves the target and tail-calls the generated function directly; a mapping miss still goes through the fail-closed `x86_icall` path. Production Apple execution remains disabled.
+
+### Authentic admission binding
+
+`ValidateAuthenticSystemRoutineAdmission` (`sdk/runtime/kernel/threads.cpp`) requires the reviewed constants and returns `VALIDATED_BUT_EXECUTION_PROHIBITED` for a matching prepared request. The constants and their evidence:
+
+| Constant | Value | Evidence |
+|---|---|---|
+| Image SHA-1 | `f636a16af04171089f879a4bed646e185c734233` | local image |
+| System routine | `0x002B5C0F` | ordinal-255 argument 10 |
+| Start routine | `0x002B38A2` | same argument block |
+| Ordinal-255 call site | `0x002B5CE0` | static disassembly: `call [0x003C9E68]`; the wrapper is `0x002B5CA7` |
+| Arguments | 10, stdcall cleanup 40 | pushes `0x002B5CB9..0x002B5CDF` |
+| TLS block | `0x94` | `0x002B3916`, `0x004DF78C` |
+| Policy identity | `7eec0a102a0485f4aa6e2036aece1aa00381fd99` | SHA-1 of `callback_policy_manifest.txt`, re-checked by the integrated preflight |
+
+A mismatch returns `kInvalidImage`, `kInvalidCallSite`, `kInvalidPolicyIdentity` or `kRejected` with the precise `SystemRoutineAdmission` reason. The result type is not accepted by `StartThread`, `CallGuestCallback` or any guest-entry function, and the validator never changes the prepared thread's state.
+
+### `KPRCB+0x250`: CONDITIONALLY_SAFE
+
+Static disassembly of the boundary (start routine prologue through the pre-start list walk):
+
+- `0x002B38B2 mov eax,[eax+0x250]; test eax,eax; jz 0x002B38C1` → `xor ecx,ecx; test ecx,ecx; jz 0x002B38EE`; the dependent `[eax+0x24]`, `[ecx]` and `[ecx+4]` accesses are skipped.
+- `0x002B596D cmp dword [eax+0x250],0; jnz` returns; null falls into `0x002B5854`.
+- `0x002B5BD9 mov eax,[eax+0x250]; test; jz 0x002B5BEC` → `xor eax,eax` → `jz 0x002B5C0A` → `xor eax,eax; ret 4`; `[eax+0x14]` is skipped.
+
+The null branch at `0x002B596D` is reached from the start routine's first call (`0x002B38A2` → `0x002B58B8` → `0x002B5967`) and enters the hardware-info probe at `0x002B5854`, which reads `[0x8001003C]`. With that global zero the probe derives `0x80010000`, scans for the `INIT` signature at `0x8000FFF0` and returns. The null path is therefore safe only while the field stays zero **and** `[0x8001003C]` stays zero (or points into the mapped physical window with no matching signature). The reads at `0x002B83F6`, `0x0037927B` and `0x0039CD5F` are outside the boundary and remain unresolved. This corrects the earlier "not on the startup path" note for this boundary.
+
+### Gates
+
+| Gate | Result | Scope | Blocking conditions |
+|---|---|---|---|
+| A — authentic preparation | **GO** | prepare and inspect the image and thread structures without guest instructions | none |
+| B — bounded authentic execution | **NO-GO** | ordinal-255 activation → `0x002B5C0F` prologue/TLS fill → `0x002B5C7E` → first `0x002B38A2` instruction, stop before its first call | retail SEH `0x00319804`; no claim-bound authentic admission; KPRCB/physical-window preconditions; route coverage |
+| C — authentic startup | **NO-GO** | start routine through the initializer chain and list walk | Gate B plus 867 initializer authorisations, CLI/STI, list callback, SEH 302/312, imports, scheduling |
+
+The 867 initializers are **not** required for Gate A or for the proposed Gate B boundary; they become mandatory at Gate C.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| Checked recompiler fixture assertions | 798 PASS / 0 FAIL | 798 PASS / 0 FAIL |
+| Applicable safe CTests | 5/5 | 5/5 |
+| Darwin memory/worker CTest | 1/1 | 1/1 |
+| Root / secondary / integrated self-test | 38 / 24 / 68 PASS | 38 / 24 / 68 PASS |
+| Root `--static-real` | PASS | — |
+| Root / secondary / integrated `--preflight` | PASS, exit 0 | PASS, exit 0 |
+| Integrated preflight route and policy identity | 143/143, 72 + 71, stop `002B5C7B`, manifest SHA-1 matches | same |
+| Android ARM64 syntax (`dispatch.cpp`, `threads.cpp`) | PASS | — |
+
+The fixture grew from 766 to 798 assertions (+32): intra-function jump, direct/register/memory tail transfers, successive transfers, nested callback then tail transfer, folded interior, and the fail-closed cases (unauthorised target, outside-code target, non-executable page, changed slot, corrupt return address, depth limit, revoked claim), plus the authentic admission binding and its negative cases.
+
+### Next milestone
+
+Gate A is GO. The next substantial package should be **Gate B's admission route**: bind the production ordinal-255 path to a validated claim and the reviewed system-routine contract without enabling guest execution, then decide the retail SEH `0x00319804` contract that the `0x002B5C0F` prologue requires. That is the smallest package that advances a gate rather than adding synthetic coverage.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

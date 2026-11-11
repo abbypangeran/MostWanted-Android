@@ -66,6 +66,11 @@ void x86_checked_register_call(X86Context& ctx, uint8_t* base, uint32_t target, 
                                uint32_t call_pc);
 void x86_checked_indirect_call(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t return_address,
                                uint32_t call_pc);
+// checked tail transfers: enter another generated function with no new return
+// address and no call frame, after the same admission a checked CALL gets
+void x86_checked_jmp(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t pc);
+void x86_checked_register_jmp(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t pc);
+void x86_checked_indirect_jmp(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t pc);
 void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes);
 void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal);
 [[noreturn]] void x86_trap(X86Context& ctx, uint32_t va, const char* what);

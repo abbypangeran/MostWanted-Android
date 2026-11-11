@@ -1741,6 +1741,13 @@ bool LoadCallbackPolicyAudit(const xbe::Image& image, callback_policy::Manifest&
         return false;
     }
     const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    // Phase 2D-17: the runtime's authentic admission constant must name this
+    // exact reviewed manifest.
+    if (Sha1Hex(bytes) != kernel::kAuthenticCallbackPolicyIdentity) {
+        error = "callback policy identity constant does not match the manifest";
+        return false;
+    }
+    std::printf("CALLBACK_POLICY identity=%s\n", kernel::kAuthenticCallbackPolicyIdentity);
     if (!callback_policy::ParseManifest(text, manifest, error)) return false;
     if (!callback_policy::LoadGeneratedMapping(CALLBACK_POLICY_MAPPING, mapping, error)) return false;
     return callback_policy::AuditAgainstImage(image, Sha1Hex(image.file), manifest, mapping, audit, error);
