@@ -4393,3 +4393,108 @@ The integrated frozen preflight still reports 143/143, 72 root + 71 secondary, s
 The same original 144-instruction boundary: parent 71 executed + stop `0x002B3987`, child 73 executed + stop `0x002B38A2`, mapping `EC3486BCAFA498BF`, manifests `7F8AD72F529DC906` / `DBCFD15B661E8CE6`, SEH scope flag `0`, isolated assessment, whole-run code/stack leases and the predicate diagnostics. It would require one new explicit authorisation; it must reach **both** stops, observe 255/187/277/294, verify the live SEH predicate set and TLS, and show the same cleanup baseline. No boundary extension is included.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-21 — start-routine extension and hardware/version readiness
+
+**`PHASE_2D21_START_ROUTINE_READINESS = PASS`.** The 2D-20 144-instruction run is the historical authentic PASS. The new boundary extends the child through the start routine's first call, the hardware/version selector, the KPRCB null path and the physical-window probe, then stops before `0x002B38A7`. The route is statically closed and synthetically validated. No authentic XBE instruction ran in this phase; the second run's evidence and both earlier evidence directories are untouched.
+
+### Historical reference (do not reuse the identities)
+
+| Item | 2D-20 verified prefix | 2D-21 extension |
+|---|---|---|
+| Parent executed | 71, stop `002B3987` | unchanged 71, stop `002B3987` |
+| Child executed | 73, stop `002B38A2` | 115, stop `002B38A7` |
+| Total | 144 / 146 boundary steps | 186 / 188 boundary steps |
+| Mapping | `EC3486BCAFA498BF` (152) | `07AEBFC052075330` (200) |
+| Parent manifest | `7F8AD72F529DC906` | `48120EDC4D3D4466` |
+| Child manifest | `DBCFD15B661E8CE6` | `322795BF56BE60B6` |
+
+The old identities are historical only. The parent identity changed because `RouteManifest.start_routine` is now part of the reviewed identity; the parent's route and 71 instructions are unchanged.
+
+### Start-routine control flow
+
+`0x002B38A2` is one direct call to `0x002B58B8`. The reviewed build-5838 path is:
+
+```
+002B38A2  call 002B58B8
+002B58B8  hardware flags from [003C9E34]          ; XboxHardwareInfo
+002B58BD  build from [003C9E3C]+4                 ; XboxKrnlVersion
+002B58C9..002B58F6  version selection              ; 5838 -> 002B5967
+002B5967  mov eax, fs:[0x20]                       ; KPCR.Prcb / KPRCB
+002B596D  cmp dword [eax+0x250], 0                 ; KPRCB+0x250 = KPCR+0x278
+002B5975  jnz 002B597C                             ; non-null -> return (blocked)
+002B5977  jmp 002B5854                             ; null -> INIT probe
+002B5859  mov eax, [8001003C]                      ; physical first megabyte
+002B5863  eax -= 7FFF0000
+002B5865  movzx ecx, [eax+6]
+002B586A  movzx esi, [eax+14]
+002B5873  eax = esi + ecx*8 - 0x10                 ; 0x8000FFF0 with [8001003C]=0
+002B5877  cmp dword [eax], 54494E49                ; "INIT"
+002B587E  jnz 002B58B6                             ; absent -> leave/ret
+002B58B6  leave; 002B58B7 ret -> 002B38A7
+```
+
+The other start-routine calls (`002B5664`, `002B582B`, `002B57D3`, `001C8C20`, `002B55EE`) and the second call at `002B38A7` are outside the boundary. The version branch is driven by `XboxKrnlVersion.Build`; the null branch by `KPRCB+0x250`; the probe by `[8001003C]` and the `INIT` signature at the derived address. The expected build is 5838, so the `JNLE` at `002B58F6` reaches `002B5967` and the protection block (`002B58F8` onward, including `CLI`/`STI`) is not reached. A non-5838 build, a non-null `KPRCB+0x250`, an `INIT` signature, or an unreviewed branch target is fail-closed by the route's conditionals and trap entries.
+
+### KPRCB and physical-window findings
+
+- `FS:[0x20]` is `KPCR.Prcb` (`KPCR+0x28`); `[eax+0x250]` is `KPRCB+0x250` = `KPCR+0x278`, inside the 0x400-byte KPCR. The runtime does not initialise this field; it stays zero. The null branch is therefore taken. A non-null value returns at `002B597C`; the new boundary stops instead of faking the object.
+- `[0x8001003C]` and `[0x8000FFF0]` are in the first physical megabyte (`0x80000000..0x80100000`), committed by `mem::Init`. The checked memory maps `0x80000000` and `0xF0000000` to the same backing store, and the read is checked. Neither address is initialised by `InitializeKernelData`; both remain zero, so the probe derives `0x80010000`, checks `0x8000FFF0`, finds no `INIT`, and returns.
+- The kernel's reviewed `XboxHardwareInfo`/`XboxKrnlVersion` data is now produced by the production `InitializeKernelData` values through `PrepareAuthenticKernelData`: hardware flags `0x20`, version `{1,0,5838,1}`. The data addresses are registered in the physical kernel data at `0x80001000+`. The future run driver must patch the image's data import slots `003C9E34`/`003C9E3C` to `hardware_info`/`kernel_version`; the static preflight checks the slot encodings.
+- The `INIT`-present path (`002B5880` -> `002B8DC4`, stores at `004EDC78`/`004EDC7C`), a non-null `KPRCB+0x250`, a non-zero `[0x8001003C]` with a matching signature, and every other build are outside the reviewed path and fail closed. No kernel object or physical value is fabricated.
+
+### CLI/STI and privileged instructions
+
+The build-5838 path skips `002B58F8` and therefore the protection block's `CLI` at `002B5957` and `STI` at `002B595E`. They remain checked traps and were not translated to NOPs. `INT3` at `002B5CA6` remains outside the boundary and trapped. Synthetic tests confirm both `CLI` and `STI` stop with `kUnsupportedInstruction`. The same fail-closed rule applies to `INT3`, unsupported opcodes and exception-generating forms.
+
+### Selected next boundary
+
+| Item | Value |
+|---|---|
+| Parent | entry `002B3916`, 71 instructions, pre-instruction stop `002B3987` |
+| Child | entry `002B5C0F`, 73+42 = 115 instructions, pre-instruction stop `002B38A7` |
+| Total | 186 executed, 188 boundary steps |
+| Child start routine | `002B38A2`; first call `002B38A2 -> 002B58B8`; return `002B58B7 -> 002B38A7` |
+| Allowed kernel ordinals | parent 255/187; child 277/294; data imports 322/324 (read-only) |
+| Required memory | image `.text`/`.rdata`/`.data`, parent/child stacks/TLS/KPCR/ETHREAD, kernel data first MB, physical `0x8001003C`/`0x8000FFF0`, TLS, SEH scope table, critical section/list |
+| Expected state | reviewed kernel data and import slots; stack pushes/returns and the live SEH frame; no data writes on the probe; physical reads only |
+| Unresolved | `INIT`-present path, non-null KPRCB, non-zero physical pointer/other builds, all later start-routine calls, 867 initializers, retail SEH 302/312, ordinal 258, list callback, `001C8C20`, protection |
+
+The boundary establishes the start routine's first call, the complete hardware/version branch, the KPRCB null path, the physical-window null probe, the first call's return, and the continuation stop before the second call. It deliberately does not enter `002B5664` or any later start-routine dependency.
+
+### Implemented checked support
+
+- `sdk/runtime/kernel/authentic_run_route.h`: 42 new child steps, stop `002B38A7`, start routine `002B38A2`, new `kStartRoutine`/`kHardwareProbe` segments, six alternative-branch trap entries, updated counts and identity inputs.
+- `sdk/runtime/kernel/authentic_run.h`: `RouteManifest.start_routine` and the identity mix; `AuthenticKernelData` and `PrepareAuthenticKernelData`.
+- `ios/recompiler-fixtures/authentic_run.cpp`: parent/child manifests; child admission by `start_routine` instead of the stop; the kernel-data initializer using the production `InitializeKernelData` values; no execution path.
+- `authentic_run_config.cpp`: 200-function mapping generation, including the six alternative branches and the child stop.
+- `authentic_run_preflight.cpp`: 200/200 generated entries, new identities, child 115/186/188, data import slots 322/324, child stop edge and trap classification.
+- `authentic_run_fixture_route.h`/`authentic_run_fixture_builder.cpp`: synthetic extended child, version/KPRCB/physical caller, and `CLI`/`STI` trap routes.
+- `authentic_run_tests.cpp`: child continuation with SEH/TLS at the new stop, 5838 version branch, physical values and alias, KPRCB null/non-null, CLI/STI traps and kernel-data values.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` | 95 PASS / 0 FAIL | 95 PASS / 0 FAIL |
+| Checked recompiler fixtures | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, 200/200 | PASS, 200/200 |
+| `authentic_run_accounting` | PASS, 1280 -> 0 | PASS, 1280 -> 0 |
+| `gate_b_preflight` | PASS (historical 145 boundary) | PASS |
+| Root / secondary / integrated static preflights | PASS; integrated 143/143 | PASS |
+| Android ARM64 harness syntax (`authentic_run.cpp`) | PASS | — |
+
+The new preflight reports mapping `07AEBFC052075330`, parent `48120EDC4D3D4466`, child `322795BF56BE60B6`, child 115, total 186, boundary 188, child stop `002B38A7`, data imports 322/324 and `AUTH_RUN_GENERATED_CHECK=PASS`. The old 144 evidence remains in `.local/ios-port/phase2d19-authentic-run/` and `.local/ios-port/phase2d20-second-authentic-run/`; the 2D-21 logs are in `.local/ios-port/phase2d21-start-routine/`.
+
+### Gates and third-run decision
+
+| Gate | Result | Scope |
+|---|---|---|
+| A — authentic preparation | **GO** | image, kernel data, mappings, manifests, assessment |
+| B — the new 186-instruction boundary | **NO-GO for execution; static/synthetic ready** | separate authorisation required; run driver not committed |
+| C — authentic startup | **NO-GO** | all later start-routine calls, 867 initializers, retail SEH, ordinal 258, list callback, `001C8C20`, CLI/STI and protection |
+
+A third authentic run is **technically justified** only for exactly the 186-instruction boundary, with the kernel data initialised, the two data import slots patched, the KPRCB/physical zero preconditions observed, both prescribed stops, kernels 255/187/277/294, live SEH/TLS, and clean accounting. It requires separate user approval. It would not be Gate C.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

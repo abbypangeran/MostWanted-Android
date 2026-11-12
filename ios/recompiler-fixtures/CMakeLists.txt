@@ -487,6 +487,7 @@ add_executable(authentic_run_tests
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
     ${XBE_SDK}/runtime/kernel/threads.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_data_init.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
     ${XBE_SDK}/runtime/xbe/image_loader.cpp
     ${AUTHENTIC_RUN_FIXTURE_GENERATED_SOURCE}

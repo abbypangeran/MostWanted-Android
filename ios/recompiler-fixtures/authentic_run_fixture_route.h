@@ -77,9 +77,100 @@ inline constexpr Step kChildRoute[] = {
 };
 inline constexpr size_t kChildRouteCount = sizeof(kChildRoute) / sizeof(kChildRoute[0]);
 
+inline constexpr Step kChildContinuationRoute[] = {
+    {0x00011100u, 5, StepKind::kSequential, 0x00011105u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "push 0x18"},
+    {0x00011105u, 5, StepKind::kSequential, 0x0001110Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "push 0x13010"},
+    {0x0001110Au, 5, StepKind::kCall, 0x0001110Fu, 0x00011200u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "call 0x11200"},
+    {0x00011200u, 5, StepKind::kSequential, 0x00011205u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "push 0x11290"},
+    {0x00011205u, 6, StepKind::kSequential, 0x0001120Bu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov eax, fs:[0x00000000]"},
+    {0x0001120Bu, 1, StepKind::kSequential, 0x0001120Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "push eax"},
+    {0x0001120Cu, 4, StepKind::kSequential, 0x00011210u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov eax, [esp+0x10]"},
+    {0x00011210u, 4, StepKind::kSequential, 0x00011214u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov [esp+0x10], ebp"},
+    {0x00011214u, 4, StepKind::kSequential, 0x00011218u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "lea ebp, [esp+0x10]"},
+    {0x00011218u, 2, StepKind::kSequential, 0x0001121Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "sub esp, eax"},
+    {0x0001121Au, 1, StepKind::kSequential, 0x0001121Bu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "push ebx"},
+    {0x0001121Bu, 1, StepKind::kSequential, 0x0001121Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "push esi"},
+    {0x0001121Cu, 1, StepKind::kSequential, 0x0001121Du, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "push edi"},
+    {0x0001121Du, 3, StepKind::kSequential, 0x00011220u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov eax, [ebp-0x08]"},
+    {0x00011220u, 3, StepKind::kSequential, 0x00011223u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov [ebp-0x18], esp"},
+    {0x00011223u, 1, StepKind::kSequential, 0x00011224u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "push eax"},
+    {0x00011224u, 3, StepKind::kSequential, 0x00011227u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov eax, [ebp-0x04]"},
+    {0x00011227u, 7, StepKind::kSequential, 0x0001122Eu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov dword ptr [ebp-0x04], 0xFFFFFFFF"},
+    {0x0001122Eu, 3, StepKind::kSequential, 0x00011231u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov [ebp-0x08], eax"},
+    {0x00011231u, 3, StepKind::kSequential, 0x00011234u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "lea eax, [ebp-0x10]"},
+    {0x00011234u, 6, StepKind::kSequential, 0x0001123Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "mov fs:[0x00000000], eax"},
+    {0x0001123Au, 1, StepKind::kRet, 0x0001110Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSehPrologue, "ret"},
+    {0x0001110Fu, 4, StepKind::kSequential, 0x00011113u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "and dword ptr [ebp-0x04], 0x00"},
+    {0x00011113u, 6, StepKind::kSequential, 0x00011119u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "mov eax, fs:[0x28]"},
+    {0x00011119u, 3, StepKind::kSequential, 0x0001111Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "mov edx, [eax+0x28]"},
+    {0x0001111Cu, 3, StepKind::kSequential, 0x0001111Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "lea ecx, [edx+4]"},
+    {0x0001111Fu, 2, StepKind::kSequential, 0x00011121u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "mov [edx], ecx"},
+    {0x00011121u, 5, StepKind::kSequential, 0x00011126u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "push 0x13020"},
+    {0x00011126u, 6, StepKind::kKernelCall, 0x0001112Cu, 0x00000000u, 0x00014008u, 0x80000115u, 277, 1, false, Segment::kSystemRoutine, "call [0x14008]"},
+    {0x0001112Cu, 5, StepKind::kSequential, 0x00011131u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "push 0x13020"},
+    {0x00011131u, 6, StepKind::kKernelCall, 0x00011137u, 0x00000000u, 0x0001400Cu, 0x80000126u, 294, 1, false, Segment::kSystemRoutine, "call [0x1400C]"},
+    {0x00011137u, 3, StepKind::kSequential, 0x0001113Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "mov edx, [ebp+0x08]"},
+    {0x0001113Au, 3, StepKind::kSequential, 0x0001113Du, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "push [ebp+0x0C]"},
+    {0x0001113Du, 2, StepKind::kCall, 0x0001113Fu, 0x00011280u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kSystemRoutine, "call edx"},
+    {0x0011280u, 5, StepKind::kSequential, 0x0011285u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kStartRoutine, "mov eax, 0xDEADBEEF"},
+    {0x0011285u, 1, StepKind::kRet, 0x001113Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kStartRoutine, "ret"},
+};
+inline constexpr size_t kChildContinuationCount = sizeof(kChildContinuationRoute) / sizeof(kChildContinuationRoute[0]);
+inline constexpr uint32_t kChildContinuationStop = 0x001113F;
+inline constexpr uint32_t kChildContinuationExecuted = 36;
+inline constexpr uint32_t kChildContinuationTrapEntries[] = {kChildContinuationStop, kernel::authentic::route::kSehHandler};
+
+inline constexpr Step kVersionCallerRoute[] = {
+    {0x0011500u, 5, StepKind::kCall, 0x0011505u, 0x0011520u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "call 0x0011520"},
+    {0x00011520u, 5, StepKind::kSequential, 0x00011525u, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov eax, [0x0013030]"},
+    {0x00011525u, 4, StepKind::kSequential, 0x00011529u, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "movzx ecx, word ptr [eax+0x04]"},
+    {0x00011529u, 6, StepKind::kSequential, 0x0001152Fu, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp ecx, 0x16CE"},
+    {0x0001152Fu, 2, StepKind::kConditional, 0x00011531u, 0x00011554u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "jne 0x0011554"},
+    {0x00011531u, 6, StepKind::kSequential, 0x00011537u, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov eax, fs:[0x00000020]"},
+    {0x00011537u, 7, StepKind::kSequential, 0x0001153Eu, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp dword ptr [eax+0x250], 0x00"},
+    {0x0001153Eu, 2, StepKind::kConditional, 0x00011540u, 0x00011554u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "jne 0x0011554"},
+    {0x00011540u, 5, StepKind::kSequential, 0x00011545u, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov eax, [0x8001003C]"},
+    {0x00011545u, 5, StepKind::kSequential, 0x0001154Au, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov [0x001303C], eax"},
+    {0x0001154Au, 5, StepKind::kSequential, 0x0001154Fu, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov eax, [0x8000FFF0]"},
+    {0x0001154Fu, 5, StepKind::kSequential, 0x00011554u, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov [0x001304C], eax"},
+    {0x00011554u, 1, StepKind::kRet, 0x00011505u, 00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "ret"},
+};
+inline constexpr size_t kVersionCallerCount = sizeof(kVersionCallerRoute) / sizeof(kVersionCallerRoute[0]);
+inline constexpr uint32_t kVersionCallerEntry = 0x0011500;
+inline constexpr uint32_t kVersionCallerStop = 0x0011505;
+inline constexpr uint32_t kVersionCallerExecuted = 13;
+inline constexpr uint32_t kVersionCallerTrapEntries[] = {kVersionCallerStop, 0x0011554};
+
+inline constexpr Step kCliRoute[] = {
+    {0x0011580u, 1, StepKind::kSequential, 0x0011581u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cli"},
+};
+inline constexpr size_t kCliCount = 1;
+inline constexpr uint32_t kCliEntry = 0x0011580;
+inline constexpr uint32_t kCliStop = 0x0011581;
+inline constexpr uint32_t kCliExecuted = 1;
+inline constexpr uint32_t kCliTrapEntries[] = {kCliStop};
+
+inline constexpr Step kStiRoute[] = {
+    {0x0011582u, 1, StepKind::kSequential, 0x0011583u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "sti"},
+};
+inline constexpr size_t kStiCount = 1;
+inline constexpr uint32_t kStiEntry = 0x0011582;
+inline constexpr uint32_t kStiStop = 0x0011583;
+inline constexpr uint32_t kStiExecuted = 1;
+inline constexpr uint32_t kStiTrapEntries[] = {kStiStop};
+
+inline constexpr uint32_t kVersionPointer = 0x0013030;
+inline constexpr uint32_t kVersionMarker = 0x0013038;
+inline constexpr uint32_t kPhysicalMarker = 0x001303C;
+inline constexpr uint32_t kVersionStruct = 0x0013040;
+inline constexpr uint32_t kVersionBuild = 0x0013044;
+inline constexpr uint32_t kHardwareFlags = 0x0013048;
+inline constexpr uint32_t kInitMarker = 0x001304C;
+
 inline constexpr uint32_t kParentEntry = 0x0011000;
 inline constexpr uint32_t kParentStop = 0x0011056;
 inline constexpr uint32_t kChildEntry = 0x0011100;
+inline constexpr uint32_t kChildStart = 0x0011280;
 inline constexpr uint32_t kChildStop = 0x0011280;
 inline constexpr uint32_t kSehCall = 0x001110A;
 inline constexpr uint32_t kSehEntry = 0x0011200;

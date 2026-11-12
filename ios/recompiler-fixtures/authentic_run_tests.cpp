@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -79,6 +80,7 @@ run::RouteManifest ChildManifest() {
     manifest.entry = fixture::kChildEntry;
     manifest.stop = fixture::kChildStop;
     manifest.executed_instructions = fixture::kChildExecutedInstructions;
+    manifest.start_routine = fixture::kChildStart;
     manifest.trap_entries = fixture::kChildTrapEntries;
     manifest.trap_count = 2;
     manifest.seh_call = fixture::kSehCall;
@@ -114,6 +116,67 @@ run::RouteManifest RetImmManifest() {
     manifest.stop = fixture::kRetImmStop;
     manifest.executed_instructions = fixture::kRetImmExecutedInstructions;
     manifest.trap_entries = fixture::kRetImmTrapEntries;
+    manifest.trap_count = 1;
+    manifest.identity = run::ManifestIdentity(manifest);
+    return manifest;
+}
+
+run::RouteManifest ChildContinuationManifest() {
+    run::RouteManifest manifest;
+    manifest.steps = fixture::kChildContinuationRoute;
+    manifest.count = fixture::kChildContinuationCount;
+    manifest.entry = fixture::kChildEntry;
+    manifest.stop = fixture::kChildContinuationStop;
+    manifest.executed_instructions = fixture::kChildContinuationExecuted;
+    manifest.start_routine = fixture::kChildStart;
+    manifest.trap_entries = fixture::kChildContinuationTrapEntries;
+    manifest.trap_count = 2;
+    manifest.seh_call = fixture::kSehCall;
+    manifest.seh_entry = fixture::kSehEntry;
+    manifest.seh_handler = fixture::kSehHandler;
+    manifest.seh_scope_table = fixture::kSehScopeTable;
+    manifest.seh_scope_bytes = fixture::kSehScopeBytes;
+    manifest.seh_scope_flag = fixture::kSehScopeFlag;
+    manifest.tls_block_size = fixture::kTlsBlockSize;
+    manifest.critical_section_object = fixture::kCriticalSectionObject;
+    manifest.identity = run::ManifestIdentity(manifest);
+    return manifest;
+}
+
+run::RouteManifest VersionCallerManifest() {
+    run::RouteManifest manifest;
+    manifest.steps = fixture::kVersionCallerRoute;
+    manifest.count = fixture::kVersionCallerCount;
+    manifest.entry = fixture::kVersionCallerEntry;
+    manifest.stop = fixture::kVersionCallerStop;
+    manifest.executed_instructions = fixture::kVersionCallerExecuted;
+    manifest.trap_entries = fixture::kVersionCallerTrapEntries;
+    manifest.trap_count = 2;
+    manifest.identity = run::ManifestIdentity(manifest);
+    return manifest;
+}
+
+run::RouteManifest CliManifest() {
+    run::RouteManifest manifest;
+    manifest.steps = fixture::kCliRoute;
+    manifest.count = fixture::kCliCount;
+    manifest.entry = fixture::kCliEntry;
+    manifest.stop = fixture::kCliStop;
+    manifest.executed_instructions = fixture::kCliExecuted;
+    manifest.trap_entries = fixture::kCliTrapEntries;
+    manifest.trap_count = 1;
+    manifest.identity = run::ManifestIdentity(manifest);
+    return manifest;
+}
+
+run::RouteManifest StiManifest() {
+    run::RouteManifest manifest;
+    manifest.steps = fixture::kStiRoute;
+    manifest.count = fixture::kStiCount;
+    manifest.entry = fixture::kStiEntry;
+    manifest.stop = fixture::kStiStop;
+    manifest.executed_instructions = fixture::kStiExecuted;
+    manifest.trap_entries = fixture::kStiTrapEntries;
     manifest.trap_count = 1;
     manifest.identity = run::ManifestIdentity(manifest);
     return manifest;
@@ -311,12 +374,14 @@ struct RouteRun {
 };
 
 RouteRun RunSyntheticRoute(const Fixture& fixture, const run::RouteManifest& manifest, uint32_t instruction_budget,
-                           uint32_t transfer_budget, uint32_t kernel_budget, uint32_t maximum_depth) {
+                           uint32_t transfer_budget, uint32_t kernel_budget, uint32_t maximum_depth,
+                           const std::function<void(kernel::Thread&)>& setup = {}) {
     WaitForQuiescence();
     RouteRun result;
     if (kernel::PrepareSystemThreadEx(0, 0x10000, 0x94, 0, manifest.entry, 0, false, 0, result.thread) !=
         kernel::kSuccess)
         return result;
+    if (setup) setup(*result.thread);
     result.start = run::AuthorizeSyntheticRouteForThread(
         result.thread.get(), manifest, fixture.sha1.c_str(), dispatch::MappingIdentity(),
         dispatch::CallLease().Generation(), mem::Generation(), instruction_budget, transfer_budget, kernel_budget,
@@ -384,6 +449,22 @@ int main() {
         return 1;
     }
     const mem::Stats allocation_baseline = mem::Query();
+    auto read_guest32 = [](uint32_t address) {
+        uint32_t value = 0;
+        mem::Read(address, &value, sizeof(value));
+        return value;
+    };
+    auto set_version_data = [](uint32_t build, uint32_t physical, uint32_t init) {
+        const uint32_t pointer = fixture::kVersionStruct;
+        mem::Write(fixture::kVersionPointer, &pointer, sizeof(pointer));
+        mem::Write(fixture::kVersionBuild, &build, sizeof(build));
+        const uint32_t zero = 0;
+        mem::Write(fixture::kVersionMarker, &zero, sizeof(zero));
+        mem::Write(fixture::kPhysicalMarker, &zero, sizeof(zero));
+        mem::Write(fixture::kInitMarker, &zero, sizeof(zero));
+        mem::Write(0x8001003C, &physical, sizeof(physical));
+        mem::Write(0x8000FFF0, &init, sizeof(init));
+    };
     {
         ResetData();
         const Started started = StartParent(fixture);
@@ -821,6 +902,82 @@ int main() {
                   child.status == run::Status::kStopped,
               "the stack mutation does not disturb either reviewed stop");
         std::printf("stack mutation decommit=%d\n", g_stack_mutation_status.load());
+    }
+    {
+        ResetData();
+        const run::RouteManifest continuation = ChildContinuationManifest();
+        const Started started = StartParent(fixture, fixture::kChildContinuationExecuted, &continuation);
+        Check(started.status == run::Status::kReady, "extended child continuation is authorised");
+        JoinThread(started.parent);
+        const bool child_done = WaitForRole(run::Role::kChild);
+        const bool parent_done = WaitForRole(run::Role::kParent);
+        run::RunEvidence parent, child;
+        const bool have_parent = run::EvidenceForRole(run::Role::kParent, &parent);
+        const bool have_child = run::EvidenceForRole(run::Role::kChild, &child);
+        Check(child_done && parent_done && have_parent && have_child, "continuation workers leave evidence");
+        std::printf("continuation child status=%s ins=%u stop=%08X at=%d seh=%d tls=%d parent=%s\n",
+                    run::StatusName(child.status), child.instructions, child.stop_pc, child.at_stop,
+                    child.seh_verified, child.tls_verified, run::StatusName(parent.status));
+        Check(child.status == run::Status::kStopped && child.instructions == fixture::kChildContinuationExecuted &&
+                  child.stop_pc == fixture::kChildContinuationStop && child.at_stop,
+              "the first start-routine call returns and stops before the next instruction");
+        Check(child.seh_verified && child.seh_registration != 0 && child.tls_verified && child.tls != 0,
+              "SEH and TLS remain valid at the extended stop");
+        const run::TraceRecord* stop = FindTrace(child, run::Role::kChild, run::EventKind::kStop);
+        Check(stop && stop->eax == 0xDEADBEEF, "the called start routine's return value is preserved at the stop");
+    }
+    {
+        ResetData();
+        set_version_data(0x16CE, 0x12345678, 0x89ABCDEF);
+        const RouteRun run = RunSyntheticRoute(fixture, VersionCallerManifest(), 13, 64, 4, 4);
+        Check(run.have && run.evidence.status == run::Status::kStopped &&
+                  run.evidence.stop_pc == fixture::kVersionCallerStop,
+              "the reviewed 5838 hardware/version branch reaches the post-call stop");
+        Check(read_guest32(fixture::kPhysicalMarker) == 0x12345678 &&
+                  read_guest32(fixture::kInitMarker) == 0x89ABCDEF,
+              "the physical-window reads deliver the checked 8001003C and 8000FFF0 values");
+        Check(read_guest32(0xF001003C) == 0x12345678 && read_guest32(0xF000FFF0) == 0x89ABCDEF,
+              "the checked physical alias 0xF0000000 observes the same backing values");
+    }
+    {
+        ResetData();
+        set_version_data(0x16CF, 0, 0);
+        const RouteRun run = RunSyntheticRoute(fixture, VersionCallerManifest(), 13, 64, 4, 4);
+        Check(run.have && run.evidence.status == run::Status::kForbiddenBranch,
+              "an unreviewed build stops at the version branch before reading KPRCB or physical memory");
+    }
+    {
+        ResetData();
+        set_version_data(0x16CE, 0, 0);
+        const RouteRun run = RunSyntheticRoute(fixture, VersionCallerManifest(), 13, 64, 4, 4,
+                                                [](kernel::Thread& thread) {
+                                                    const uint32_t one = 1;
+                                                    mem::Write(thread.kpcr + 0x278, &one, sizeof(one));
+                                                });
+        Check(run.have && run.evidence.status == run::Status::kForbiddenBranch,
+              "a non-null KPRCB+0x250 stops before the physical probe");
+    }
+    {
+        ResetData();
+        const RouteRun cli = RunSyntheticRoute(fixture, CliManifest(), 1, 8, 1, 1);
+        const RouteRun sti = RunSyntheticRoute(fixture, StiManifest(), 1, 8, 1, 1);
+        Check(cli.have && cli.evidence.status == run::Status::kUnsupportedInstruction,
+              "CLI remains a checked trap on the proposed boundary");
+        Check(sti.have && sti.evidence.status == run::Status::kUnsupportedInstruction,
+              "STI remains a checked trap on the proposed boundary");
+    }
+    {
+        run::AuthenticKernelData data;
+        const run::Status prepared = run::PrepareAuthenticKernelData(&data);
+        Check(prepared == run::Status::kReady && data.hardware_info != 0 && data.kernel_version != 0,
+              "the reviewed kernel data registers valid hardware/version addresses");
+        Check(data.hardware_flags == 0x20 && data.build == 5838,
+              "the production XboxHardwareInfo flags and XboxKrnlVersion build are initialised");
+        Check(kernel::DataAddress(322) == data.hardware_info && kernel::DataAddress(324) == data.kernel_version,
+              "the import data addresses resolve to the initialised kernel data");
+        Check(read_guest32(data.hardware_info) == 0x20 &&
+                  (read_guest32(data.kernel_version + 4) & 0xFFFF) == 5838,
+              "the guest-visible hardware flags and build read back correctly");
     }
     {
         const mem::Stats final = mem::Query();

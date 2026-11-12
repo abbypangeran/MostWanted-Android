@@ -12,6 +12,7 @@
 // post-execution PC check is used.
 
 #include "kernel/authentic_run.h"
+#include "kernel/kernel_data_init.h"
 
 #include <algorithm>
 #include <atomic>
@@ -684,7 +685,7 @@ const RouteManifest& AuthenticParentManifest() {
                                        route::kParentStop, 0, 0, 0, 0, 0, 0, 0, 0),
         route::kParentTrapEntries,
         sizeof(route::kParentTrapEntries) / sizeof(route::kParentTrapEntries[0]),
-        0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
     };
     return manifest;
 }
@@ -699,7 +700,8 @@ const RouteManifest& AuthenticChildManifest() {
         route::ComputeManifestIdentity(route::kChildRoute, route::kChildRouteCount, route::kChildEntry,
                                        route::kChildStop, route::kSehCall, route::kSehEntry, route::kSehHandler,
                                        route::kSehScopeTable, route::kSehScopeBytes, route::kSehScopeFlag,
-                                       route::kTlsBlockSize, route::kCriticalSectionObject),
+                                       route::kTlsBlockSize, route::kCriticalSectionObject,
+                                       route::kChildStartRoutine),
         route::kChildTrapEntries,
         sizeof(route::kChildTrapEntries) / sizeof(route::kChildTrapEntries[0]),
         route::kSehCall,
@@ -710,6 +712,7 @@ const RouteManifest& AuthenticChildManifest() {
         route::kSehScopeFlag,
         route::kTlsBlockSize,
         route::kCriticalSectionObject,
+        route::kChildStartRoutine,
     };
     return manifest;
 }
@@ -718,11 +721,47 @@ uint64_t ManifestIdentity(const RouteManifest& manifest) {
     return route::ComputeManifestIdentity(manifest.steps, manifest.count, manifest.entry, manifest.stop,
                                           manifest.seh_call, manifest.seh_entry, manifest.seh_handler,
                                           manifest.seh_scope_table, manifest.seh_scope_bytes, manifest.seh_scope_flag,
-                                          manifest.tls_block_size, manifest.critical_section_object);
+                                          manifest.tls_block_size, manifest.critical_section_object,
+                                          manifest.start_routine);
 }
 
 uint64_t RuntimeMappingIdentity() { return dispatch::MappingIdentity(); }
 uint32_t RuntimeMappingCount() { return dispatch::MappingCount(); }
+
+Status PrepareAuthenticKernelData(AuthenticKernelData* data) {
+    if (data) *data = AuthenticKernelData{};
+    if (!mem::IsInitialized()) return Status::kShutdown;
+    const uint32_t launch = RegisterData(164, "LaunchDataPage", 4);
+    const uint32_t hardware = RegisterData(322, "XboxHardwareInfo", 8);
+    const uint32_t version = RegisterData(324, "XboxKrnlVersion", 8);
+    const uint32_t image_name = RegisterData(326, "XeImageFileName", 8 + 64);
+    const uint32_t disk_model = RegisterData(41, "HalDiskModelNumber", 8 + 48);
+    const uint32_t disk_serial = RegisterData(42, "HalDiskSerialNumber", 8 + 32);
+    const uint32_t cache_count = RegisterData(40, "HalDiskCachePartitionCount", 4);
+    const uint32_t smc_video = RegisterData(356, "HalBootSMCVideoMode", 4);
+    const uint32_t ide = RegisterData(357, "IdexChannelObject", 0x40);
+    const uint32_t debugger = RegisterData(89, "KdDebuggerNotPresent", 4);
+    const uint32_t increment = RegisterData(157, "KeTimeIncrement", 4);
+    if (!launch || !hardware || !version || !image_name || !disk_model || !disk_serial || !cache_count ||
+        !smc_video || !ide || !debugger || !increment)
+        return Status::kInternalError;
+    const KernelDataLayout layout{launch, hardware, version, image_name, disk_model, disk_serial, cache_count,
+                                  smc_video, ide, debugger, increment};
+    std::string error;
+    if (!InitializeKernelData(layout, error)) return Status::kInternalError;
+    uint32_t flags = 0;
+    uint16_t build = 0;
+    if (mem::Read(hardware, &flags, sizeof(flags)) != mem::AccessStatus::kOk ||
+        mem::Read(version + 4, &build, sizeof(build)) != mem::AccessStatus::kOk)
+        return Status::kMemoryViolation;
+    if (data) {
+        data->hardware_info = hardware;
+        data->kernel_version = version;
+        data->hardware_flags = flags;
+        data->build = build;
+    }
+    return Status::kReady;
+}
 
 Status AuthorizeRunForThread(Thread* thread, const AuthorizationPolicy& policy, RunAuthorization* authorization) {
     if (authorization) *authorization = RunAuthorization{};
@@ -1085,7 +1124,7 @@ Status BindChildThreadForRequest(const AuthenticSystemThreadRequest& request, co
         return Status::kInvalidRoute;
     const RouteManifest& child_manifest = *parent->child_manifest;
     if (request.thread_extension_size != 0 || request.reserved || (request.create_flags & 0xFFu) ||
-        request.tls_size != child_manifest.tls_block_size || request.start_routine != child_manifest.stop ||
+        request.tls_size != child_manifest.tls_block_size || request.start_routine != child_manifest.start_routine ||
         request.system_routine != child_manifest.entry || request.start_context != 0)
         return Status::kInvalidPolicy;
     if (!request.handle_out || mem::CheckAccess(request.handle_out, 4, mem::kRead | mem::kWrite) !=
@@ -1120,7 +1159,7 @@ Status BindChildThreadForRequest(const AuthenticSystemThreadRequest& request, co
     // start/system routines must equal the child manifest endpoints.
     if (uint64_t(child->stack_top) - child->tls != child_manifest.tls_block_size)
         return Status::kTlsViolation;
-    if (child->start_routine != child_manifest.stop || child->system_routine != child_manifest.entry)
+    if (child->start_routine != child_manifest.start_routine || child->system_routine != child_manifest.entry)
         return Status::kInvalidRoute;
     RunAuthorization authorization;
     AuthorizationPolicy policy;

@@ -9,7 +9,7 @@
 namespace kernel::authentic::route {
 
 enum class StepKind : uint8_t { kSequential, kConditional, kCall, kKernelCall, kRet };
-enum class Segment : uint8_t { kParentRoot, kSystemRoutine, kSehPrologue, kPreStartWalk, kStartCallSetup };
+enum class Segment : uint8_t { kParentRoot, kSystemRoutine, kSehPrologue, kPreStartWalk, kStartCallSetup, kStartRoutine, kHardwareProbe };
 
 struct Step {
     uint32_t pc;
@@ -176,13 +176,55 @@ inline constexpr Step kChildRoute[] = {
     {0x002B59B2u, 3, StepKind::kRet, 0x002B5C7Bu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kPreStartWalk, "ret 0x04", 0x04},
     {0x002B5C7Bu, 3, StepKind::kSequential, 0x002B5C7Eu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kStartCallSetup, "push [ebp+0x0C]"},
     {0x002B5C7Eu, 3, StepKind::kCall, 0x002B5C81u, 0x002B38A2u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kStartCallSetup, "call [ebp+0x08]"},
+    {0x002B38A2u, 5, StepKind::kCall, 0x002B38A7u, 0x002B58B8u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kStartRoutine, "call 0x002B58B8"},
+    {0x002B58B8u, 5, StepKind::kSequential, 0x002B58BDu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov eax, [0x003C9E34]"},
+    {0x002B58BDu, 2, StepKind::kSequential, 0x002B58BFu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov eax, [eax]"},
+    {0x002B58BFu, 6, StepKind::kSequential, 0x002B58C5u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov ecx, [0x003C9E3C]"},
+    {0x002B58C5u, 4, StepKind::kSequential, 0x002B58C9u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "movzx ecx, word ptr [ecx+0x04]"},
+    {0x002B58C9u, 2, StepKind::kSequential, 0x002B58CBu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "shr eax, 0x01"},
+    {0x002B58CBu, 2, StepKind::kSequential, 0x002B58CDu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "not al"},
+    {0x002B58CDu, 2, StepKind::kSequential, 0x002B58CFu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "and al, 0x01"},
+    {0x002B58CFu, 6, StepKind::kSequential, 0x002B58D5u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp ecx, 0xF68"},
+    {0x002B58D5u, 1, StepKind::kSequential, 0x002B58D6u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "push esi"},
+    {0x002B58D6u, 2, StepKind::kConditional, 0x002B58D8u, 0x002B5923u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "jz 0x002B5923"},
+    {0x002B58D8u, 6, StepKind::kSequential, 0x002B58DEu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp ecx, 0xFC2"},
+    {0x002B58DEu, 2, StepKind::kConditional, 0x002B58E0u, 0x002B5918u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "jz 0x002B5918"},
+    {0x002B58E0u, 6, StepKind::kSequential, 0x002B58E6u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp ecx, 0xFC7"},
+    {0x002B58E6u, 2, StepKind::kConditional, 0x002B58E8u, 0x002B5908u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "jz 0x002B5908"},
+    {0x002B58E8u, 6, StepKind::kSequential, 0x002B58EEu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp ecx, 0x12D0"},
+    {0x002B58EEu, 2, StepKind::kConditional, 0x002B58F0u, 0x002B5967u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "jle 0x002B5967"},
+    {0x002B58F0u, 6, StepKind::kSequential, 0x002B58F6u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp ecx, 0x12D2"},
+    {0x002B58F6u, 2, StepKind::kConditional, 0x002B58F8u, 0x002B5967u, 0x00000000u, 0x00000000u, 0, 0, true, Segment::kHardwareProbe, "jnle 0x002B5967"},
+    {0x002B5967u, 6, StepKind::kSequential, 0x002B596Du, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov eax, fs:[0x00000020]"},
+    {0x002B596Du, 7, StepKind::kSequential, 0x002B5974u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp dword ptr [eax+0x250], 0x00"},
+    {0x002B5974u, 1, StepKind::kSequential, 0x002B5975u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "pop esi"},
+    {0x002B5975u, 2, StepKind::kConditional, 0x002B5977u, 0x002B597Cu, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "jnz 0x002B597C"},
+    {0x002B5977u, 5, StepKind::kSequential, 0x002B5854u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "jmp 0x002B5854"},
+    {0x002B5854u, 1, StepKind::kSequential, 0x002B5855u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "push ebp"},
+    {0x002B5855u, 2, StepKind::kSequential, 0x002B5857u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov ebp, esp"},
+    {0x002B5857u, 1, StepKind::kSequential, 0x002B5858u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "push ecx"},
+    {0x002B5858u, 1, StepKind::kSequential, 0x002B5859u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "push ecx"},
+    {0x002B5859u, 5, StepKind::kSequential, 0x002B585Eu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov eax, [0x8001003C]"},
+    {0x002B585Eu, 5, StepKind::kSequential, 0x002B5863u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "mov edx, 0x7FFF0000"},
+    {0x002B5863u, 2, StepKind::kSequential, 0x002B5865u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "sub eax, edx"},
+    {0x002B5865u, 4, StepKind::kSequential, 0x002B5869u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "movzx ecx, word ptr [eax+0x06]"},
+    {0x002B5869u, 1, StepKind::kSequential, 0x002B586Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "push esi"},
+    {0x002B586Au, 4, StepKind::kSequential, 0x002B586Eu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "movzx esi, word ptr [eax+0x14]"},
+    {0x002B586Eu, 2, StepKind::kSequential, 0x002B5870u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "add esi, eax"},
+    {0x002B5870u, 3, StepKind::kSequential, 0x002B5873u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "lea ecx, [ecx+ecx*4]"},
+    {0x002B5873u, 4, StepKind::kSequential, 0x002B5877u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "lea eax, [esi+ecx*8-0x10]"},
+    {0x002B5877u, 6, StepKind::kSequential, 0x002B587Du, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "cmp dword ptr [eax], 0x54494E49"},
+    {0x002B587Du, 1, StepKind::kSequential, 0x002B587Eu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "pop esi"},
+    {0x002B587Eu, 2, StepKind::kConditional, 0x002B5880u, 0x002B58B6u, 0x00000000u, 0x00000000u, 0, 0, true, Segment::kHardwareProbe, "jnz 0x002B58B6"},
+    {0x002B58B6u, 1, StepKind::kSequential, 0x002B58B7u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "leave"},
+    {0x002B58B7u, 1, StepKind::kRet, 0x002B38A7u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "ret"},
 };
 inline constexpr size_t kChildRouteCount = sizeof(kChildRoute) / sizeof(kChildRoute[0]);
 
 inline constexpr uint32_t kParentEntry = 0x002B3916;
 inline constexpr uint32_t kParentStop = 0x002B3987;
 inline constexpr uint32_t kChildEntry = 0x002B5C0F;
-inline constexpr uint32_t kChildStop = 0x002B38A2;
+inline constexpr uint32_t kChildStop = 0x002B38A7;
 inline constexpr uint32_t kChildStartRoutine = 0x002B38A2;
 inline constexpr uint32_t kChildStartContext = 0;
 inline constexpr uint32_t kChildSystemRoutine = 0x002B5C0F;
@@ -205,20 +247,26 @@ inline constexpr uint32_t kSehScopeFlag = 0x00000000;
 inline constexpr uint32_t kCriticalSectionObject = 0x0046C8B0;
 inline constexpr uint32_t kTlsBlockSize = 0x94;
 inline constexpr uint32_t kParentExecutedInstructions = 71;
-inline constexpr uint32_t kChildExecutedInstructions = 73;
-inline constexpr uint32_t kTotalExecutedInstructions = 144;
+inline constexpr uint32_t kChildExecutedInstructions = 115;
+inline constexpr uint32_t kTotalExecutedInstructions = 186;
 inline constexpr uint32_t kParentBoundarySteps = 72;
-inline constexpr uint32_t kChildBoundarySteps = 74;
+inline constexpr uint32_t kChildBoundarySteps = 116;
+inline constexpr uint32_t kTotalBoundarySteps = 188;
 inline constexpr uint32_t kParentTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C};
-inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, kSehHandler, 0x002B5999, 0x002B59A1};
+inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, kSehHandler, 0x002B5999, 0x002B59A1,
+                                               0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,
+                                               0x002B5880, 0x002B597C};
 inline constexpr uint32_t kAllTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C,
-                                                kChildStop, kSehHandler, 0x002B5999, 0x002B59A1};
+                                                kChildStop, kSehHandler, 0x002B5999, 0x002B59A1,
+                                                0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,
+                                                0x002B5880, 0x002B597C};
 
 inline constexpr uint64_t ComputeManifestIdentity(const Step* steps, size_t count, uint32_t entry, uint32_t stop,
                                                  uint32_t seh_call = 0, uint32_t seh_entry = 0,
                                                  uint32_t seh_handler = 0, uint32_t seh_scope_table = 0,
                                                  uint32_t seh_scope_bytes = 0, uint32_t seh_scope_flag = 0,
-                                                 uint32_t tls_block_size = 0, uint32_t critical_section_object = 0) {
+                                                 uint32_t tls_block_size = 0, uint32_t critical_section_object = 0,
+                                                 uint32_t start_routine = 0) {
     if (!steps) return 0;
     uint64_t hash = 0xCBF29CE484222325ull;
     auto mix = [&hash](uint32_t value) {
@@ -252,6 +300,7 @@ inline constexpr uint64_t ComputeManifestIdentity(const Step* steps, size_t coun
     mix(seh_scope_flag);
     mix(tls_block_size);
     mix(critical_section_object);
+    mix(start_routine);
     return hash;
 }
 

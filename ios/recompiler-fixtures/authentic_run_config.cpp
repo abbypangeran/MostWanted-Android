@@ -48,18 +48,33 @@ int main(int argc, char** argv) {
     // Trap-only entries: they are present so the prepared-thread admission can
     // resolve the reviewed start routine and handler, but no route edge targets
     // them. The boundary gate refuses every transfer into them.
-    // Trap-only entries. The two stops and the SEH handler make the prepared
+    // Trap-only entries. The stops and the SEH handler make the prepared
     // start routine and handler resolvable; the forbidden branch arms make the
     // recompiler emit a checked edge for every reviewed conditional target so
     // the gate can classify and refuse it. None of these is ever executed.
-    EmitFunction(config, route::kParentStop, route::kParentStop + 1);
-    EmitFunction(config, 0x002B5CEC, 0x002B5CEC + 8);
-    EmitFunction(config, 0x002B3975, 0x002B3975 + 1);
-    EmitFunction(config, 0x002B276C, 0x002B276C + 1);
-    EmitFunction(config, route::kChildStop, route::kChildStop + 1);
-    EmitFunction(config, route::kSehHandler, route::kSehHandler + 1);
-    EmitFunction(config, 0x002B5999, 0x002B5999 + 4);
-    EmitFunction(config, 0x002B59A1, 0x002B59A1 + 3);
+    auto trap_length = [](uint32_t pc) -> uint32_t {
+        switch (pc) {
+            case route::kParentStop: return 1;
+            case route::kChildStop: return 1;
+            case route::kSehHandler: return 1;
+            case 0x002B5CEC: return 8;
+            case 0x002B3975: return 1;
+            case 0x002B276C: return 1;
+            case 0x002B5923: return 2;
+            case 0x002B5918: return 2;
+            case 0x002B5908: return 2;
+            case 0x002B58F8: return 2;
+            case 0x002B5880: return 3;
+            case 0x002B597C: return 1;
+            case 0x002B5999: return 4;
+            case 0x002B59A1: return 3;
+            default: return 0;
+        }
+    };
+    for (uint32_t pc : route::kAllTrapEntries) {
+        const uint32_t length = trap_length(pc);
+        if (length) EmitFunction(config, pc, pc + length);
+    }
     std::ofstream file(argv[1]);
     file << config.str();
     return file ? 0 : 1;

@@ -279,11 +279,7 @@ bool CheckGenerated(const std::string& directory) {
     std::set<uint32_t> expected;
     for (size_t i = 0; i < route::kParentRouteCount; ++i) expected.insert(route::kParentRoute[i].pc);
     for (size_t i = 0; i < route::kChildRouteCount; ++i) expected.insert(route::kChildRoute[i].pc);
-    expected.insert(route::kParentStop);
-    for (uint32_t pc : route::kParentTrapEntries) expected.insert(pc);
-    expected.insert(route::kChildStop);
-    expected.insert(route::kSehHandler);
-    for (uint32_t pc : route::kChildTrapEntries) expected.insert(pc);
+    for (uint32_t pc : route::kAllTrapEntries) expected.insert(pc);
     Record("AUTH_RUN_MAPPING_ENTRY_SET", entries == expected);
     g_lines.emplace_back("AUTH_RUN_MAPPING_ENTRIES=" + std::to_string(entries.size()) + "/" +
                          std::to_string(expected.size()));
@@ -355,7 +351,7 @@ int main(int argc, char** argv) {
                           route::kChildRoute, route::kChildRouteCount, route::kChildEntry, route::kChildStop,
                           route::kSehCall, route::kSehEntry, route::kSehHandler, route::kSehScopeTable,
                           route::kSehScopeBytes, route::kSehScopeFlag, route::kTlsBlockSize,
-                          route::kCriticalSectionObject)));
+                          route::kCriticalSectionObject, route::kChildStartRoutine)));
         g_lines.emplace_back(std::string("AUTH_RUN_PARENT_MANIFEST_IDENTITY=") + parent_identity);
         g_lines.emplace_back(std::string("AUTH_RUN_CHILD_MANIFEST_IDENTITY=") + child_identity);
     }
@@ -365,7 +361,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < route::kParentRouteCount; ++i)
         if (route::kParentRoute[i].next == route::kParentStop) parent_stop_edge = true;
     for (size_t i = 0; i < route::kChildRouteCount; ++i)
-        if (route::kChildRoute[i].kind == route::StepKind::kCall && route::kChildRoute[i].target == route::kChildStop)
+        if (route::kChildRoute[i].kind == route::StepKind::kRet && route::kChildRoute[i].next == route::kChildStop)
             child_stop_edge = true;
     Record("AUTH_RUN_PARENT_STOP_EDGE", parent_stop_edge);
     Record("AUTH_RUN_CHILD_STOP_EDGE", child_stop_edge);
@@ -381,13 +377,16 @@ int main(int argc, char** argv) {
     Record("AUTH_RUN_SCOPE_EMPTY", scope_first == 0xFFFFFFFF);
     // The reviewed import slots and the exact call-site encodings.
     uint32_t enter_slot = 0, leave_slot = 0, create_slot = 0, close_slot = 0;
+    uint32_t hardware_slot = 0, version_slot = 0;
     const bool slots_ok = image.Read32(0x003C9E44, enter_slot) && image.Read32(0x003C9E40, leave_slot) &&
-                          image.Read32(0x003C9E68, create_slot) && image.Read32(0x003C9D4C, close_slot);
+                          image.Read32(0x003C9E68, create_slot) && image.Read32(0x003C9D4C, close_slot) &&
+                          image.Read32(0x003C9E34, hardware_slot) && image.Read32(0x003C9E3C, version_slot);
     Record("AUTH_RUN_IMPORT_SLOTS", slots_ok && enter_slot == 0x80000115 && leave_slot == 0x80000126 &&
                                         create_slot == 0x800000FF && close_slot == 0x800000BB);
+    Record("AUTH_RUN_DATA_IMPORT_SLOTS", slots_ok && hardware_slot == 0x80000142 && version_slot == 0x80000144);
     // The three trap-only entries must decode to the reviewed lengths.
     bool traps_ok = true;
-    for (uint32_t pc : {route::kParentStop, route::kChildStop, route::kSehHandler}) {
+    for (uint32_t pc : route::kAllTrapEntries) {
         ZydisDecodedInstruction instruction;
         ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
         std::string text;

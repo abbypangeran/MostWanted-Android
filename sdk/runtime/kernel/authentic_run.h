@@ -85,6 +85,7 @@ struct RouteManifest {
     uint32_t seh_scope_flag = 0xFFFFFFFFu;  // reviewed [E] value at the stop
     uint32_t tls_block_size = 0;         // 0 if the route does not initialise TLS
     uint32_t critical_section_object = 0;  // reviewed 277/294 object, 0 if none
+    uint32_t start_routine = 0;          // the thread start routine this route serves, 0 if none
 };
 
 const RouteManifest& AuthenticParentManifest();
@@ -284,6 +285,18 @@ Status BindChildThreadForRequest(const AuthenticSystemThreadRequest& request, co
 // registers exact, checked implementations for ordinals 255, 187, 277 and 294;
 // no other export is replaced or given a fabricated result.
 Status InstallHarnessKernelExports();
+// Registers and initialises the reviewed production kernel data used by the
+// start routine's hardware/version selector. It writes only the reviewed
+// InitializeKernelData values and returns their addresses; no guest
+// instruction executes. The caller must patch the image's data import slots
+// 003C9E34/003C9E3C to hardware_info/kernel_version before the reviewed run.
+struct AuthenticKernelData {
+    uint32_t hardware_info = 0;
+    uint32_t kernel_version = 0;
+    uint32_t hardware_flags = 0;
+    uint32_t build = 0;
+};
+Status PrepareAuthenticKernelData(AuthenticKernelData* data);
 // The kernel call currently crossing the gate on this worker, for the ordinal
 // 255 bridge's call-site binding. False outside a reviewed kernel call.
 bool PendingKernelCall(uint32_t ordinal, uint32_t& call_pc, uint32_t& return_pc);
