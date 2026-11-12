@@ -479,8 +479,10 @@ FullRun RunFullRoute(const Fixture& fixture, uint32_t parent_transfer = full::kP
                      uint32_t parent_instructions = full::kParentExecutedInstructions,
                      uint32_t child_instructions = full::kChildExecutedInstructions,
                      const run::RouteManifest* child = nullptr,
-                     const run::RouteManifest* parent = nullptr) {
+                     const run::RouteManifest* parent = nullptr,
+                     const std::function<void()>& setup = {}) {
     ResetFullData();
+    if (setup) setup();
     FullRun result;
     result.started = StartFullParent(fixture, parent_transfer, child_transfer, parent_instructions,
                                      child_instructions, child, parent);
@@ -507,6 +509,14 @@ bool TraceHasInstructionAt(const run::RunEvidence& evidence, run::Role role, uin
         if (record && record->event == uint8_t(run::EventKind::kInstructionEntry) && record->pc == pc) return true;
     }
     return false;
+}
+
+uint32_t ChildKernelPc(uint32_t ordinal) {
+    for (size_t i = 0; i < full::kChildRouteCount; ++i)
+        if (full::kChildRoute[i].kind == route::StepKind::kKernelCall &&
+            full::kChildRoute[i].ordinal == ordinal)
+            return full::kChildRoute[i].pc;
+    return 0;
 }
 
 bool AcceptFullRoute(const Fixture& fixture, const FullRun& run, const run::RouteManifest& parent,
@@ -643,6 +653,38 @@ void CaptureTlsReference(X86Context&) {
     g_tls_reference_self = ok ? pointer : 0;
     g_tls_reference_hash = ok ? TlsHash(block.data(), size) : 0;
     g_tls_reference_read_ok = ok;
+}
+
+std::atomic<uint32_t> g_cont_esp{0};
+std::atomic<uint32_t> g_cont_ebp{0};
+std::atomic<uint32_t> g_cont_eax{0};
+std::atomic<uint32_t> g_cont_arg0{0};
+std::atomic<uint32_t> g_cont_arg1{0};
+std::atomic<uint32_t> g_cont_arg2{0};
+std::atomic<uint32_t> g_cont_arg3{0};
+std::atomic<uint32_t> g_cont_arg4{0};
+std::atomic<bool> g_cont_read_ok{false};
+std::atomic<bool> g_cont_flags_ok{false};
+
+// Fires at the final reviewed instruction (push 0x11) before it executes. The
+// four arguments already on the stack plus the immediate push are the exact
+// five-argument device-query frame; no device-query call is entered.
+void CaptureContinuationState(X86Context& ctx) {
+    uint32_t args[4] = {};
+    bool ok = mem::Read(ctx.esp, args, sizeof(args)) == mem::AccessStatus::kOk;
+    uint32_t timer_e8 = 1, timer_ec = 1;
+    ok = ok && mem::Read(full::kDebe8, &timer_e8, sizeof(timer_e8)) == mem::AccessStatus::kOk &&
+         mem::Read(full::kDebec, &timer_ec, sizeof(timer_ec)) == mem::AccessStatus::kOk;
+    g_cont_esp = ctx.esp;
+    g_cont_ebp = ctx.ebp;
+    g_cont_eax = ctx.eax;
+    g_cont_arg0 = 0x11u;
+    g_cont_arg1 = args[0];
+    g_cont_arg2 = args[1];
+    g_cont_arg3 = args[2];
+    g_cont_arg4 = args[3];
+    g_cont_read_ok = ok;
+    g_cont_flags_ok = ok && timer_e8 == 0 && timer_ec == 0;
 }
 
 // Test-only negative injections. They mutate the thread's TLS address or the
@@ -911,8 +953,20 @@ int main() {
         g_tls_reference_size = 0;
         g_tls_reference_hash = 0;
         g_tls_reference_read_ok = false;
+        g_cont_esp = 0;
+        g_cont_ebp = 0;
+        g_cont_eax = 0;
+        g_cont_arg0 = 0;
+        g_cont_arg1 = 0;
+        g_cont_arg2 = 0;
+        g_cont_arg3 = 0;
+        g_cont_arg4 = 0;
+        g_cont_read_ok = false;
+        g_cont_flags_ok = false;
+        run::SetInjectionHookForTest(run::Role::kChild, ChildKernelPc(113), CaptureTlsReference);
         run::SetInjectionHookForTest(run::Role::kChild,
-                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CaptureTlsReference);
+                                     full::kChildRoute[full::kChildRouteCount - 1].pc,
+                                     CaptureContinuationState);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.started.status == run::Status::kReady, "the full 224-instruction synthetic run is authorised");
@@ -999,6 +1053,32 @@ int main() {
               "the TLS snapshot matches the independent pre-stop reference");
         Check(run.parent.tls_evidence.status == run::TlsEvidenceStatus::kNotEvaluated,
               "a route without TLS leaves the snapshot not evaluated");
+        Check(g_cont_read_ok.load() && g_cont_flags_ok.load() && g_cont_ebp.load() != 0 &&
+                  g_cont_eax.load() == g_cont_ebp.load() - 0x0C &&
+                  g_cont_arg0.load() == 0x11u &&
+                  g_cont_arg1.load() == g_cont_ebp.load() - 0x0C &&
+                  g_cont_arg2.load() == g_cont_ebp.load() - 4 &&
+                  g_cont_arg3.load() == 4u && g_cont_arg4.load() == g_cont_ebp.load() - 8,
+              "the continuation prepares the exact five-argument stack and register state");
+        const run::TraceRecord* child_stop = FindTrace(run.child, run::Role::kChild, run::EventKind::kStop);
+        Check(child_stop && child_stop->esp == g_cont_esp.load() - 4 &&
+                  child_stop->ebp == g_cont_ebp.load() && child_stop->eax == g_cont_eax.load(),
+              "the terminal stop preserves ESP, EBP and EAX after the final push");
+        bool prohibited_kernels = true;
+        for (size_t i = 0; i < run.child.kernel_count; ++i) {
+            const run::KernelObservation* observation =
+                run::KernelObservationForRole(run::Role::kChild, i);
+            if (observation && (observation->ordinal == 24 || observation->ordinal == 301 ||
+                                observation->ordinal == 149))
+                prohibited_kernels = false;
+        }
+        for (size_t i = 0; i < run.child.trace_count; ++i) {
+            const run::TraceRecord* record = run::TraceForRole(run::Role::kChild, i);
+            if (record && record->event == uint8_t(run::EventKind::kKernelCall) &&
+                (record->ordinal == 24 || record->ordinal == 301 || record->ordinal == 149))
+                prohibited_kernels = false;
+        }
+        Check(prohibited_kernels, "the device query, timer scheduling and shutdown ordinals are never reached");
         bool seh_checks_ok = run.child.seh_check_count >= 14;
         for (size_t i = 0; i < run.child.seh_check_count; ++i) {
             const run::SehCheck& check = run.child.seh_checks[i];
@@ -1081,6 +1161,20 @@ int main() {
                   run.child.tls_evidence.status == run::TlsEvidenceStatus::kUnavailable &&
                   !run.child.tls_evidence.hash_recorded && run.child.tls_evidence.content_hash == 0,
               "an unavailable TLS pointer is reported without evidence");
+    }
+
+    {
+        const FullRun run = RunFullRoute(fixture, full::kParentRequiredTransfers, full::kChildRequiredTransfers,
+                                         full::kParentExecutedInstructions, full::kChildExecutedInstructions,
+                                         nullptr, nullptr, [] {
+                                             const uint32_t flags = 0x28u;
+                                             mem::Write(full::kDataPage + 0x500, &flags, sizeof(flags));
+                                         });
+        Check(run.have_child && run.child.status == run::Status::kForbiddenBranch && !run.child.at_stop,
+              "a taken alternate branch is refused at the reviewed conditional");
+        const uint32_t alternate = full::kChildRoute[144].target;
+        Check(!TraceHasInstructionAt(run.child, run::Role::kChild, alternate),
+              "the prohibited alternate target is never entered");
     }
 
     {

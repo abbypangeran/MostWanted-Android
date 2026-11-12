@@ -180,6 +180,12 @@ void EncodeStep(bool parent, size_t index, const route::Step& step, const SynthS
             EmitCallRel(bytes, pc, map(step.target));
             return;
         case route::StepKind::kConditional: {
+            if (!parent && index == 144) {
+                bytes.push_back(0x0F);
+                bytes.push_back(0x85);
+                Emit32(bytes, map(step.target) - (pc + 6));
+                return;
+            }
             const uint32_t expected = step.taken ? map(step.target) : pc + uint32_t(bytes.size() + 5);
             EmitJmp(bytes, pc, expected);
             return;
@@ -282,6 +288,9 @@ void EncodeStep(bool parent, size_t index, const route::Step& step, const SynthS
         case 118: Append(bytes, {0x83, 0xEC, 0x34}); return;
         case 124: EmitPushImm8(bytes, 1); return;
         case 126: EmitPushImm32(bytes, kFullShutdownObject); return;
+        case 130: bytes.push_back(0x55); return;
+        case 131: Append(bytes, {0x8B, 0xEC}); return;
+        case 132: Append(bytes, {0x83, 0xEC, 0x0C}); return;
         case 133: EmitPushImm32(bytes, kFullDpcContext); return;
         case 134: EmitPushImm32(bytes, kFullHandler); return;
         case 135: EmitPushImm32(bytes, kFullDpcObject); return;
@@ -289,6 +298,14 @@ void EncodeStep(bool parent, size_t index, const route::Step& step, const SynthS
         case 141: Append(bytes, {0x83, 0x25}); Emit32(bytes, kFullDebe8); bytes.push_back(0x00); return;
         case 142: Append(bytes, {0x83, 0x25}); Emit32(bytes, kFullDebec); bytes.push_back(0x00); return;
         case 143: Append(bytes, {0xF6, 0x00, 0x08}); return;
+        case 145: Append(bytes, {0x8D, 0x45, 0xF8}); return;
+        case 146: EmitPushReg(bytes, 0); return;
+        case 147: EmitPushImm8(bytes, 4); return;
+        case 148: Append(bytes, {0x8D, 0x45, 0xFC}); return;
+        case 149: EmitPushReg(bytes, 0); return;
+        case 150: Append(bytes, {0x8D, 0x45, 0xF4}); return;
+        case 151: EmitPushReg(bytes, 0); return;
+        case 152: EmitPushImm8(bytes, 0x11); return;
         case 137: EmitPushImm8(bytes, 0); return;
         case 138: EmitPushImm32(bytes, kFullTimerObject); return;
         default: EmitNop(bytes); return;

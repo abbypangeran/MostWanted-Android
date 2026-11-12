@@ -1,7 +1,7 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-28",
-  "milestone": "STARTUP_CONTINUATION_224",
+  "phase": "2D-28B",
+  "milestone": "SIXTH_RUN_PREPARATION_224",
   "result": "PASS",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
@@ -220,7 +220,7 @@
     "ios/recompiler-fixtures/CMakeLists.txt"
   ],
   "validation": {
-    "authentic_run_tests": "155 PASS / 0 FAIL, Debug and Release",
+    "authentic_run_tests": "160 PASS / 0 FAIL, Debug and Release",
     "checked_recompiler_fixtures": "812 PASS / 0 FAIL, Debug and Release",
     "safe_ctests": "5/5, Debug and Release (-E execution_probe)",
     "authentic_run_preflight": "PASS, 242/242",
@@ -380,7 +380,7 @@
   "authorises_authentic_execution": false,
   "r1_16": "ON_HOLD",
   "customer_release": "NOT_READY",
-  "baseline_head": "4b7aad616374d0ea45b7200a95fdb26f02448ff7",
+  "baseline_head": "912baa2aac4f9128353d8b17c6ef6c5090f28e16",
   "fourth_run": {
     "result": "EARLY_STOP",
     "authentic_run": true,
@@ -737,7 +737,7 @@
     "new_kernels": [],
     "acceptance_contract": "AcceptFullRoute in ios/recompiler-fixtures/authentic_run_tests.cpp",
     "tests": {
-      "authentic_run_tests": "155 PASS / 0 FAIL",
+      "authentic_run_tests": "160 PASS / 0 FAIL",
       "full_route": "71/153, 224/226, child kernels 5",
       "new_checks": "acceptance contract, extended flag clears, updated terminal/edge budgets"
     },
@@ -772,11 +772,93 @@
     "parent_manifest": "85527B8FA581229F",
     "child_manifest": "3440CAC0FC3A57FB",
     "requirements": [
-      "new experimental driver/admission generated for the new identities",
+      "prepared sixth driver/admission available locally for the reviewed identities",
       "one separate explicit authorisation",
       "stop before 002B5E5F; do not enter the device query or timer DPC",
       "no authentic callback authorisation",
-      "fresh preflight, prepare-only admission and cleanup"
+      "fresh preflight, prepare-only admission and cleanup",
+      "preserve the historical fifth-run FAIL evidence"
     ]
+  },
+  "phase_2d28b_sixth_run_preparation": {
+    "result": "PASS",
+    "authentic_execution": false,
+    "sixth_run_started": false,
+    "driver": "local only; never committed",
+    "activation": {
+      "macro": "AUTHENTIC_RUN_SIXTH_AUTHORISED",
+      "default": 0,
+      "target": "authentic_run_sixth_exec",
+      "patch": "reversible; restored; git apply --check PASS"
+    },
+    "admission": {
+      "image_sha1": "f636a16af04171089f879a4bed646e185c734233",
+      "mapping_identity": "94166820FBB48A28",
+      "mapping_entries": 242,
+      "parent_manifest": "85527B8FA581229F",
+      "child_manifest": "3440CAC0FC3A57FB",
+      "parent_instructions": 71,
+      "parent_transfers": 73,
+      "child_instructions": 153,
+      "child_transfers": 156,
+      "parent_stop": "0x002B3987",
+      "child_stop": "0x002B5E5F",
+      "kernels": {
+        "parent": [
+          255,
+          187
+        ],
+        "child": [
+          277,
+          294,
+          47,
+          107,
+          113
+        ]
+      },
+      "one_shot_token_generated": true,
+      "one_shot_token_committed": false
+    },
+    "preparation": {
+      "off_build": "AUTHORISATION=DISABLED",
+      "on_prepare_only": "AUTHORISATION=PERMITTED, parent=1 child=1 ceilings=2/5 cleanup=1 accounting=1",
+      "refused_without_start": [
+        "missing token",
+        "wrong token",
+        "missing explicit authorisation",
+        "off build with valid token",
+        "stale fifth admission",
+        "tampered child instructions",
+        "tampered child transfers",
+        "tampered child stop"
+      ]
+    },
+    "continuation_checks": [
+      "five-argument frame 0x11, [ebp-0x0C], [ebp-0x04], 4, [ebp-0x08]",
+      "eax == ebp-0x0C; terminal stop preserves ESP/EBP/EAX",
+      "timer flags 0x004EDBE8 and 0x004EDBEC are zero",
+      "conditional falls through 002B5E4F and never enters 002B5E7F",
+      "ordinals 24, 301 and 149 never reached",
+      "hardware flags 0x28 taken-branch negative fails with kForbiddenBranch"
+    ],
+    "evidence_separation": [
+      "route_completion",
+      "driver_acceptance"
+    ],
+    "fresh_validation": {
+      "authentic_run_tests": "160 PASS / 0 FAIL, Debug and Release",
+      "checked_recompiler_tests": "812 PASS / 0 FAIL, Debug and Release",
+      "safe_ctests": "5/5, Debug and Release (-E execution_probe)",
+      "authentic_run_preflight": "PASS, 242/242, Debug and Release",
+      "authentic_run_accounting": "1280 -> 0, Debug and Release",
+      "mostwanted_memory_tests": "454 PASS / 0 FAIL, Debug and Release",
+      "android_arm64_syntax": "PASS (authentic_run.cpp, kernel_objects.cpp)"
+    },
+    "gates": {
+      "gate_a_preparation": "GO",
+      "gate_b_224_continuation": "preparation READY; sixth execution NOT AUTHORISED",
+      "gate_c_authentic_startup": "NO-GO"
+    },
+    "evidence": ".local/ios-port/phase2d28b-sixth-prep/"
   }
 }

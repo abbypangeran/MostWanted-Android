@@ -4943,7 +4943,7 @@ unsupported instructions, kernel rejection, memory faults and TLS evidence-after
 
 | Check | Debug | Release |
 |---|---:|---:|
-| `authentic_run_tests` | 155 PASS / 0 FAIL | 155 PASS / 0 FAIL |
+| `authentic_run_tests` | 160 PASS / 0 FAIL | 160 PASS / 0 FAIL |
 | `checked_recompiler_tests` | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
 | Safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
 | `authentic_run_preflight --generated` | PASS, 242/242 | PASS, 242/242 |
@@ -4970,3 +4970,66 @@ must not authorise callbacks. It requires a new explicit authorisation; no run i
 by this phase.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-28B — sixth-run preparation for the 224-instruction route
+
+**`PHASE_2D28B_SIXTH_RUN_PREPARATION = PASS`** (offline preparation only). No authentic XBE instruction
+ran, the fifth run was not retried, no sixth run was started, and the historical evidence directories were
+not modified.
+
+### Reproducible local driver and admission
+
+A local experimental driver, never committed, was built twice from the same source: an off build with
+`AUTHENTIC_RUN_SIXTH_AUTHORISED=0` and an on build with the reversible local activation patch. The
+activation patch adds only the compile-time switch and the `authentic_run_sixth_exec` target; it was
+restored afterwards and `git apply --check` passes against the committed tree. The ordinary source keeps
+`kAuthenticExecutionAuthorised = false`.
+
+The sixth admission was generated independently from the Phase 2D-28 preflight (`242/242`,
+`AUTH_RUN_RESULT=PASS`) and the compiled route dump, with a fresh one-shot token that is not committed:
+mapping `94166820FBB48A28` (242), parent `85527B8FA581229F` (71/73), child `3440CAC0FC3A57FB` (153/156),
+stop `002B5E5F`, kernels parent `255,187` and child `277,294,47,107,113`. The generator requires every
+preflight, dump, route-header and reviewed-data-slot value to agree.
+
+The off build refuses the prepared admission (`AUTHORISATION=DISABLED`). The on build's prepare-only
+admission prepares and authorises both workers, cancels them without starting either, and cleans up
+(`AUTHORISATION=PERMITTED`, `parent=1 child=1 ceilings=2/5 cleanup=1 accounting=1`). Refusal negatives all
+fail closed without starting a worker: missing token, wrong token, missing explicit authorisation, off
+build with a valid token, stale fifth admission and tampered child instruction, transfer and stop values.
+
+### Continuation and evidence validation
+
+The synthetic mirror now checks the exact continuation state before the stop: the five-argument frame is
+`0x11`, `[ebp-0x0C]`, `[ebp-0x04]`, `0x04`, `[ebp-0x08]`; `eax` is `ebp-0x0C`; the terminal stop preserves
+`esp` after the final push with the same `ebp`/`eax`; both timer watchdog flags are zero; the reviewed
+conditional falls through to `002B5E4F` and never enters `002B5E7F`; and ordinals 24, 301 and 149 never
+appear in child observations or the trace. A taken-branch negative sets hardware flags to `0x28`, and the
+run fails closed with `kForbiddenBranch` without entering the alternate target.
+
+The driver keeps route completion separate from driver acceptance: completion is the parent/child
+terminal stops, instruction/transfer counts and kernel sequences; acceptance additionally requires the
+SEH/TLS snapshot, registration, kernel objects, continuation/stack/flags, conditional, prohibited-kernel,
+read-only evidence and cleanup checks. No authentic route completion is claimed or performed.
+
+### Fresh validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` | 160 PASS / 0 FAIL | 160 PASS / 0 FAIL |
+| `checked_recompiler_tests` | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, 242/242 | PASS, 242/242 |
+| `authentic_run_accounting` | 1280 -> 0 | 1280 -> 0 |
+| `mostwanted_memory_tests` | 454 PASS / 0 FAIL | 454 PASS / 0 FAIL |
+| Android ARM64 syntax (`authentic_run.cpp`, `kernel_objects.cpp`) | PASS | — |
+
+### Gates
+
+| Gate | Result | Scope |
+|---|---|---|
+| A — preparation | **GO** | image, mapping, manifests, budgets, evidence harness and sixth admission |
+| B — 224-instruction continuation | **preparation READY; sixth execution NOT AUTHORISED** | the driver and admission exist only locally; one separate explicit authorisation is required |
+| C — actual game startup | **NO-GO** | unchanged Gate C dependencies |
+
+The historical fifth run remains FAIL. No sixth run is authorised or performed by this phase. R1.16
+remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

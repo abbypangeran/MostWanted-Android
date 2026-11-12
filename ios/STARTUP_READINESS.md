@@ -270,10 +270,33 @@ The synthetic mirror retires 224 instructions in 226 boundary steps, checks the 
 existing kernel/SEH/TLS/stop conditions, the `AcceptFullRoute` acceptance contract, and all negative
 budget/identity/terminal/loop/unknown-transfer/unsupported/memory/TLS-lifecycle cases.
 
-Fresh Debug/Release: authentic tests 155/0, checked fixtures 812/0, safe CTests 5/5, preflight PASS 242/242,
+Fresh Debug/Release: authentic tests 160/0, checked fixtures 812/0, safe CTests 5/5, preflight PASS 242/242,
 accounting 1280 -> 0, memory tests 454/0, Android ARM64 syntax PASS.
 
 The historical `FIFTH_AUTHENTIC_RUN = FAIL` (211/211 completed, both stops, post-finalisation TLS evidence
 failure) is preserved and not converted. Gate A GO; Gate B for the new 224 boundary is static/synthetic
 READY with execution NO-GO pending a new driver/admission and separate authorisation; Gate C remains
 NO-GO. No authentic execution or sixth run was performed.
+
+## Phase 2D-28B — sixth-run preparation
+
+`PHASE_2D28B_SIXTH_RUN_PREPARATION = PASS` (offline preparation only).
+
+A reproducible local driver (never committed) was built off and on. The reversible activation patch adds
+`AUTHENTIC_RUN_SIXTH_AUTHORISED` (default 0) and `authentic_run_sixth_exec`; it was restored and
+`git apply --check` passes. The sixth admission agrees with the 2D-28 preflight (`242/242`) and the compiled
+route: mapping `94166820FBB48A28` (242), parent `85527B8FA581229F` (71/73), child `3440CAC0FC3A57FB`
+(153/156), stop `002B5E5F`, kernels 2/5. The off build refuses; the on build's prepare-only admission
+passes with cleanup and accounting, and every negative (missing/wrong token, missing explicit
+authorisation, off build, stale fifth admission, tampered instructions/transfers/stop) fails closed without
+starting a worker.
+
+The synthetic mirror checks the exact five-argument continuation stack, `eax = ebp-0x0C`, stop
+`esp`/`ebp`/`eax`, zero timer flags, the not-taken `002B5E4D` conditional (never `002B5E7F`), the absence of
+ordinals 24/301/149, and a `0x28` taken-branch negative that fails with `kForbiddenBranch` without entering
+the alternate target. Route completion remains separate from driver acceptance. No authentic instruction
+ran, the fifth run was not retried, no sixth run was started, and the historical evidence is unchanged.
+
+Fresh Debug/Release: authentic tests 160/0, checked fixtures 812/0, safe CTests 5/5, preflight PASS 242/242,
+accounting 1280 -> 0, memory tests 454/0, Android ARM64 syntax PASS. Gate A GO; Gate B is preparation
+READY with sixth execution NOT AUTHORISED; Gate C remains NO-GO.
