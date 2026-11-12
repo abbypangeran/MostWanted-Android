@@ -150,3 +150,15 @@ Validation: `mostwanted_memory_tests` 439 PASS / 0 FAIL including the new checke
 suite 95/0; checked fixtures 812/0; authentic preflight PASS 200/200; Android ARM64 `kernel_objects.cpp`
 syntax PASS. Gate A remains GO; the historical Gate B 186 is PASS; the proposed 210 boundary is NO-GO;
 Gate C remains NO-GO. A fourth authentic run is not technically justified yet.
+
+
+## Phase 2D-25 — shutdown registration
+
+`PHASE_2D25_SHUTDOWN_REGISTRATION = PARTIAL`.
+
+Ordinal-47 evidence: nxdk void ABI with two stdcall arguments; `HAL_SHUTDOWN_REGISTRATION` layout
+`NotificationRoutine +0`, `Priority +4`, `ListEntry +8`; local authentic object `0x0046CD30` contains
+`002B8D6D`, `80000000`, `{0,0}`; the call at `0x002B567B` registers with action `1`. No authoritative
+evidence was found for the kernel-private list head, ordering, duplicate/removal or shutdown consumption,
+and Cxbx has no implementation. The no-op is retained; no speculative list or callback was written. The
+210-instruction boundary remains ungenerated and NO-GO. A fourth authentic run is not justified.

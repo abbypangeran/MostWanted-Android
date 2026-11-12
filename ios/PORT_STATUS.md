@@ -4550,4 +4550,30 @@ ordinal 47 is unresolved. Gate C remains NO-GO. The next work must establish the
 ownership and shutdown-time lifetime before generating the 210 mapping/manifests. A fourth authentic run is
 not technically justified yet.
 
+
+## Phase 2D-25 — shutdown-registration evidence
+
+**`PHASE_2D25_SHUTDOWN_REGISTRATION = PARTIAL`.** No new authentic execution; the 186-instruction third-run
+PASS and the 107/113 checked objects remain the current verified state.
+
+### Ordinal-47 evidence
+
+- nxdk `xboxkrnl.h`: `VOID NTAPI HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION, BOOLEAN)`;
+  `HAL_SHUTDOWN_REGISTRATION` is `NotificationRoutine +0x00`, `Priority +0x04`, `ListEntry +0x08`
+  (`0x10` bytes).
+- RXDK `xboxkrnl.def`: `_HalRegisterShutdownNotification@8 @47 NONAME` (two stdcall arguments).
+- Local XBE object `0x0046CD30` (`.data`, flags `7`): `NotificationRoutine=0x002B8D6D`,
+  `Priority=0x80000000`, `ListEntry={0,0}`.
+- Authentic call `0x002B567B`: `0x0046CD30, 1` (register).
+- Cxbx-Reloaded's current source contains no implementation of this export; no independent runtime
+  behaviour for the kernel-private list head, ordering, duplicate/removal or shutdown consumption was found.
+
+### Result
+
+The ABI, object layout, object values and action semantics are established. The kernel-maintained list
+head and guest-visible linkage mutation are **not** established, so the no-op HLE is retained rather than
+replaced by a speculative host registry or fabricated list. The 210-instruction route was not generated.
+The mapping `07AEBFC052075330`, parent `48120EDC4D3D4466` and child `322795BF56BE60B6` remain the historical
+186-route identities.
+
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
