@@ -215,3 +215,29 @@ Gate A GO; Gate B is static/synthetic ready and execution NO-GO; Gate C NO-GO. A
 execution of the unchanged 211/213 route is technically justified only with a separate explicit
 authorisation and the 47/107/113 kernel-slot preparation; the temporary activation/driver is not committed
 by this phase and must use the 73/143 floors. It is not Gate C. Do not authorise it from this document.
+
+## Phase 2D-27C — TLS evidence lifecycle remediation
+
+`FIFTH_RUN_TLS_REMEDIATION = PASS` (offline only).
+
+The historical `FIFTH_AUTHENTIC_RUN = FAIL` is preserved. The fifth run completed 211/211 instructions,
+reached both stops (`002B3987`, `002B5E37`), completed seven reviewed kernel calls, and passed the
+stop-time TLS verification, but the driver re-read released TLS memory after child-worker finalisation,
+reported `pointer=00000000`/`read_only=0`, and hashed the unread zero buffer (`9D899E55`). The driver exited
+4. There was no retry.
+
+The corrected harness captures TLS evidence at the stop while the allocation is live: address,
+expected/self pointer, pointer and full-block checked-read status, block size and FNV-1a hash. The hash is
+recorded only after a successful full read; `TlsEvidenceStatus` distinguishes not-evaluated, valid,
+unavailable, read-failed and mismatch. `RunEvidence.tls_evidence` is host-owned and survives finalisation.
+The local corrected driver consumes that snapshot and never re-reads TLS guest memory after release; it was
+compiled in both builds and its prepare-only admission passed, but was not executed authentically.
+
+Fresh Debug/Release: `authentic_run_tests` 152/0 (8 new TLS lifecycle checks), checked fixtures 812/0,
+safe CTests 5/5, preflight PASS 225/225, accounting 1280 -> 0, memory tests 454/0, Android ARM64 syntax PASS.
+The full synthetic 71/140 route still retires 211 instructions in 213 boundary steps with unchanged
+instruction/transfer counts and kernel/SEH/stop conditions.
+
+Identities are unchanged: mapping `E9DFEF8BB5AC0970`, parent `85527B8FA581229F`, child
+`585C5E1A742B6924`. The fifth run remains closed as FAIL. No sixth run, authentic retry or Gate C
+activation is authorised by this phase.

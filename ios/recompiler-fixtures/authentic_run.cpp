@@ -16,6 +16,7 @@
 #include "kernel/kernel_objects.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -88,6 +89,7 @@ struct WorkerSlot {
     uint32_t call_stack[kMaximumCallDepth] = {};
     uint32_t seh_registration = 0;
     uint32_t tls = 0;
+    TlsEvidence tls_evidence;
     bool seh_verified = false;
     bool tls_verified = false;
     SehCheck seh_checks[16] = {};
@@ -145,6 +147,9 @@ void ResetSession() {
         slot.finished = false;
         slot.at_stop = false;
         slot.claim_id = 0;
+        slot.tls = 0;
+        slot.tls_evidence = {};
+        slot.tls_verified = false;
     }
 }
 
@@ -277,6 +282,8 @@ bool ClaimSlot(WorkerSlot& slot, Thread& thread) {
     for (SehCheck& check : slot.seh_checks) check = {};
     slot.seh_registration = 0;
     slot.tls = 0;
+    slot.tls_evidence = {};
+    slot.tls_verified = false;
     slot.at_stop = false;
     slot.finished = false;
     return true;
@@ -492,17 +499,53 @@ void VerifyStopState(WorkerSlot& slot) {
         }
     }
     if (manifest.tls_block_size) {
-        uint32_t pointer = 0;
-        if (!thread->tls || mem::Read(thread->tls, &pointer, sizeof(pointer)) != mem::AccessStatus::kOk) {
-            slot.status = Status::kTlsViolation;
-            return;
-        }
+        TlsEvidence evidence;
+        evidence.address = thread->tls;
+        evidence.block_size = manifest.tls_block_size;
+        evidence.expected_pointer = thread->tls ? thread->tls + 4 : 0;
         slot.tls = thread->tls;
-        slot.tls_verified = pointer == thread->tls + 4;
-        if (!slot.tls_verified) {
+        if (!thread->tls) {
+            evidence.status = TlsEvidenceStatus::kUnavailable;
+            slot.tls_evidence = evidence;
+            slot.tls_verified = false;
             slot.status = Status::kTlsViolation;
             return;
         }
+        uint32_t pointer = 0;
+        const mem::AccessStatus pointer_status = mem::Read(thread->tls, &pointer, sizeof(pointer));
+        evidence.pointer_read_ok = pointer_status == mem::AccessStatus::kOk;
+        if (evidence.pointer_read_ok) evidence.self_pointer = pointer;
+        std::array<uint8_t, 0x1000> block{};
+        mem::AccessStatus block_status = mem::AccessStatus::kInvalidAddress;
+        if (manifest.tls_block_size <= block.size())
+            block_status = mem::Read(thread->tls, block.data(), manifest.tls_block_size);
+        evidence.block_read_ok = block_status == mem::AccessStatus::kOk;
+        if (evidence.block_read_ok) {
+            uint32_t hash = 0x811C9DC5u;
+            for (uint32_t i = 0; i < manifest.tls_block_size; ++i) {
+                hash ^= block[i];
+                hash *= 0x01000193u;
+            }
+            evidence.content_hash = hash;
+            evidence.hash_recorded = true;
+        }
+        if (!evidence.pointer_read_ok || !evidence.block_read_ok) {
+            evidence.status = TlsEvidenceStatus::kReadFailed;
+            slot.tls_evidence = evidence;
+            slot.tls_verified = false;
+            slot.status = Status::kTlsViolation;
+            return;
+        }
+        if (pointer != thread->tls + 4) {
+            evidence.status = TlsEvidenceStatus::kMismatch;
+            slot.tls_evidence = evidence;
+            slot.tls_verified = false;
+            slot.status = Status::kTlsViolation;
+            return;
+        }
+        evidence.status = TlsEvidenceStatus::kValid;
+        slot.tls_evidence = evidence;
+        slot.tls_verified = true;
     }
 }
 
@@ -657,6 +700,17 @@ void InvokeReviewedKernel(WorkerSlot& slot, X86Context& ctx, uint8_t* base, cons
 }
 
 }  // namespace
+
+const char* TlsEvidenceStatusName(TlsEvidenceStatus status) {
+    switch (status) {
+        case TlsEvidenceStatus::kNotEvaluated: return "not-evaluated";
+        case TlsEvidenceStatus::kValid: return "valid";
+        case TlsEvidenceStatus::kUnavailable: return "unavailable";
+        case TlsEvidenceStatus::kReadFailed: return "read-failed";
+        case TlsEvidenceStatus::kMismatch: return "mismatch";
+    }
+    return "unknown";
+}
 
 const char* StatusName(Status status) {
     switch (status) {
@@ -1272,6 +1326,8 @@ bool EvidenceForRole(Role role, RunEvidence* evidence) {
     evidence->maximum_depth = slot.maximum_depth_seen;
     evidence->seh_registration = slot.seh_registration;
     evidence->tls = slot.tls;
+    evidence->tls_pointer = slot.tls_evidence.self_pointer;
+    evidence->tls_evidence = slot.tls_evidence;
     evidence->seh_verified = slot.seh_verified;
     evidence->tls_verified = slot.tls_verified;
     evidence->at_stop = slot.at_stop;

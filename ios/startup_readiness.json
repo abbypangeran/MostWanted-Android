@@ -1,7 +1,7 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-27B",
-  "milestone": "TRANSFER_BUDGET_REMEDIATION",
+  "phase": "2D-27C",
+  "milestone": "TLS_EVIDENCE_LIFECYCLE",
   "result": "PASS",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
@@ -220,20 +220,17 @@
     "ios/recompiler-fixtures/CMakeLists.txt"
   ],
   "validation": {
-    "authentic_run_tests": "144 PASS / 0 FAIL, Debug and Release",
+    "authentic_run_tests": "152 PASS / 0 FAIL, Debug and Release",
     "checked_recompiler_fixtures": "812 PASS / 0 FAIL, Debug and Release",
     "safe_ctests": "5/5, Debug and Release (-E execution_probe)",
-    "authentic_run_preflight": "PASS, 225/225, 211 executed / 213 boundary steps",
+    "authentic_run_preflight": "PASS, 225/225",
     "identity_preflight": "mapping E9DFEF8BB5AC0970, parent 85527B8FA581229F, child 585C5E1A742B6924",
     "data_import_slots": "322/324 verified",
     "authentic_run_accounting": "PASS, virtual 1280 -> 0",
-    "gate_b_preflight": "PASS, historical 145 boundary, execution prohibited",
-    "root_secondary_integrated_static": "PASS; integrated 143/143; production assessment validated-but-execution-prohibited",
-    "android_arm64_harness_syntax": "PASS (authentic_run.cpp, kernel_objects.cpp)",
-    "authentic_image_executed": false,
-    "old_evidence_modified": false,
     "mostwanted_memory_tests": "454 PASS / 0 FAIL, Debug and Release",
-    "child_budget_128": "REFUSED by the static preflight"
+    "android_arm64_syntax": "PASS (authentic_run.cpp, kernel_objects.cpp)",
+    "authentic_image_executed": false,
+    "historical_evidence_modified": false
   },
   "gates": {
     "gate_a_preparation": {
@@ -519,31 +516,101 @@
     }
   },
   "fifth_run": {
-    "authorised": false,
-    "technically_justified": true,
-    "scope": "exactly the unchanged 211-instruction route, parent 73 transfers, child 143 transfers",
-    "mapping_identity": "E9DFEF8BB5AC0970",
-    "parent_manifest": "85527B8FA581229F",
-    "child_manifest": "585C5E1A742B6924",
-    "requirements": [
-      "one separate explicit authorisation",
-      "the temporary activation/driver is not committed; use the committed 73/143 budget floors",
-      "patch kernel slots 003C9E38/003C9E30/003C9E1C and data slots 003C9E34/003C9E3C",
-      "retain the four reviewed kernel import patches",
-      "observe KPRCB+0x250 == 0, [0x8001003C] == 0 and no INIT signature",
-      "reach both stops 002B3987/002B5E37 with 71/140 instructions and 73/143 transfers",
-      "observe kernels 255/187/277/294/47/107/113",
-      "verify the live 14-predicate SEH frame and TLS",
-      "verify the exact KDPC/KTIMER/shutdown-registration objects",
-      "return accounting to 0 and finalise all workers/claims/leases"
+    "authorised": true,
+    "executed": true,
+    "result": "FAIL",
+    "route": "211/211 instructions",
+    "parent": {
+      "instructions": 71,
+      "transfers": 73,
+      "stop": "0x002B3987"
+    },
+    "child": {
+      "instructions": 140,
+      "transfers": 143,
+      "stop": "0x002B5E37"
+    },
+    "kernels": [
+      255,
+      187,
+      277,
+      294,
+      47,
+      107,
+      113
     ],
-    "excluded": [
-      "Gate C items",
-      "later start-routine calls",
-      "initializers and callbacks",
-      "retail SEH delivery",
-      "ordinal 258",
-      "CLI/STI execution"
-    ]
+    "stop_time_tls_verified": true,
+    "post_finalisation_tls_capture": "failed",
+    "observed_tls_pointer": "0x00000000",
+    "zero_buffer_hash_reported": "0x9D899E55",
+    "driver_exit": 4,
+    "retry": false,
+    "evidence": ".local/ios-port/phase2d27b-fifth-authentic-run/",
+    "note": "Historical result; not retroactively converted to PASS."
+  },
+  "phase_2d27c_tls_remediation": {
+    "result": "PASS",
+    "authentic_execution": false,
+    "root_cause": "The driver re-read child TLS after worker finalisation; the unread block was hashed as a zero buffer.",
+    "changes": [
+      "sdk/runtime/kernel/authentic_run.h: TlsEvidenceStatus and TlsEvidence; RunEvidence.tls_evidence",
+      "ios/recompiler-fixtures/authentic_run.cpp: WorkerSlot.tls_evidence; VerifyStopState snapshot; EvidenceForRole copy; reset paths",
+      "local experimental driver consumes the host-owned snapshot and does not re-read TLS guest memory"
+    ],
+    "snapshot_fields": [
+      "address",
+      "expected_pointer",
+      "self_pointer",
+      "block_size",
+      "content_hash",
+      "pointer_read_ok",
+      "block_read_ok",
+      "hash_recorded",
+      "status"
+    ],
+    "statuses": [
+      "not-evaluated",
+      "valid",
+      "unavailable",
+      "read-failed",
+      "mismatch"
+    ],
+    "hash_rule": "recorded only when the full checked block read succeeds",
+    "zero_fallback_hash": "0x9D899E55",
+    "zero_fallback_cannot_be_valid": true,
+    "identities_unchanged": {
+      "mapping_identity": "E9DFEF8BB5AC0970",
+      "parent_manifest": "85527B8FA581229F",
+      "child_manifest": "585C5E1A742B6924"
+    },
+    "tests": {
+      "authentic_run_tests": "152 PASS / 0 FAIL (8 new TLS lifecycle checks)",
+      "full_route": "71/140 instructions, 211/213, kernels 255/187/277/294/47/107/113",
+      "snapshot_survives_finalisation": true,
+      "failed_read_no_hash": true,
+      "mismatch_distinguished": true,
+      "unavailable_distinguished": true
+    },
+    "evidence": ".local/ios-port/phase2d27c-tls-evidence/"
+  },
+  "gates_2d27c": {
+    "gate_a_preparation": {
+      "result": "GO",
+      "scope": "image, mapping, manifests, budgets and evidence harness"
+    },
+    "gate_b_211_boundary": {
+      "result": "historical FAIL; offline remediation PASS",
+      "blockers": [
+        "the fifth run is closed as FAIL",
+        "no retry or sixth run is authorised",
+        "a further run requires new explicit authorisation"
+      ]
+    },
+    "gate_c_authentic_startup": {
+      "result": "NO-GO",
+      "blockers": [
+        "Gate C dependencies unchanged"
+      ]
+    }
   }
 }

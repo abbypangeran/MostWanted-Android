@@ -248,6 +248,32 @@ struct SehCheck {
     uint32_t address = 0;
 };
 
+// TLS evidence is captured at the stop, while the worker's TLS allocation is
+// still live, and kept as a host-owned snapshot. It is never re-read from guest
+// memory after finalisation. The content hash is meaningful only when the full
+// checked read succeeded and hash_recorded is true.
+enum class TlsEvidenceStatus : uint8_t {
+    kNotEvaluated,
+    kValid,
+    kUnavailable,
+    kReadFailed,
+    kMismatch,
+};
+
+const char* TlsEvidenceStatusName(TlsEvidenceStatus status);
+
+struct TlsEvidence {
+    uint32_t address = 0;           // thread->tls at the stop
+    uint32_t self_pointer = 0;      // checked [address] value
+    uint32_t expected_pointer = 0;  // reviewed self-pointer (address + 4)
+    uint32_t block_size = 0;        // manifest tls_block_size
+    uint32_t content_hash = 0;      // FNV-1a over the block, only when recorded
+    TlsEvidenceStatus status = TlsEvidenceStatus::kNotEvaluated;
+    bool pointer_read_ok = false;
+    bool block_read_ok = false;
+    bool hash_recorded = false;
+};
+
 struct RunEvidence {
     uint32_t role = 0;
     uint32_t origin = 0;
@@ -263,7 +289,8 @@ struct RunEvidence {
     uint32_t maximum_depth = 0;
     uint32_t seh_registration = 0;
     uint32_t tls = 0;
-    uint32_t tls_pointer = 0;
+    uint32_t tls_pointer = 0;  // mirrors tls_evidence.self_pointer
+    TlsEvidence tls_evidence;
     bool seh_verified = false;
     bool tls_verified = false;
     bool at_stop = false;

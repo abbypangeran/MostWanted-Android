@@ -531,6 +531,63 @@ void HoldForStackMutation(X86Context&) {
 void CancelAfterChildStart(X86Context&) { kernel::authentic::CancelAllRuns(); }
 void CancelAtChildEntry(X86Context&) { kernel::authentic::CancelAllRuns(); }
 
+std::atomic<uint32_t> g_tls_reference_address{0};
+std::atomic<uint32_t> g_tls_reference_self{0};
+std::atomic<uint32_t> g_tls_reference_size{0};
+std::atomic<uint32_t> g_tls_reference_hash{0};
+std::atomic<bool> g_tls_reference_read_ok{false};
+
+uint32_t TlsHash(const uint8_t* bytes, uint32_t size) {
+    uint32_t hash = 0x811C9DC5u;
+    for (uint32_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 0x01000193u;
+    }
+    return hash;
+}
+
+uint32_t ZeroTlsHash(uint32_t size) {
+    uint32_t hash = 0x811C9DC5u;
+    for (uint32_t i = 0; i < size; ++i) {
+        hash ^= 0;
+        hash *= 0x01000193u;
+    }
+    return hash;
+}
+
+// Independent read-only reference captured before the final child instruction
+// executes. The kernel call that follows does not change the TLS block.
+void CaptureTlsReference(X86Context&) {
+    kernel::Thread* thread = kernel::Current();
+    const uint32_t address = thread ? thread->tls : 0;
+    const uint32_t size = thread && thread->tls ? thread->stack_top - thread->tls : 0;
+    std::array<uint8_t, 0x1000> block{};
+    uint32_t pointer = 0;
+    bool ok = address && size && size <= block.size() &&
+              mem::Read(address, &pointer, sizeof(pointer)) == mem::AccessStatus::kOk &&
+              mem::Read(address, block.data(), size) == mem::AccessStatus::kOk;
+    g_tls_reference_address = address;
+    g_tls_reference_size = size;
+    g_tls_reference_self = ok ? pointer : 0;
+    g_tls_reference_hash = ok ? TlsHash(block.data(), size) : 0;
+    g_tls_reference_read_ok = ok;
+}
+
+// Test-only negative injections. They mutate the thread's TLS address or the
+// TLS self-pointer immediately before the stop verification.
+void CorruptTlsAddress(X86Context&) {
+    if (kernel::Thread* thread = kernel::Current()) thread->tls = 0x00080000;
+}
+void ClearTlsAddress(X86Context&) {
+    if (kernel::Thread* thread = kernel::Current()) thread->tls = 0;
+}
+void CorruptTlsPointer(X86Context&) {
+    kernel::Thread* thread = kernel::Current();
+    if (!thread || !thread->tls) return;
+    const uint32_t value = 0xDEADBEEFu;
+    mem::Write(thread->tls, &value, sizeof(value));
+}
+
 struct RouteRun {
     kernel::ThreadRef thread;
     run::RunAuthorization authorization;
@@ -777,7 +834,15 @@ int main() {
     }
 
     {
+        g_tls_reference_address = 0;
+        g_tls_reference_self = 0;
+        g_tls_reference_size = 0;
+        g_tls_reference_hash = 0;
+        g_tls_reference_read_ok = false;
+        run::SetInjectionHookForTest(run::Role::kChild,
+                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CaptureTlsReference);
         const FullRun run = RunFullRoute(fixture);
+        run::ClearInjectionHooksForTest();
         Check(run.started.status == run::Status::kReady, "the full 211-instruction synthetic run is authorised");
         Check(run.have_parent && run.have_child, "both full-route workers leave evidence");
         Check(run.parent.status == run::Status::kStopped && run.parent.instructions == 71 &&
@@ -847,6 +912,19 @@ int main() {
         Check(run.child.seh_verified && run.child.seh_registration != 0 && run.child.tls_verified &&
                   run.child.tls != 0,
               "SEH and TLS remain live and verified at the child stop");
+        const run::TlsEvidence& tls = run.child.tls_evidence;
+        Check(tls.status == run::TlsEvidenceStatus::kValid && tls.pointer_read_ok && tls.block_read_ok &&
+                  tls.hash_recorded && tls.address == run.child.tls &&
+                  tls.expected_pointer == run.child.tls + 4 && tls.self_pointer == run.child.tls + 4 &&
+                  tls.block_size == full::kTlsBlockSize && tls.content_hash != 0,
+              "the stop-time TLS snapshot is valid and complete");
+        Check(g_tls_reference_read_ok.load() && g_tls_reference_address.load() == tls.address &&
+                  g_tls_reference_self.load() == tls.self_pointer &&
+                  g_tls_reference_size.load() == tls.block_size &&
+                  g_tls_reference_hash.load() == tls.content_hash,
+              "the TLS snapshot matches the independent pre-stop reference");
+        Check(run.parent.tls_evidence.status == run::TlsEvidenceStatus::kNotEvaluated,
+              "a route without TLS leaves the snapshot not evaluated");
         bool seh_checks_ok = run.child.seh_check_count >= 14;
         for (size_t i = 0; i < run.child.seh_check_count; ++i) {
             const run::SehCheck& check = run.child.seh_checks[i];
@@ -863,11 +941,59 @@ int main() {
                   run.parent.claim_id != run.child.claim_id,
               "the full-route workers have distinct thread and claim identities");
         Check(kernel::Threads().empty(), "both full-route workers unregister after finalisation");
+        run::RunEvidence after_finalize;
+        Check(run::EvidenceForRole(run::Role::kChild, &after_finalize) &&
+                  after_finalize.tls_evidence.status == run::TlsEvidenceStatus::kValid &&
+                  after_finalize.tls_evidence.content_hash == g_tls_reference_hash.load() &&
+                  after_finalize.tls_evidence.self_pointer == g_tls_reference_self.load() &&
+                  after_finalize.tls_evidence.address == g_tls_reference_address.load(),
+              "the host-owned TLS snapshot survives child-worker finalisation");
         std::printf("FULL_ROUTE parent_instructions=%u parent_transfers=%u child_instructions=%u "
                     "child_transfers=%u total_instructions=%u boundary_steps=%u\n",
                     run.parent.instructions, run.parent.transfers, run.child.instructions, run.child.transfers,
                     run.parent.instructions + run.child.instructions,
                     run.parent.instructions + run.child.instructions + 2);
+    }
+
+    {
+        run::SetInjectionHookForTest(run::Role::kChild,
+                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CorruptTlsAddress);
+        const FullRun run = RunFullRoute(fixture);
+        run::ClearInjectionHooksForTest();
+        Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
+                  run.child.instructions == 140 && run.child.transfers == 143 &&
+                  run.child.tls_evidence.status == run::TlsEvidenceStatus::kReadFailed &&
+                  !run.child.tls_evidence.hash_recorded && run.child.tls_evidence.content_hash == 0 &&
+                  run.child.tls_evidence.content_hash != ZeroTlsHash(full::kTlsBlockSize),
+              "a failed TLS read cannot produce valid evidence or a zero-buffer hash");
+        Check(run.have_parent && run.parent.status == run::Status::kStopped &&
+                  run.parent.instructions == 71 && run.parent.transfers == 73,
+              "the parent stop is independent of the child TLS read failure");
+    }
+
+    {
+        run::SetInjectionHookForTest(run::Role::kChild,
+                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CorruptTlsPointer);
+        const FullRun run = RunFullRoute(fixture);
+        run::ClearInjectionHooksForTest();
+        Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
+                  run.child.instructions == 140 && run.child.transfers == 143 &&
+                  run.child.tls_evidence.status == run::TlsEvidenceStatus::kMismatch &&
+                  run.child.tls_evidence.pointer_read_ok && run.child.tls_evidence.block_read_ok &&
+                  run.child.tls_evidence.hash_recorded && !run.child.tls_verified,
+              "a TLS self-pointer mismatch is distinguished from a failed read");
+    }
+
+    {
+        run::SetInjectionHookForTest(run::Role::kChild,
+                                     full::kChildRoute[full::kChildRouteCount - 1].pc, ClearTlsAddress);
+        const FullRun run = RunFullRoute(fixture);
+        run::ClearInjectionHooksForTest();
+        Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
+                  run.child.instructions == 140 && run.child.transfers == 143 &&
+                  run.child.tls_evidence.status == run::TlsEvidenceStatus::kUnavailable &&
+                  !run.child.tls_evidence.hash_recorded && run.child.tls_evidence.content_hash == 0,
+              "an unavailable TLS pointer is reported without evidence");
     }
 
     {

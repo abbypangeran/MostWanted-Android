@@ -4767,3 +4767,78 @@ separate explicit authorisation and a driver that uses the committed 73/143 floo
 activation/driver is not committed by this phase. It is not Gate C. Do not activate it from this document.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-27C — TLS evidence lifecycle remediation
+
+**`FIFTH_RUN_TLS_REMEDIATION = PASS`.** This is an offline remediation. No authentic XBE instruction ran,
+the fifth run was not retried and no sixth run was started. The five historical authentic-run evidence
+directories are unchanged.
+
+### Historical fifth-run result (preserved)
+
+`FIFTH_AUTHENTIC_RUN = FAIL`.
+
+The fifth run completed the reviewed route: 211/211 instructions, parent 71/73 before `002B3987`, child
+140/143 before `002B5E37`, seven reviewed kernel calls (255/187/277/294/47/107/113), kernel-object fields,
+SEH predicates and the stop-time TLS verification all passed. The driver exited 4 because its
+post-finalisation TLS evidence capture failed: it re-read the child's TLS after the worker had released the
+TLS/stack and reported `pointer=00000000`, `read_only=0`, and the FNV-1a hash of the unread zero buffer
+`9D899E55`. The run is not retroactively converted to PASS.
+
+### Root cause
+
+`WorkerSlot`/`RunEvidence` stored the TLS address and `tls_verified`, but no pointer, read result or content
+hash. `VerifyStopState` discarded the pointer and block after the self-pointer check, and the driver tried
+to re-read the TLS guest block after `RunBoundWorker` had finalised the child. The zero-initialised fallback
+buffer was hashed even though the checked read had failed.
+
+### Corrected evidence model
+
+- `sdk/runtime/kernel/authentic_run.h`: `TlsEvidenceStatus` (`not-evaluated`, `valid`, `unavailable`,
+  `read-failed`, `mismatch`) and `TlsEvidence` (address, expected/self pointer, block size, content hash,
+  pointer/block read status, hash-recorded flag). `RunEvidence.tls_evidence` carries the host-owned
+  snapshot; `tls_pointer` mirrors the self-pointer.
+- `ios/recompiler-fixtures/authentic_run.cpp`: `WorkerSlot.tls_evidence`; `VerifyStopState` captures the
+  TLS address, expected/self pointer, pointer-read status, full-block checked-read status and FNV-1a hash
+  while the stack/TLS lease is still held. The hash is recorded only when the full checked read succeeds;
+  unavailable/failed/mismatch observations are distinguished and cannot become `kValid`.
+  `EvidenceForRole` copies the snapshot; `ResetSession`/`ClaimSlot` clear it.
+- The corrected experimental driver (local, never committed) consumes `RunEvidence.tls_evidence` and does
+  not re-read TLS guest memory after finalisation. The driver was compiled in both builds and its
+  prepare-only admission passed; it was not executed against the authentic route.
+
+### Regression coverage
+
+`authentic_run_tests` now has 152 checks (8 new TLS lifecycle checks): the stop-time snapshot is valid and
+matches an independent pre-stop reference; the snapshot survives child-worker finalisation; a failed
+checked read records no hash and cannot be valid; the zero-buffer hash `9D899E55` cannot be reported as
+evidence; a self-pointer mismatch is distinct from a failed read; an unavailable TLS pointer is reported
+without evidence; the full synthetic 71/140 route still retires 211 instructions in 213 boundary steps with
+unchanged worker instruction/transfer counts, kernel services, SEH and stop conditions, and cleanup.
+
+### Validation (fresh)
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` | 152 PASS / 0 FAIL | 152 PASS / 0 FAIL |
+| `checked_recompiler_tests` | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, 225/225 | PASS, 225/225 |
+| `authentic_run_accounting` | 1280 -> 0 | 1280 -> 0 |
+| `mostwanted_memory_tests` | 454 PASS / 0 FAIL | 454 PASS / 0 FAIL |
+| Android ARM64 syntax (`authentic_run.cpp`, `kernel_objects.cpp`) | PASS | — |
+
+The preflight reports mapping `E9DFEF8BB5AC0970`, parent `85527B8FA581229F`, child `585C5E1A742B6924`,
+parent 73, child 143 and `AUTH_RUN_RESULT=PASS`. No identity-covered property changed; the route and
+mapping identities are unchanged.
+
+### Gates
+
+| Gate | Result | Scope |
+|---|---|---|
+| A — preparation | **GO** | image, mapping, manifests, budgets and evidence harness |
+| B — 211-instruction authentic execution | **historical FAIL; offline remediation PASS** | the route completed but the driver evidence lifecycle failed; no retry is authorised |
+| C — actual game startup | **NO-GO** | unchanged Gate C dependencies |
+
+The fifth run remains closed as FAIL. A further authentic attempt requires a new explicit authorisation and
+is not part of this phase. R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
