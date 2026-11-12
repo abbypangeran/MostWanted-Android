@@ -8,6 +8,7 @@
 #include "kernel/clock_worker.h"
 #include "kernel/crypto.h"
 #include "kernel/kernel_data_init.h"
+#include "kernel/kernel_objects.h"
 #include "kernel/worker_lifecycle.h"
 #include "kernel/exports.h"
 #include "xbe/image_loader.h"
@@ -726,12 +727,9 @@ KERNEL_FASTCALL(250, ObfDereferenceObject) { return 0; }
 // timers, DPCs, interrupts
 
 KERNEL_EXPORT(113, KeInitializeTimerEx, 2) {
-    uint32_t t = a[0];
-    std::memset(HostPtr(t), 0, 0x28);
-    G<uint8_t>(t) = uint8_t(8 + a[1]);  // TimerNotificationObject or TimerSynchronizationObject
-    G<uint8_t>(t + 2) = 10;
-    W32(t + 8, t + 8);
-    W32(t + 12, t + 8);
+    const KernelObjectStatus status = InitializeTimerExChecked(a[0], a[1]);
+    if (status != KernelObjectStatus::kOk)
+        x86_trap(ctx, a[0], "KeInitializeTimerEx: checked guest object initialisation failed");
     return 0;
 }
 
@@ -793,11 +791,9 @@ KERNEL_EXPORT(185, NtCancelTimer, 2) {
 }
 
 KERNEL_EXPORT(107, KeInitializeDpc, 3) {
-    uint32_t d = a[0];
-    std::memset(HostPtr(d), 0, 0x1C);
-    W16(d, 19);  // DpcObject
-    W32(d + 0x0C, a[1]);
-    W32(d + 0x10, a[2]);
+    const KernelObjectStatus status = InitializeDpcChecked(a[0], a[1], a[2]);
+    if (status != KernelObjectStatus::kOk)
+        x86_trap(ctx, a[0], "KeInitializeDpc: checked guest object initialisation failed");
     return 0;
 }
 

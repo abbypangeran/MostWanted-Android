@@ -4497,4 +4497,57 @@ The new preflight reports mapping `07AEBFC052075330`, parent `48120EDC4D3D4466`,
 
 A third authentic run is **technically justified** only for exactly the 186-instruction boundary, with the kernel data initialised, the two data import slots patched, the KPRCB/physical zero preconditions observed, both prescribed stops, kernels 255/187/277/294, live SEH/TLS, and clean accounting. It requires separate user approval. It would not be Gate C.
 
+
+## Phase 2D-24 — checked DPC and timer initialisation
+
+**`PHASE_2D24_CHECKED_KERNEL_OBJECTS = PARTIAL`.** Ordinals 107 (`KeInitializeDpc`) and 113
+(`KeInitializeTimerEx`) now use checked guest-memory initialisation in production. Ordinal 47
+(`HalRegisterShutdownNotification`) remains unresolved; the 210-instruction boundary was not generated.
+No authentic instruction ran; the 186-instruction third-run PASS remains the historical authentic checkpoint.
+
+### Checked implementations
+
+`sdk/runtime/kernel/kernel_objects.{h,cpp}` owns the reviewed layouts and checked writes:
+
+- `InitializeDpcChecked(dpc, routine, context)`: pins and validates the full `0x1C` KDPC span, then publishes
+  Type `19`, zero Inserted/Padding and an empty `DpcListEntry`, the exact deferred routine at `+0x0C`, the
+  exact context at `+0x10`, and zero `SystemArgument1/2`. No callback is invoked.
+- `InitializeTimerExChecked(timer, type)`: rejects types other than 0/1, pins and validates the full `0x28`
+  KTIMER span, publishes dispatcher type `8` (notification) or `9` (synchronization), size `10`, signal
+  state 0, a self-linked empty wait list at `+8/+12`, and zero DueTime/TimerListEntry/Dpc/Period. No timer
+  is scheduled.
+
+Both use `mem::ScopedPageLease` plus `mem::Write`. Invalid/uncommitted/read-only/busy spans fail before
+publication. The xboxkrnl HLEs trap through `x86_trap` on a checked failure rather than returning success.
+
+### Ordinal 47
+
+The nxdk declaration is authoritative for the ABI: `HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION,
+BOOLEAN Register)` returns void; the registration layout is `NotificationRoutine +0x00`, `Priority +0x04`,
+`ListEntry +0x08`. The authentic call passes `0x0046CD30, 1` (register). The kernel-maintained list head,
+ordering/lifetime, duplicate/removal semantics and shutdown-time consumption are not established with
+sufficient evidence, so the existing no-op remains and is explicitly reported as unresolved. No speculative
+shutdown list or callback was added.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| `mostwanted_memory_tests` (macOS) | 439 PASS / 0 FAIL |
+| New checked DPC/timer tests | 25 PASS, including cross-page, read-only, uncommitted and reinitialisation cases |
+| `authentic_run_tests` | 95 PASS / 0 FAIL |
+| Checked recompiler fixtures | 812 PASS / 0 FAIL |
+| `authentic_run_preflight --generated` | PASS, 200/200, unchanged identities |
+| Android ARM64 `kernel_objects.cpp` syntax | PASS |
+
+Before: raw `memset`/`HostPtr` writes of `0x1C`/`0x28`; after: checked, pinned, full-span writes with the
+reviewed field values and a trap on failure. No DPC/timer callback, dispatch or scheduling was executed.
+
+### Gates and next experiment
+
+Gate A remains GO; the 186 historical boundary remains PASS; the proposed 210 boundary is **NO-GO** because
+ordinal 47 is unresolved. Gate C remains NO-GO. The next work must establish the shutdown-registration list
+ownership and shutdown-time lifetime before generating the 210 mapping/manifests. A fourth authentic run is
+not technically justified yet.
+
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

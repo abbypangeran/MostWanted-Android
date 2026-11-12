@@ -13,6 +13,7 @@ extern int RunWorkerLifecycleTests(void);
 extern int RunDispatchTableTests(void);
 extern int RunKernelThunkTests(void);
 extern int RunFilesystemSetupTests(void);
+extern int RunKernelObjectTests(void);
 extern int RunGuestMemoryPrototypeTests(void);
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
 extern int RunCheckedRecompilerFixtureTests(void);
@@ -37,6 +38,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     failures += RunDispatchTableTests();
     failures += RunKernelThunkTests();
     failures += RunFilesystemSetupTests();
+    failures += RunKernelObjectTests();
 #ifdef MOSTWANTED_CHECKED_RECOMPILER_FIXTURE
     failures += RunCheckedRecompilerFixtureTests();
 #endif

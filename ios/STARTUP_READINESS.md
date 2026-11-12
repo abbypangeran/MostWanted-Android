@@ -126,3 +126,27 @@ included. A separate explicit authorisation is required.
 
 Do not authorise authentic execution from this document. The 144 boundary is historical; the 186 boundary is
 static/synthetic only until a separately approved run.
+
+
+## Phase 2D-24 — checked DPC/timer kernel objects
+
+`PHASE_2D24_CHECKED_KERNEL_OBJECTS = PARTIAL`.
+
+`KeInitializeDpc` (107) and `KeInitializeTimerEx` (113) are now implemented through checked guest memory in
+production (`sdk/runtime/kernel/kernel_objects.{h,cpp}`): full `0x1C`/`0x28` span validation and pinning,
+reviewed field publication, invalid/uncommitted/read-only rejection, and an `x86_trap` failure path. No DPC
+callback or timer scheduling is invoked. The authenticated 186-instruction third-run PASS remains historical.
+
+`HalRegisterShutdownNotification` (47) is **not implemented**. The nxdk ABI/layout is authoritative
+(`PHAL_SHUTDOWN_REGISTRATION`, `NotificationRoutine +0`, `Priority +4`, `ListEntry +8`, void return), but the
+kernel list head, ordering/lifetime, duplicate/removal and shutdown consumption remain unresolved. The no-op
+is retained rather than replaced by a speculative list.
+
+The 210-instruction boundary is **not generated**: ordinal 47 must be established first. The current mapping
+`07AEBFC052075330`, parent `48120EDC4D3D4466` and child `322795BF56BE60B6` remain the historical 186-route
+identities and must not be reused after a route change.
+
+Validation: `mostwanted_memory_tests` 439 PASS / 0 FAIL including the new checked DPC/timer tests; authentic
+suite 95/0; checked fixtures 812/0; authentic preflight PASS 200/200; Android ARM64 `kernel_objects.cpp`
+syntax PASS. Gate A remains GO; the historical Gate B 186 is PASS; the proposed 210 boundary is NO-GO;
+Gate C remains NO-GO. A fourth authentic run is not technically justified yet.

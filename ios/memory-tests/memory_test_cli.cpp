@@ -9,6 +9,7 @@ extern "C" int RunWorkerLifecycleTests();
 extern "C" int RunDispatchTableTests();
 extern "C" int RunKernelThunkTests();
 extern "C" int RunFilesystemSetupTests();
+extern "C" int RunKernelObjectTests();
 
 int main(int argc, char** argv) {
     int failures = RunMemoryTests();
@@ -21,6 +22,7 @@ int main(int argc, char** argv) {
     failures += RunDispatchTableTests();
     failures += RunKernelThunkTests();
     failures += RunFilesystemSetupTests();
+    failures += RunKernelObjectTests();
     failures += RunXbeImageLoaderTests(argc > 1 ? argv[1] : nullptr);
     return failures ? 1 : 0;
 }

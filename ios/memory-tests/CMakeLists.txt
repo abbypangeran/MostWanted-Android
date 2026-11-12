@@ -9,6 +9,7 @@ add_executable(mostwanted_memory_tests
     ../../sdk/runtime/kernel/clock_worker.cpp
     ../../sdk/runtime/kernel/worker_lifecycle.cpp
     ../../sdk/runtime/kernel/kernel_data_init.cpp
+    ../../sdk/runtime/kernel/kernel_objects.cpp
     ../../sdk/runtime/cpu/dispatch_table.cpp
     ../../sdk/runtime/kernel/kernel_thunks.cpp
     ../../sdk/runtime/kernel/filesystem_context.cpp
@@ -30,6 +31,7 @@ add_executable(mostwanted_memory_tests
     dispatch_table_tests.cpp
     kernel_thunk_tests.cpp
     filesystem_setup_tests.cpp
+    kernel_object_tests.cpp
     memory_test_cli.cpp
 )
 target_compile_features(mostwanted_memory_tests PRIVATE cxx_std_20)

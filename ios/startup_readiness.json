@@ -1,8 +1,8 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-21",
-  "milestone": "START_ROUTINE_EXTENSION",
-  "result": "PASS",
+  "phase": "2D-24",
+  "milestone": "CHECKED_KERNEL_OBJECTS",
+  "result": "PARTIAL",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
   "image_sha1": "f636a16af04171089f879a4bed646e185c734233",
@@ -290,6 +290,45 @@
     "CLI/STI and INT3 outside the boundary",
     "Gate C and customer release"
   ],
+  "checked_kernel_objects": {
+    "result": "partial",
+    "ordinal_107": {
+      "status": "implemented_synthetic",
+      "layout": "KDPC 0x1C: Type 19, Inserted/Padding 0, empty DpcListEntry, routine +0x0C, context +0x10, SystemArgument1/2 +0x14/+0x18",
+      "checked": "ScopedPageLease + full-span validation + checked write + x86_trap failure",
+      "callback_execution": false
+    },
+    "ordinal_113": {
+      "status": "implemented_synthetic",
+      "layout": "KTIMER 0x28: dispatcher type 8/9, size 10, signal 0, self-linked empty wait list +8/+12, zero due/list/DPC/period",
+      "checked": "ScopedPageLease + full-span validation + checked write + x86_trap failure",
+      "scheduling": false
+    },
+    "ordinal_47": {
+      "status": "unresolved",
+      "abi": "void HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION, BOOLEAN)",
+      "layout": "NotificationRoutine +0, Priority +4, ListEntry +8",
+      "authentic_call": "0x002B567B: 0x0046CD30, 1",
+      "remaining": "kernel list head, ordering/lifetime, duplicate/removal and shutdown consumption",
+      "implementation": "no-op retained; no speculative list"
+    },
+    "boundary_210": {
+      "generated": false,
+      "reason": "ordinal 47 unresolved",
+      "parent": 71,
+      "child": 139,
+      "total": 210,
+      "stop": "0x002B5E37"
+    },
+    "validation": {
+      "memory_tests": "439 PASS / 0 FAIL",
+      "new_dpc_timer_tests": "25 PASS",
+      "authentic_run_tests": "95 PASS / 0 FAIL",
+      "checked_fixtures": "812 PASS / 0 FAIL",
+      "authentic_preflight": "PASS 200/200",
+      "android_kernel_objects_syntax": "PASS"
+    }
+  },
   "authorises_authentic_execution": false,
   "r1_16": "ON_HOLD",
   "customer_release": "NOT_READY"

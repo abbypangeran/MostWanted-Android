@@ -40,6 +40,7 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     ../sdk/runtime/kernel/clock_worker.cpp
     ../sdk/runtime/kernel/worker_lifecycle.cpp
     ../sdk/runtime/kernel/kernel_data_init.cpp
+    ../sdk/runtime/kernel/kernel_objects.cpp
     ../sdk/runtime/cpu/dispatch_table.cpp
     ../sdk/runtime/kernel/kernel_thunks.cpp
     ../sdk/runtime/kernel/filesystem_context.cpp
@@ -60,6 +61,7 @@ add_executable(mostwanted_memory_tests MACOSX_BUNDLE
     memory-tests/dispatch_table_tests.cpp
     memory-tests/kernel_thunk_tests.cpp
     memory-tests/filesystem_setup_tests.cpp
+    memory-tests/kernel_object_tests.cpp
 )
 set(MOSTWANTED_CHECKED_FIXTURE_DIR "" CACHE PATH "Generated checked-recompiler fixture directory")
 if(MOSTWANTED_CHECKED_FIXTURE_DIR)
