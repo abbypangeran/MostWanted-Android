@@ -4620,4 +4620,54 @@ The 210 route was not prepared because the scoped route generation and preflight
 this phase. The mapping `07AEBFC052075330`, parent `48120EDC4D3D4466` and child `322795BF56BE60B6` remain
 historical and must not be reused after a route change.
 
+
+## Phase 2D-27 — 211-instruction boundary
+
+**`PHASE_2D27_211_BOUNDARY_READINESS = PASS`.** The former 210-instruction estimate is superseded by the
+independently verified 211-instruction route. No authentic instruction ran.
+
+### Corrected route
+
+- Parent: 71, stop before `002B3987`.
+- Child: 140, stop before `002B5E37`.
+- Total: 211 retired / 213 boundary steps.
+- Extension: `002B38A7` call (1), `002B5664..002B567B` (13), `002B5681` call (1), `002B5E12..002B5E31` (10).
+
+The `002B5681` call is retained; nothing was dropped to force the earlier 210 count. The preflight now treats
+the child stop edge as the `next` of the reviewed kernel-call step, and the operand texts match the Zydis
+formatter without changing the semantic checks.
+
+### New identities
+
+| Identity | Value |
+|---|---|
+| Mapping | `E9DFEF8BB5AC0970` (225 entries) |
+| Parent manifest | `48120EDC4D3D4466` |
+| Child manifest | `2FA1FDFDA0F3F86B` |
+
+The parent route is unchanged; the child/mapping identities replace the historical 186-route
+`07AEBFC052075330` / `48120EDC4D3D4466` / `322795BF56BE60B6` pair for the extended route.
+
+### Kernel-service integration
+
+Ordinal 47 uses the scoped `RegisterShutdownNotificationChecked`; 107/113 use the production
+`InitializeDpcChecked`/`InitializeTimerExChecked`. The reviewed slots are `003C9E38`, `003C9E30`, `003C9E1C`
+with ordinals 47/107/113. The registration lifecycle now clears on production `mem::Shutdown`; the scoped
+record is not retained across sessions. `SCOPED_STARTUP_COMPATIBILITY` holds for this boundary;
+`FULL_KERNEL_SHUTDOWN_FIDELITY` remains unresolved.
+
+### Validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` | 95 PASS / 0 FAIL | 95 PASS / 0 FAIL |
+| `authentic_run_preflight --generated` | PASS, 225/225 | PASS, 225/225 |
+| `authentic_run_accounting` | 1280 -> 0 | 1280 -> 0 |
+| Safe CTests | 5/5 | 5/5 |
+| `mostwanted_memory_tests` | 454 PASS / 0 FAIL | — |
+| Checked recompiler fixtures | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+
+The preflight reports child 140, total 211, 213 boundary steps, stop `002B5E37`, parent `48120EDC4D3D4466`,
+child `2FA1FDFDA0F3F86B`, mapping `E9DFEF8BB5AC0970` and `AUTH_RUN_RESULT=PASS`.
+
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

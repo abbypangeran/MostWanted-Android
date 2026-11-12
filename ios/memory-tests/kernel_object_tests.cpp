@@ -135,17 +135,21 @@ extern "C" int RunKernelObjectTests() {
     Check(kernel::RegisterShutdownNotificationChecked(mem::kUserLow + 0x7F000, 1, 7, "test-image", 0x00011000u,
                                                       0x00380000u) == kernel::KernelObjectStatus::kUncommitted,
           "shutdown registration rejects an uncommitted object");
+    kernel::ClearShutdownRegistrationsForTest();
+    const uint32_t fresh_registration = page + 0x400;
+    Check(mem::Write(fresh_registration, registration_bytes.data(), registration_bytes.size()) ==
+              mem::AccessStatus::kOk,
+          "fresh read-only registration object is writable before protection");
     Check(mem::Protect(page, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
           "shutdown registration page becomes read-only");
-    const kernel::KernelObjectStatus read_only_status =
-        kernel::RegisterShutdownNotificationChecked(registration, 1, 7, "test-image", 0x00011000u, 0x00380000u);
-    std::printf("read-only registration status=%s\n", kernel::KernelObjectStatusName(read_only_status));
-    Check(read_only_status != kernel::KernelObjectStatus::kOk,
-          "read-only registration object cannot establish a second host record");
+    Check(kernel::RegisterShutdownNotificationChecked(fresh_registration, 1, 7, "test-image", 0x00011000u,
+                                                      0x00380000u) == kernel::KernelObjectStatus::kOk,
+          "valid first registration accepts a readable read-only object");
     Check(mem::Protect(page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
-          "shutdown registration page restores");
-    kernel::ClearShutdownRegistrationsForTest();
-    Check(kernel::ShutdownRegistrationCountForTest() == 0, "shutdown registration metadata cleans up");
+          "read-only registration page restores");
+    Check(kernel::ShutdownRegistrationCountForTest() == 1, "shutdown registration survives until teardown");
     mem::Shutdown();
+    Check(kernel::ShutdownRegistrationCountForTest() == 0,
+          "production image teardown clears shutdown registration metadata");
     return failures;
 }

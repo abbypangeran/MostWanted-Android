@@ -1,7 +1,7 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-26",
-  "milestone": "SCOPED_SHUTDOWN_REGISTRATION",
+  "phase": "2D-27",
+  "milestone": "BOUNDARY_211",
   "result": "PARTIAL",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
@@ -344,8 +344,22 @@
     "FULL_KERNEL_SHUTDOWN_FIDELITY": "unresolved",
     "record": "object, callback, raw priority, owner thread, memory generation, image identity",
     "tests": "452 memory-test PASS / 0 FAIL",
-    "route_210": "not generated",
+    "route_211": "generated and preflighted",
     "historical_identities_unchanged": true
+  },
+  "boundary_211": {
+    "parent": 71,
+    "child": 140,
+    "total": 211,
+    "boundary_steps": 213,
+    "child_stop": "0x002B5E37",
+    "extension_instructions": 25,
+    "mapping_identity": "E9DFEF8BB5AC0970",
+    "mapping_entries": 225,
+    "parent_manifest": "48120EDC4D3D4466",
+    "child_manifest": "2FA1FDFDA0F3F86B",
+    "preflight": "PASS 225/225",
+    "historical_186_identities": ["07AEBFC052075330", "48120EDC4D3D4466", "322795BF56BE60B6"]
   },
   "authorises_authentic_execution": false,
   "r1_16": "ON_HOLD",

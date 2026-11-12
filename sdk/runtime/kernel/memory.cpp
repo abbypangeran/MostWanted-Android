@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "kernel/kernel_objects.h"
 
 #include <algorithm>
 #include <array>
@@ -777,6 +778,7 @@ static void EnsureRanges() {
 }
 
 void Shutdown() {
+    kernel::ClearShutdownRegistrations();
     kernel::KernelMemoryLifecycle lifecycle;
     if (!lifecycle.StopWorker()) {
         LOGE("memory: kernel workers could not be joined; guest memory remains mapped");

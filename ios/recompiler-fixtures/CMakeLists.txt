@@ -79,6 +79,7 @@ add_executable(execution_probe_tests
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/memory_protection.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
@@ -136,6 +137,7 @@ add_executable(execution_probe_real_preflight
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/memory_protection.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
@@ -193,6 +195,7 @@ add_executable(execution_probe_secondary_real_preflight
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/memory_protection.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
@@ -251,6 +254,7 @@ add_executable(execution_probe_integrated_real_preflight
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/memory_protection.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
@@ -324,6 +328,7 @@ add_executable(execution_probe_secondary_tests
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/memory_protection.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
@@ -355,6 +360,7 @@ add_executable(checked_recompiler_tests
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/memory_protection.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
@@ -370,6 +376,7 @@ add_executable(checked_fault_handler_tests
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
     ${XBE_SDK}/runtime/kernel/guest_strings.cpp
     ${XBE_SDK}/runtime/kernel/rtl.cpp
@@ -389,6 +396,7 @@ add_executable(synthetic_startup_integration_tests
     ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
     ${XBE_SDK}/runtime/kernel/threads.cpp
@@ -405,6 +413,7 @@ add_executable(vblank_runtime_tests
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
     ${XBE_SDK}/runtime/kernel/threads.cpp
@@ -483,6 +492,7 @@ add_executable(authentic_run_tests
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/memory_protection.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp
@@ -506,6 +516,7 @@ target_compile_definitions(authentic_run_tests PRIVATE
     AUTHENTIC_RUN_FIXTURE_XBE="${AUTHENTIC_RUN_FIXTURE_XBE}"
 )
 target_link_libraries(authentic_run_tests PRIVATE Threads::Threads)
+target_sources(authentic_run_tests PRIVATE ${XBE_SDK}/runtime/kernel/kernel_objects.cpp)
 
 # The authentic experiment's recompiler config and static boundary. The
 # generated authentic mapping is excluded from the default build; the static
@@ -555,6 +566,7 @@ add_executable(authentic_run_accounting
     ${XBE_SDK}/runtime/kernel/clock_worker.cpp
     ${XBE_SDK}/runtime/kernel/worker_lifecycle.cpp
     ${XBE_SDK}/runtime/kernel/memory.cpp
+    ${XBE_SDK}/runtime/kernel/kernel_objects.cpp
     ${XBE_SDK}/runtime/kernel/memory_protection.cpp
     ${XBE_SDK}/runtime/kernel/objects.cpp
     ${XBE_SDK}/runtime/kernel/ordinals.cpp

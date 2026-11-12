@@ -9,7 +9,7 @@
 namespace kernel::authentic::route {
 
 enum class StepKind : uint8_t { kSequential, kConditional, kCall, kKernelCall, kRet };
-enum class Segment : uint8_t { kParentRoot, kSystemRoutine, kSehPrologue, kPreStartWalk, kStartCallSetup, kStartRoutine, kHardwareProbe };
+enum class Segment : uint8_t { kParentRoot, kSystemRoutine, kSehPrologue, kPreStartWalk, kStartCallSetup, kStartRoutine, kHardwareProbe, kKernelInit };
 
 struct Step {
     uint32_t pc;
@@ -218,13 +218,38 @@ inline constexpr Step kChildRoute[] = {
     {0x002B587Eu, 2, StepKind::kConditional, 0x002B5880u, 0x002B58B6u, 0x00000000u, 0x00000000u, 0, 0, true, Segment::kHardwareProbe, "jnz 0x002B58B6"},
     {0x002B58B6u, 1, StepKind::kSequential, 0x002B58B7u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "leave"},
     {0x002B58B7u, 1, StepKind::kRet, 0x002B38A7u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kHardwareProbe, "ret"},
+    {0x002B38A7u, 5, StepKind::kCall, 0x002B38ACu, 0x002B5664u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kStartRoutine, "call 0x002B5664"},
+    {0x002B5664u, 1, StepKind::kSequential, 0x002B5665u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push ebp"},
+    {0x002B5665u, 2, StepKind::kSequential, 0x002B5667u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "mov ebp, esp"},
+    {0x002B5667u, 3, StepKind::kSequential, 0x002B566Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "sub esp, 0x34"},
+    {0x002B566Au, 1, StepKind::kSequential, 0x002B566Bu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push ebx"},
+    {0x002B566Bu, 1, StepKind::kSequential, 0x002B566Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push esi"},
+    {0x002B566Cu, 1, StepKind::kSequential, 0x002B566Du, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push edi"},
+    {0x002B566Du, 2, StepKind::kSequential, 0x002B566Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "xor ebx, ebx"},
+    {0x002B566Fu, 1, StepKind::kSequential, 0x002B5670u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "inc ebx"},
+    {0x002B5670u, 1, StepKind::kSequential, 0x002B5671u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push ebx"},
+    {0x002B5671u, 2, StepKind::kSequential, 0x002B5673u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "xor esi, esi"},
+    {0x002B5673u, 5, StepKind::kSequential, 0x002B5678u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x46CD30"},
+    {0x002B5678u, 3, StepKind::kSequential, 0x002B567Bu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "mov [ebp-0x04], esi"},
+    {0x002B567Bu, 6, StepKind::kKernelCall, 0x002B5681u, 0x00000000u, 0x003C9E38u, 0x8000002Fu, 47, 2, false, Segment::kKernelInit, "call [0x003C9E38]"},
+    {0x002B5681u, 5, StepKind::kCall, 0x002B5686u, 0x002B5E12u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "call 0x002B5E12"},
+    {0x002B5E12u, 1, StepKind::kSequential, 0x002B5E13u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push ebp"},
+    {0x002B5E13u, 2, StepKind::kSequential, 0x002B5E15u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "mov ebp, esp"},
+    {0x002B5E15u, 3, StepKind::kSequential, 0x002B5E18u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "sub esp, 0x0C"},
+    {0x002B5E18u, 2, StepKind::kSequential, 0x002B5E1Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x00"},
+    {0x002B5E1Au, 5, StepKind::kSequential, 0x002B5E1Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x2B5E00"},
+    {0x002B5E1Fu, 5, StepKind::kSequential, 0x002B5E24u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x4EDBA0"},
+    {0x002B5E24u, 6, StepKind::kKernelCall, 0x002B5E2Au, 0x00000000u, 0x003C9E30u, 0x8000006Bu, 107, 3, false, Segment::kKernelInit, "call [0x003C9E30]"},
+    {0x002B5E2Au, 2, StepKind::kSequential, 0x002B5E2Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x00"},
+    {0x002B5E2Cu, 5, StepKind::kSequential, 0x002B5E31u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x4EDBC0"},
+    {0x002B5E31u, 6, StepKind::kKernelCall, 0x002B5E37u, 0x00000000u, 0x003C9E1Cu, 0x80000071u, 113, 2, false, Segment::kKernelInit, "call [0x003C9E1C]"},
 };
 inline constexpr size_t kChildRouteCount = sizeof(kChildRoute) / sizeof(kChildRoute[0]);
 
 inline constexpr uint32_t kParentEntry = 0x002B3916;
 inline constexpr uint32_t kParentStop = 0x002B3987;
 inline constexpr uint32_t kChildEntry = 0x002B5C0F;
-inline constexpr uint32_t kChildStop = 0x002B38A7;
+inline constexpr uint32_t kChildStop = 0x002B5E37;
 inline constexpr uint32_t kChildStartRoutine = 0x002B38A2;
 inline constexpr uint32_t kChildStartContext = 0;
 inline constexpr uint32_t kChildSystemRoutine = 0x002B5C0F;
@@ -247,11 +272,11 @@ inline constexpr uint32_t kSehScopeFlag = 0x00000000;
 inline constexpr uint32_t kCriticalSectionObject = 0x0046C8B0;
 inline constexpr uint32_t kTlsBlockSize = 0x94;
 inline constexpr uint32_t kParentExecutedInstructions = 71;
-inline constexpr uint32_t kChildExecutedInstructions = 115;
-inline constexpr uint32_t kTotalExecutedInstructions = 186;
+inline constexpr uint32_t kChildExecutedInstructions = 140;
+inline constexpr uint32_t kTotalExecutedInstructions = 211;
 inline constexpr uint32_t kParentBoundarySteps = 72;
-inline constexpr uint32_t kChildBoundarySteps = 116;
-inline constexpr uint32_t kTotalBoundarySteps = 188;
+inline constexpr uint32_t kChildBoundarySteps = 141;
+inline constexpr uint32_t kTotalBoundarySteps = 213;
 inline constexpr uint32_t kParentTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C};
 inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, kSehHandler, 0x002B5999, 0x002B59A1,
                                                0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,

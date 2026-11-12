@@ -140,9 +140,11 @@ bool ShutdownRegistrationForTest(size_t index, ShutdownRegistrationRecord* recor
     return true;
 }
 
-void ClearShutdownRegistrationsForTest() {
+void ClearShutdownRegistrations() {
     std::lock_guard lock(g_shutdown_lock);
     g_shutdown_registrations.clear();
 }
+
+void ClearShutdownRegistrationsForTest() { ClearShutdownRegistrations(); }
 
 }  // namespace kernel

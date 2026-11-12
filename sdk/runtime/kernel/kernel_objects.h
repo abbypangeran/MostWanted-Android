@@ -57,6 +57,7 @@ KernelObjectStatus RegisterShutdownNotificationChecked(uint32_t object, uint32_t
                                                        uint32_t callback_high);
 size_t ShutdownRegistrationCountForTest();
 bool ShutdownRegistrationForTest(size_t index, ShutdownRegistrationRecord* record);
+void ClearShutdownRegistrations();
 void ClearShutdownRegistrationsForTest();
 
 }  // namespace kernel

@@ -177,3 +177,17 @@ unsupported-removal rejection, no callback execution and explicit cleanup. The x
 failure. SCOPED_STARTUP_COMPATIBILITY is established; FULL_KERNEL_SHUTDOWN_FIDELITY remains unresolved.
 The 210-instruction route was not generated; the 186-route identities remain historical. Gate A remains
 GO, the historical Gate B 186 PASS remains, the 210 boundary is NO-GO and Gate C remains NO-GO.
+
+
+## Phase 2D-27 — 211-instruction boundary
+
+`PHASE_2D27_211_BOUNDARY_READINESS = PASS` (offline/static/synthetic).
+
+The 25-instruction extension is parent 71 / child 140 / total 211 / 213 boundary steps; the `002B5681`
+call is retained. The new mapping is `E9DFEF8BB5AC0970` (225 entries), parent `48120EDC4D3D4466`, child
+`2FA1FDFDA0F3F86B`; the 186-route identities are historical only. Ordinals 47/107/113 use the production
+checked services; the scoped registration record clears on `mem::Shutdown`. The preflight, Debug/Release
+authentic tests, checked fixtures, CTests, accounting and memory/registration suite pass. Gate A GO; the
+211 boundary is static/synthetic ready for a separately authorised run; Gate C remains NO-GO. A fourth
+authentic run is technically justified only for exactly this 211/213 boundary and with the explicit
+`SCOPED_STARTUP_COMPATIBILITY` / `FULL_KERNEL_SHUTDOWN_FIDELITY=unresolved` caveat.

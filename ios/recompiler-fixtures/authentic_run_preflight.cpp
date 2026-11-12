@@ -361,8 +361,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < route::kParentRouteCount; ++i)
         if (route::kParentRoute[i].next == route::kParentStop) parent_stop_edge = true;
     for (size_t i = 0; i < route::kChildRouteCount; ++i)
-        if (route::kChildRoute[i].kind == route::StepKind::kRet && route::kChildRoute[i].next == route::kChildStop)
-            child_stop_edge = true;
+        if (route::kChildRoute[i].next == route::kChildStop) child_stop_edge = true;
     Record("AUTH_RUN_PARENT_STOP_EDGE", parent_stop_edge);
     Record("AUTH_RUN_CHILD_STOP_EDGE", child_stop_edge);
     // Startup data.
