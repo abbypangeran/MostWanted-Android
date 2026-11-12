@@ -1,7 +1,7 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-25",
-  "milestone": "SHUTDOWN_REGISTRATION_EVIDENCE",
+  "phase": "2D-26",
+  "milestone": "SCOPED_SHUTDOWN_REGISTRATION",
   "result": "PARTIAL",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
@@ -291,13 +291,13 @@
     "Gate C and customer release"
   ],
   "shutdown_registration": {
-    "result": "partial",
+    "result": "scoped_compatibility_implemented",
     "abi": "VOID NTAPI HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION, BOOLEAN)",
     "layout": "NotificationRoutine +0x00, Priority +0x04, ListEntry +0x08; size 0x10",
     "authentic_object": "0x0046CD30: routine 0x002B8D6D, priority 0x80000000, list {0,0}",
     "authentic_call": "0x002B567B: object 0x0046CD30, action 1 (register)",
     "unresolved": "kernel list head, ordering, duplicate/removal, shutdown consumption",
-    "implementation": "no-op retained; no speculative registry or guest-list mutation",
+    "implementation": "checked host-owned record; callback stored only; no guest-list mutation",
     "external_evidence": "nxdk ABI/layout and RXDK export 47; Cxbx has no implementation"
   },
   "checked_kernel_objects": {
@@ -338,6 +338,14 @@
       "authentic_preflight": "PASS 200/200",
       "android_kernel_objects_syntax": "PASS"
     }
+  },
+  "scoped_registration": {
+    "SCOPED_STARTUP_COMPATIBILITY": "established",
+    "FULL_KERNEL_SHUTDOWN_FIDELITY": "unresolved",
+    "record": "object, callback, raw priority, owner thread, memory generation, image identity",
+    "tests": "452 memory-test PASS / 0 FAIL",
+    "route_210": "not generated",
+    "historical_identities_unchanged": true
   },
   "authorises_authentic_execution": false,
   "r1_16": "ON_HOLD",

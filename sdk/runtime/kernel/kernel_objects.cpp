@@ -1,6 +1,10 @@
 #include "kernel/kernel_objects.h"
 
 #include <array>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <vector>
 
 namespace kernel {
 namespace {
@@ -35,6 +39,9 @@ KernelObjectStatus MapStatus(mem::AccessStatus status) {
     return KernelObjectStatus::kHostError;
 }
 
+std::mutex g_shutdown_lock;
+std::vector<ShutdownRegistrationRecord> g_shutdown_registrations;
+
 }  // namespace
 
 const char* KernelObjectStatusName(KernelObjectStatus status) {
@@ -46,6 +53,11 @@ const char* KernelObjectStatusName(KernelObjectStatus status) {
         case KernelObjectStatus::kPermissionDenied: return "permission-denied";
         case KernelObjectStatus::kBusy: return "busy";
         case KernelObjectStatus::kInvalidType: return "invalid-type";
+        case KernelObjectStatus::kInvalidCallback: return "invalid-callback";
+        case KernelObjectStatus::kUnsupportedAction: return "unsupported-action";
+        case KernelObjectStatus::kDuplicateRegistration: return "duplicate-registration";
+        case KernelObjectStatus::kStaleOwner: return "stale-owner";
+        case KernelObjectStatus::kInternalFailure: return "internal-failure";
         case KernelObjectStatus::kHostError: return "host-error";
     }
     return "unknown";
@@ -79,6 +91,58 @@ KernelObjectStatus InitializeTimerExChecked(uint32_t timer, uint32_t type) {
     Put32(object, 12, wait_list);
     // SignalState at +4, DueTime, TimerListEntry, Dpc and Period stay zero.
     return MapStatus(mem::Write(timer, object.data(), object.size()));
+}
+
+KernelObjectStatus RegisterShutdownNotificationChecked(uint32_t object, uint32_t action, uint32_t owner_thread,
+                                                       const char* image_sha1, uint32_t callback_low,
+                                                       uint32_t callback_high) {
+    if (!mem::IsInitialized()) return KernelObjectStatus::kNotInitialized;
+    if (action != 1) return KernelObjectStatus::kUnsupportedAction;
+    if (!image_sha1 || !*image_sha1) return KernelObjectStatus::kStaleOwner;
+    mem::ScopedPageLease lease;
+    const KernelObjectStatus acquired = MapStatus(lease.Acquire(object, 0x10, mem::kRead));
+    if (acquired != KernelObjectStatus::kOk) return acquired;
+    std::array<uint8_t, 0x10> bytes{};
+    if (mem::Read(object, bytes.data(), bytes.size()) != mem::AccessStatus::kOk)
+        return KernelObjectStatus::kInvalidAddress;
+    const uint32_t routine = uint32_t(bytes[0]) | uint32_t(bytes[1]) << 8 | uint32_t(bytes[2]) << 16 |
+                             uint32_t(bytes[3]) << 24;
+    const uint32_t priority = uint32_t(bytes[4]) | uint32_t(bytes[5]) << 8 | uint32_t(bytes[6]) << 16 |
+                              uint32_t(bytes[7]) << 24;
+    if (routine < callback_low || routine >= callback_high) return KernelObjectStatus::kInvalidCallback;
+    std::lock_guard lock(g_shutdown_lock);
+    for (const ShutdownRegistrationRecord& existing : g_shutdown_registrations)
+        if (existing.object == object) return KernelObjectStatus::kDuplicateRegistration;
+    ShutdownRegistrationRecord record;
+    record.object = object;
+    record.notification_routine = routine;
+    record.priority = priority;
+    record.owner_thread = owner_thread;
+    record.memory_generation = mem::Generation();
+    std::snprintf(record.image_sha1, sizeof(record.image_sha1), "%s", image_sha1);
+    try {
+        g_shutdown_registrations.push_back(record);
+    } catch (...) {
+        return KernelObjectStatus::kInternalFailure;
+    }
+    return KernelObjectStatus::kOk;
+}
+
+size_t ShutdownRegistrationCountForTest() {
+    std::lock_guard lock(g_shutdown_lock);
+    return g_shutdown_registrations.size();
+}
+
+bool ShutdownRegistrationForTest(size_t index, ShutdownRegistrationRecord* record) {
+    std::lock_guard lock(g_shutdown_lock);
+    if (index >= g_shutdown_registrations.size() || !record) return false;
+    *record = g_shutdown_registrations[index];
+    return true;
+}
+
+void ClearShutdownRegistrationsForTest() {
+    std::lock_guard lock(g_shutdown_lock);
+    g_shutdown_registrations.clear();
 }
 
 }  // namespace kernel

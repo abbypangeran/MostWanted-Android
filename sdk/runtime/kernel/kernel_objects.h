@@ -15,6 +15,11 @@ enum class KernelObjectStatus : uint8_t {
     kPermissionDenied,
     kBusy,
     kInvalidType,
+    kInvalidCallback,
+    kUnsupportedAction,
+    kDuplicateRegistration,
+    kStaleOwner,
+    kInternalFailure,
     kHostError,
 };
 
@@ -31,5 +36,27 @@ KernelObjectStatus InitializeDpcChecked(uint32_t dpc, uint32_t routine, uint32_t
 // list at +8/+12 and zero DueTime/TimerListEntry/Dpc/Period. The complete
 // 0x28 span is validated and pinned. No timer is scheduled.
 KernelObjectStatus InitializeTimerExChecked(uint32_t timer, uint32_t type);
+
+// Scoped startup compatibility model for HalRegisterShutdownNotification.
+// The reviewed 210-instruction boundary only needs the registration call to
+// consume its arguments without reading the object again, mutating its
+// ListEntry, invoking the callback or depending on kernel-list ordering. This
+// records the reviewed fields and validates the callback range; it is NOT a
+// full Xbox shutdown-list implementation.
+struct ShutdownRegistrationRecord {
+    uint32_t object = 0;
+    uint32_t notification_routine = 0;
+    uint32_t priority = 0;
+    uint32_t owner_thread = 0;
+    uint64_t memory_generation = 0;
+    char image_sha1[41] = {};
+};
+
+KernelObjectStatus RegisterShutdownNotificationChecked(uint32_t object, uint32_t action, uint32_t owner_thread,
+                                                       const char* image_sha1, uint32_t callback_low,
+                                                       uint32_t callback_high);
+size_t ShutdownRegistrationCountForTest();
+bool ShutdownRegistrationForTest(size_t index, ShutdownRegistrationRecord* record);
+void ClearShutdownRegistrationsForTest();
 
 }  // namespace kernel

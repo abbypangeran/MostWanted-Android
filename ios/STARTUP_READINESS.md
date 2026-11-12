@@ -162,3 +162,18 @@ Ordinal-47 evidence: nxdk void ABI with two stdcall arguments; `HAL_SHUTDOWN_REG
 evidence was found for the kernel-private list head, ordering, duplicate/removal or shutdown consumption,
 and Cxbx has no implementation. The no-op is retained; no speculative list or callback was written. The
 210-instruction boundary remains ungenerated and NO-GO. A fourth authentic run is not justified.
+
+
+## Phase 2D-26 — scoped shutdown registration
+
+`PHASE_2D26_SCOPED_REGISTRATION = PARTIAL`.
+
+The reviewed extension from `002B38A7` to the proposed `002B5E37` stop does not depend on the unknown
+shutdown-list semantics: `0046CD30` is only passed to ordinal 47; the object is not read again, its
+`ListEntry` is not consulted, and no callback, removal or ordering effect is used. A checked host-owned
+registration record is implemented and tested (`RegisterShutdownNotificationChecked`): full `0x10` span
+validation, callback range, raw priority/object/owner/generation/image identity, duplicate rejection,
+unsupported-removal rejection, no callback execution and explicit cleanup. The xboxkrnl HLE traps on
+failure. SCOPED_STARTUP_COMPATIBILITY is established; FULL_KERNEL_SHUTDOWN_FIDELITY remains unresolved.
+The 210-instruction route was not generated; the 186-route identities remain historical. Gate A remains
+GO, the historical Gate B 186 PASS remains, the 210 boundary is NO-GO and Gate C remains NO-GO.

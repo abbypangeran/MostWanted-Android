@@ -103,6 +103,49 @@ extern "C" int RunKernelObjectTests() {
     Check(mem::Decommit(page + mem::kPage, mem::kPage), "cross-page DPC page decommits");
     Check(kernel::InitializeDpcChecked(cross_page, 0x002B5E00, 0) == kernel::KernelObjectStatus::kUncommitted,
           "decommitted cross-page object is rejected");
+    kernel::ClearShutdownRegistrationsForTest();
+    const uint32_t registration = page + 0x300;
+    std::array<uint8_t, 0x10> registration_bytes{};
+    const uint32_t routine = 0x002B8D6D, priority = 0x80000000u;
+    std::memcpy(registration_bytes.data(), &routine, 4);
+    std::memcpy(registration_bytes.data() + 4, &priority, 4);
+    Check(mem::Write(registration, registration_bytes.data(), registration_bytes.size()) == mem::AccessStatus::kOk,
+          "shutdown registration object is writable");
+    Check(kernel::RegisterShutdownNotificationChecked(registration, 1, 7, "test-image", 0x00011000u, 0x00380000u) ==
+              kernel::KernelObjectStatus::kOk,
+          "checked shutdown registration succeeds");
+    Check(kernel::ShutdownRegistrationCountForTest() == 1, "shutdown registration record is observable");
+    kernel::ShutdownRegistrationRecord record;
+    Check(kernel::ShutdownRegistrationForTest(0, &record) && record.object == registration &&
+              record.notification_routine == routine && record.priority == priority && record.owner_thread == 7 &&
+              std::strcmp(record.image_sha1, "test-image") == 0,
+          "shutdown record preserves the object, callback, priority and owner");
+    Check(kernel::RegisterShutdownNotificationChecked(registration, 1, 7, "test-image", 0x00011000u, 0x00380000u) ==
+              kernel::KernelObjectStatus::kDuplicateRegistration,
+          "duplicate shutdown registration is rejected");
+    Check(kernel::RegisterShutdownNotificationChecked(registration, 0, 7, "test-image", 0x00011000u, 0x00380000u) ==
+              kernel::KernelObjectStatus::kUnsupportedAction,
+          "shutdown removal remains unavailable");
+    Check(kernel::RegisterShutdownNotificationChecked(registration, 1, 7, "", 0x00011000u, 0x00380000u) ==
+              kernel::KernelObjectStatus::kStaleOwner,
+          "shutdown registration rejects a missing image identity");
+    Check(kernel::RegisterShutdownNotificationChecked(registration, 1, 7, "test-image", 0x00380000u, 0x00400000u) ==
+              kernel::KernelObjectStatus::kInvalidCallback,
+          "shutdown registration rejects a callback outside the reviewed range");
+    Check(kernel::RegisterShutdownNotificationChecked(mem::kUserLow + 0x7F000, 1, 7, "test-image", 0x00011000u,
+                                                      0x00380000u) == kernel::KernelObjectStatus::kUncommitted,
+          "shutdown registration rejects an uncommitted object");
+    Check(mem::Protect(page, mem::kPage, mem::kRead) == mem::AccessStatus::kOk,
+          "shutdown registration page becomes read-only");
+    const kernel::KernelObjectStatus read_only_status =
+        kernel::RegisterShutdownNotificationChecked(registration, 1, 7, "test-image", 0x00011000u, 0x00380000u);
+    std::printf("read-only registration status=%s\n", kernel::KernelObjectStatusName(read_only_status));
+    Check(read_only_status != kernel::KernelObjectStatus::kOk,
+          "read-only registration object cannot establish a second host record");
+    Check(mem::Protect(page, mem::kPage, mem::kReadWrite) == mem::AccessStatus::kOk,
+          "shutdown registration page restores");
+    kernel::ClearShutdownRegistrationsForTest();
+    Check(kernel::ShutdownRegistrationCountForTest() == 0, "shutdown registration metadata cleans up");
     mem::Shutdown();
     return failures;
 }

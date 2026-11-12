@@ -1240,7 +1240,15 @@ KERNEL_EXPORT(49, HalReturnToFirmware, 1) {
 
 KERNEL_EXPORT(360, HalInitiateShutdown, 0) { Shutdown(0); }
 KERNEL_EXPORT(358, HalIsResetOrShutdownPending, 0) { return 0; }
-KERNEL_EXPORT(47, HalRegisterShutdownNotification, 2) { return 0; }
+KERNEL_EXPORT(47, HalRegisterShutdownNotification, 2) {
+    if (!ImageIdentityMatches(kAuthenticImageSha1))
+        x86_trap(ctx, 0x002B567B, "HalRegisterShutdownNotification: image identity mismatch");
+    const KernelObjectStatus status = RegisterShutdownNotificationChecked(
+        a[0], a[1], Current() ? Current()->id : 0, kAuthenticImageSha1, 0x00011000u, 0x00380000u);
+    if (status != KernelObjectStatus::kOk)
+        x86_trap(ctx, a[0], "HalRegisterShutdownNotification: checked registration failed");
+    return 0;
+}
 // the file cache in pages: nothing is cached here, the size only goes back to the title
 static uint32_t g_cache_pages = 16;
 KERNEL_EXPORT(35, FscGetCacheSize, 0) { return g_cache_pages; }

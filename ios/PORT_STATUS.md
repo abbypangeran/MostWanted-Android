@@ -4576,4 +4576,48 @@ replaced by a speculative host registry or fabricated list. The 210-instruction 
 The mapping `07AEBFC052075330`, parent `48120EDC4D3D4466` and child `322795BF56BE60B6` remain the historical
 186-route identities.
 
+
+## Phase 2D-26 — scoped shutdown registration
+
+**`PHASE_2D26_SCOPED_REGISTRATION = PARTIAL`.** The scoped registration implementation and its tests are
+delivered. The 210-instruction route was not generated, so the historical 186-route remains the last
+authentic checkpoint. No authentic instruction ran.
+
+### Observable-dependency analysis
+
+Between the ordinal-47 call at `002B567B` and the proposed stop at `002B5E37`, the reviewed route only
+pushes `0046CD30` as the first argument. It does not read the registration object again, mutate its
+`ListEntry`, invoke shutdown/removal, execute the registered callback, depend on ordering or consume the
+void return value. The callback `002B8D6D` is not referenced by the extension. The static dependency is
+therefore limited to the registration call consuming its arguments.
+
+### Scoped implementation
+
+`RegisterShutdownNotificationChecked` in `sdk/runtime/kernel/kernel_objects.cpp` validates the full `0x10`
+object span through checked memory, reads the routine/priority, enforces the reviewed callback range,
+records the object address, raw priority, owner thread, memory generation and image identity in a
+host-owned vector, rejects duplicate registration and unsupported removal, and never invokes the callback.
+No guest list head is fabricated and no `ListEntry` mutation is invented. The xboxkrnl ordinal-47 HLE traps
+on an image/registration failure instead of returning a fabricated success.
+
+Status split:
+
+- **SCOPED_STARTUP_COMPATIBILITY: established** for the reviewed 24-instruction extension.
+- **FULL_KERNEL_SHUTDOWN_FIDELITY: unresolved** — original kernel list insertion, ordering, removal and
+  callback delivery remain unproven.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| `mostwanted_memory_tests` (macOS) | 452 PASS / 0 FAIL |
+| New shutdown-registration tests | valid record, preserved fields, duplicate, unsupported removal, missing image, invalid callback, uncommitted and read-only cases |
+| DPC/timer tests | 25 PASS, unchanged |
+| Authentic suite / checked fixtures | 95 / 812 PASS (last verified) |
+| Authentic preflight | 200/200 PASS, unchanged historical identities |
+
+The 210 route was not prepared because the scoped route generation and preflight were not completed in
+this phase. The mapping `07AEBFC052075330`, parent `48120EDC4D3D4466` and child `322795BF56BE60B6` remain
+historical and must not be reused after a route change.
+
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
