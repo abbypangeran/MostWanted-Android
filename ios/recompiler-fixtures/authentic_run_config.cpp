@@ -55,7 +55,11 @@ int main(int argc, char** argv) {
     auto trap_length = [](uint32_t pc) -> uint32_t {
         switch (pc) {
             case route::kParentStop: return 1;
-            case route::kChildStop: return 1;
+            case route::kChildStop: return 5;
+            case 0x002B5E7F: return 5;
+            case 0x002B39B9: return 0x22;
+            case 0x002B5DE5: return 0x1B;
+            case 0x002B95AC: return 6;
             case route::kSehHandler: return 1;
             case 0x002B5CEC: return 8;
             case 0x002B3975: return 1;

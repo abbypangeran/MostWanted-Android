@@ -353,7 +353,8 @@ int main(int argc, char** argv) {
     Record("AUTH_RUN_CHILD_BUDGET_128_REFUSED", route::kChildRequiredTransfers > 128);
     Record("AUTH_RUN_PARENT_BUDGET_72_REFUSED", route::kParentRequiredTransfers > 72);
     Record("AUTH_RUN_PARENT_BUDGET_73_ACCEPTED", route::kParentRequiredTransfers <= 73);
-    Record("AUTH_RUN_CHILD_BUDGET_143_ACCEPTED", route::kChildRequiredTransfers <= 143);
+    Record("AUTH_RUN_CHILD_BUDGET_156_ACCEPTED", route::kChildRequiredTransfers <= 156);
+    Record("AUTH_RUN_CHILD_BUDGET_155_REFUSED", route::kChildRequiredTransfers > 155);
     char budget_line[96];
     std::snprintf(budget_line, sizeof(budget_line), "AUTH_RUN_PARENT_REQUIRED_TRANSFERS=%u",
                   route::kParentRequiredTransfers);

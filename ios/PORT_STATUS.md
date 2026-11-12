@@ -4842,3 +4842,131 @@ mapping identities are unchanged.
 
 The fifth run remains closed as FAIL. A further authentic attempt requires a new explicit authorisation and
 is not part of this phase. R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-28 — startup continuation beyond the 211-instruction boundary
+
+**`PHASE_2D28_STARTUP_CONTINUATION = PASS`** (offline/static/synthetic). No authentic XBE instruction ran;
+the fifth run was not retried and no sixth run was started.
+
+### Historical result preserved
+
+`FIFTH_AUTHENTIC_RUN = FAIL` remains the official historical result. The reviewed 211-instruction route
+completed authentically (211/211, both stops, seven kernel calls, stop-time TLS/SEH/kernel-object checks);
+the driver failed only its post-finalisation TLS evidence capture and exited 4. The Phase 2D-27C TLS
+snapshot remediation remains in place.
+
+### Authentic continuation map
+
+Starts at the previous child stop `0x002B5E37`:
+
+| PC | Len | Instruction | Semantics | Next |
+|---|---:|---|---|---|
+| `002B5E37` | 5 | `mov eax, [0x003C9E34]` | load `XboxHardwareInfo` pointer | `002B5E3C` |
+| `002B5E3C` | 7 | `and dword ptr [0x004EDBE8], 0x00` | clear timer watchdog flag | `002B5E43` |
+| `002B5E43` | 7 | `and dword ptr [0x004EDBEC], 0x00` | clear timer error flag | `002B5E4A` |
+| `002B5E4A` | 3 | `test byte ptr [eax], 0x08` | hardware flags bit 3 | `002B5E4D` |
+| `002B5E4D` | 2 | `jnz 0x002B5E7F` | reviewed not taken (flags `0x20`) | `002B5E4F` |
+| `002B5E4F` | 3 | `lea eax, [ebp-0x08]` | query result-length out | `002B5E52` |
+| `002B5E52` | 1 | `push eax` | argument 5 | `002B5E53` |
+| `002B5E53` | 2 | `push 0x04` | argument 4 (length) | `002B5E55` |
+| `002B5E55` | 3 | `lea eax, [ebp-0x04]` | query value out | `002B5E58` |
+| `002B5E58` | 1 | `push eax` | argument 3 | `002B5E59` |
+| `002B5E59` | 3 | `lea eax, [ebp-0x0C]` | query type out | `002B5E5C` |
+| `002B5E5C` | 1 | `push eax` | argument 2 | `002B5E5D` |
+| `002B5E5D` | 2 | `push 0x11` | argument 1 (device class `0x11`) | `002B5E5F` stop |
+
+The selected mandatory stop is the pre-instruction boundary at **`0x002B5E5F`**, before
+`call 0x002B39B9`.
+
+### Why this boundary
+
+The next call enters `0x002B39B9`: it pushes five arguments to `0x002B95AC`, which tail-jumps to
+`ExQueryNonVolatileSetting` (ordinal 24), then calls `RtlNtStatusToDosError` (301). Its result updates the
+timer watchdog flags. The following call at `0x002B5E7F` is `call 0x002B5DE5`, which sets the KTIMER with
+`KeSetTimer` (ordinal 149) and registers the DPC routine `0x002B5E00`; the DPC can call
+`HalInitiateShutdown` (360). That is an authentic callback path, which remains prohibited. Completing the
+helper to its return at `0x002B5686` would therefore require callback admission and the full device-query
+dependency. The selected boundary stops before the first call and avoids both. The alternate branch target
+`0x002B5E7F` is a trap entry; if the hardware flags ever take the branch, the gate fails closed with
+`kForbiddenBranch`.
+
+### Route accounting
+
+| Item | Before | After |
+|---|---:|---:|
+| Parent | 71 instr / 73 transfers | 71 / 73 (unchanged) |
+| Child | 140 / 143 | **153 / 156** |
+| Total instructions | 211 | **224** |
+| Boundary steps | 213 | **226** |
+| Child stop | `002B5E37` | **`002B5E5F`** |
+| Child kernels | 5 | 5 (`277,294,47,107,113`) |
+| Parent kernels | 2 | 2 (`255,187`) |
+| Child manifest | `585C5E1A742B6924` | **`3440CAC0FC3A57FB`** |
+| Parent manifest | `85527B8FA581229F` | `85527B8FA581229F` (unchanged) |
+| Mapping | `E9DFEF8BB5AC0970` (225) | **`94166820FBB48A28` (242)** |
+
+The mapping change is required by the new route steps and trap entries. The parent manifest identity is
+unchanged because the parent route and its identity inputs did not change.
+
+### Implementation
+
+- `sdk/runtime/kernel/authentic_run_route.h`: 13 new child steps, new stop `002B5E5F`, child 153/156,
+  total 224/226; trap-only entries for the stop, the alternate `002B5E7F`, and the three call targets
+  reached only by trap functions (`002B39B9`, `002B5DE5`, `002B95AC`).
+- `ios/recompiler-fixtures/authentic_run_config.cpp`: trap-only function lengths for the new stop and call
+  targets; the generated authentic mapping is 242 entries.
+- `ios/recompiler-fixtures/authentic_run_preflight.cpp`: derived child budget checks; 128 and 155 are
+  refused, 156 is accepted.
+- `sdk/tools/recomp/codegen.cpp`: checked `test r/m8, imm8` support (the `test byte ptr [eax], 0x08` at
+  `002B5E4A`). The generated code performs a checked `x86_mem_read<uint8_t>` and sets CF/OF/ZF/SF/PF. No
+  new runtime kernel service and no guest-state fabrication.
+- `ios/recompiler-fixtures/authentic_run_fixture_builder.cpp`: the synthetic mirror encodes the new
+  hardware read, flag clears, byte test and argument setup; synthetic timer-flag storage is cleared by the
+  route.
+- `ios/recompiler-fixtures/authentic_run_tests.cpp`: updated route counts and budgets; reusable
+  `AcceptFullRoute` contract (mapping/manifest identity, budget sufficiency, instruction/transfer
+  accounting, kernel ordinals/ABI, terminal stops, SEH/TLS snapshot, read-only evidence, cleanup and
+  post-stop refusal); terminal-stop budget and rewritten-next tests updated.
+
+### Synthetic rehearsal and acceptance
+
+`FULL_ROUTE parent_instructions=71 parent_transfers=73 child_instructions=153 child_transfers=156
+total_instructions=224 boundary_steps=226`
+
+The synthetic mirror executes the unchanged parent, the expanded child through `002B5E5D`, stops before the
+synthetic `002B5E5F`, reaches all five child kernels, checks the new flag writes, SEH/TLS snapshot, worker
+cleanup and the acceptance contract. Negative cases include insufficient transfer budgets (128/155), stale
+identities, the terminal-stop budget, rewritten terminal edges, unexpected loops/unknown transfers,
+unsupported instructions, kernel rejection, memory faults and TLS evidence-after-release.
+
+### Fresh validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` | 155 PASS / 0 FAIL | 155 PASS / 0 FAIL |
+| `checked_recompiler_tests` | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, 242/242 | PASS, 242/242 |
+| `authentic_run_accounting` | 1280 -> 0 | 1280 -> 0 |
+| `mostwanted_memory_tests` | 454 PASS / 0 FAIL | 454 PASS / 0 FAIL |
+| Android ARM64 syntax (`authentic_run.cpp`, `kernel_objects.cpp`) | PASS | — |
+
+The authenticated preflight reports parent `85527B8FA581229F`, child `3440CAC0FC3A57FB`, mapping
+`94166820FBB48A28` (242), parent 73, child 156, stop `002B5E5F`, total 224/226 and
+`AUTH_RUN_RESULT=PASS`.
+
+### Gates and next experiment
+
+| Gate | Result | Scope |
+|---|---|---|
+| A — preparation | **GO** | image, mapping, manifests, budgets and evidence harness |
+| B — 224-instruction continuation | **static/synthetic READY; execution NO-GO** | new driver/admission and separate explicit authorisation required |
+| C — actual game startup | **NO-GO** | unchanged Gate C dependencies |
+
+A further bounded authentic experiment over exactly this 224/226 route is technically justified from the
+offline evidence, using mapping `94166820FBB48A28`, parent `85527B8FA581229F`, child `3440CAC0FC3A57FB`,
+budgets 73/156, kernels 2/5 and stop `002B5E5F`. It would stop before the device query and timer DPC and
+must not authorise callbacks. It requires a new explicit authorisation; no run is authorised or performed
+by this phase.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

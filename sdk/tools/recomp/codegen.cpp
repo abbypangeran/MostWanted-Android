@@ -352,6 +352,10 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                            is_register32(ops[1]);
         bool checked_test = m == ZYDIS_MNEMONIC_TEST && in.operand_count_visible == 2 && is_register32(ops[0]) &&
                             is_register32(ops[1]) && ops[0].reg.value == ops[1].reg.value;
+        bool checked_test_byte_memory_imm = m == ZYDIS_MNEMONIC_TEST && in.operand_count_visible == 2 &&
+                                            ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[0].size == 8 &&
+                                            is_flat_guest_memory(ops[0]) &&
+                                            ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[1].size <= 8;
         bool checked_shr = m == ZYDIS_MNEMONIC_SHR && in.operand_count_visible == 2 && in.operand_width == 32 &&
                            is_register32(ops[0]) && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[1].size == 8;
         bool checked_shl = m == ZYDIS_MNEMONIC_SHL && in.operand_count_visible == 2 && in.operand_width == 32 &&
@@ -407,7 +411,8 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
         bool locked = in.attributes & ZYDIS_ATTRIB_HAS_LOCK;
         if (!(checked_mov || checked_extend || checked_movq || checked_rmw || checked_sbb || checked_neg_al || checked_cmp ||
               checked_and || checked_or || checked_push || checked_pop || checked_cdq || checked_idiv || checked_xor ||
-              checked_test || checked_shl || checked_shr || checked_leave || checked_lea || checked_not_al ||
+              checked_test || checked_test_byte_memory_imm || checked_shl || checked_shr || checked_leave ||
+              checked_lea || checked_not_al ||
               checked_rep_string || checked_branch || checked_call || checked_indirect_call ||
               checked_indirect_register_call || checked_jmp || checked_indirect_jmp ||
               checked_indirect_register_jmp || checked_ret) || locked) {

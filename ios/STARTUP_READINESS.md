@@ -241,3 +241,39 @@ instruction/transfer counts and kernel/SEH/stop conditions.
 Identities are unchanged: mapping `E9DFEF8BB5AC0970`, parent `85527B8FA581229F`, child
 `585C5E1A742B6924`. The fifth run remains closed as FAIL. No sixth run, authentic retry or Gate C
 activation is authorised by this phase.
+
+## Phase 2D-28 — startup continuation to `0x002B5E5F`
+
+`PHASE_2D28_STARTUP_CONTINUATION = PASS` (offline/static/synthetic).
+
+The reviewed route now continues from the former child stop `0x002B5E37` through 13 instructions
+(`002B5E37..002B5E5D`) and stops before `call 0x002B39B9` at **`0x002B5E5F`**. The helper's remaining
+device query enters `ExQueryNonVolatileSetting` (24) via the `002B95AC` tail jump and `RtlNtStatusToDosError`
+(301); the following `002B5E7F` call schedules the KTIMER with `KeSetTimer` (149) and the `002B5E00` DPC,
+which is a prohibited authentic callback. The boundary therefore stops before those dependencies.
+
+| Item | Value |
+|---|---|
+| Parent | 71 instructions / 73 transfers (unchanged) |
+| Child | 153 instructions / 156 transfers |
+| Total | 224 instructions / 226 boundary steps |
+| Child stop | `0x002B5E5F` (pre-instruction) |
+| Kernels | parent 255,187; child 277,294,47,107,113 |
+| Parent manifest | `85527B8FA581229F` |
+| Child manifest | `3440CAC0FC3A57FB` |
+| Mapping | `94166820FBB48A28` (242 entries) |
+
+Required runtime support: checked `test r/m8, imm8` for `002B5E4A` in `sdk/tools/recomp/codegen.cpp`
+(checked guest-memory read, exact CF/OF/ZF/SF/PF). No new kernel export was added.
+
+The synthetic mirror retires 224 instructions in 226 boundary steps, checks the new flag clears, the
+existing kernel/SEH/TLS/stop conditions, the `AcceptFullRoute` acceptance contract, and all negative
+budget/identity/terminal/loop/unknown-transfer/unsupported/memory/TLS-lifecycle cases.
+
+Fresh Debug/Release: authentic tests 155/0, checked fixtures 812/0, safe CTests 5/5, preflight PASS 242/242,
+accounting 1280 -> 0, memory tests 454/0, Android ARM64 syntax PASS.
+
+The historical `FIFTH_AUTHENTIC_RUN = FAIL` (211/211 completed, both stops, post-finalisation TLS evidence
+failure) is preserved and not converted. Gate A GO; Gate B for the new 224 boundary is static/synthetic
+READY with execution NO-GO pending a new driver/admission and separate authorisation; Gate C remains
+NO-GO. No authentic execution or sixth run was performed.

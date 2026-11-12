@@ -243,13 +243,30 @@ inline constexpr Step kChildRoute[] = {
     {0x002B5E2Au, 2, StepKind::kSequential, 0x002B5E2Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x00"},
     {0x002B5E2Cu, 5, StepKind::kSequential, 0x002B5E31u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x4EDBC0"},
     {0x002B5E31u, 6, StepKind::kKernelCall, 0x002B5E37u, 0x00000000u, 0x003C9E1Cu, 0x80000071u, 113, 2, false, Segment::kKernelInit, "call [0x003C9E1C]"},
+    // Beyond the fifth-run boundary: the timer/DPC helper continues. The stop
+    // is before the device-query call at 0x002B5E5F, which would enter the
+    // ExQueryNonVolatileSetting tail path; the following call at 0x002B5E7F
+    // schedules the timer DPC and is outside this boundary.
+    {0x002B5E37u, 5, StepKind::kSequential, 0x002B5E3Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "mov eax, [0x003C9E34]"},
+    {0x002B5E3Cu, 7, StepKind::kSequential, 0x002B5E43u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "and dword ptr [0x004EDBE8], 0x00"},
+    {0x002B5E43u, 7, StepKind::kSequential, 0x002B5E4Au, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "and dword ptr [0x004EDBEC], 0x00"},
+    {0x002B5E4Au, 3, StepKind::kSequential, 0x002B5E4Du, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "test byte ptr [eax], 0x08"},
+    {0x002B5E4Du, 2, StepKind::kConditional, 0x002B5E4Fu, 0x002B5E7Fu, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "jnz 0x002B5E7F"},
+    {0x002B5E4Fu, 3, StepKind::kSequential, 0x002B5E52u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "lea eax, [ebp-0x08]"},
+    {0x002B5E52u, 1, StepKind::kSequential, 0x002B5E53u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push eax"},
+    {0x002B5E53u, 2, StepKind::kSequential, 0x002B5E55u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x04"},
+    {0x002B5E55u, 3, StepKind::kSequential, 0x002B5E58u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "lea eax, [ebp-0x04]"},
+    {0x002B5E58u, 1, StepKind::kSequential, 0x002B5E59u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push eax"},
+    {0x002B5E59u, 3, StepKind::kSequential, 0x002B5E5Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "lea eax, [ebp-0x0C]"},
+    {0x002B5E5Cu, 1, StepKind::kSequential, 0x002B5E5Du, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push eax"},
+    {0x002B5E5Du, 2, StepKind::kSequential, 0x002B5E5Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x11"},
 };
 inline constexpr size_t kChildRouteCount = sizeof(kChildRoute) / sizeof(kChildRoute[0]);
 
 inline constexpr uint32_t kParentEntry = 0x002B3916;
 inline constexpr uint32_t kParentStop = 0x002B3987;
 inline constexpr uint32_t kChildEntry = 0x002B5C0F;
-inline constexpr uint32_t kChildStop = 0x002B5E37;
+inline constexpr uint32_t kChildStop = 0x002B5E5F;
 inline constexpr uint32_t kChildStartRoutine = 0x002B38A2;
 inline constexpr uint32_t kChildStartContext = 0;
 inline constexpr uint32_t kChildSystemRoutine = 0x002B5C0F;
@@ -272,11 +289,11 @@ inline constexpr uint32_t kSehScopeFlag = 0x00000000;
 inline constexpr uint32_t kCriticalSectionObject = 0x0046C8B0;
 inline constexpr uint32_t kTlsBlockSize = 0x94;
 inline constexpr uint32_t kParentExecutedInstructions = 71;
-inline constexpr uint32_t kChildExecutedInstructions = 140;
-inline constexpr uint32_t kTotalExecutedInstructions = 211;
+inline constexpr uint32_t kChildExecutedInstructions = 153;
+inline constexpr uint32_t kTotalExecutedInstructions = 224;
 inline constexpr uint32_t kParentBoundarySteps = 72;
-inline constexpr uint32_t kChildBoundarySteps = 141;
-inline constexpr uint32_t kTotalBoundarySteps = 213;
+inline constexpr uint32_t kChildBoundarySteps = 154;
+inline constexpr uint32_t kTotalBoundarySteps = 226;
 
 // Every reviewed instruction after the first is entered through one transfer,
 // each RET is one additional transfer that does not enter an instruction, and
@@ -294,13 +311,15 @@ inline constexpr uint32_t ComputeRequiredTransfers(const Step* steps, size_t cou
 inline constexpr uint32_t kParentRequiredTransfers = ComputeRequiredTransfers(kParentRoute, kParentRouteCount);
 inline constexpr uint32_t kChildRequiredTransfers = ComputeRequiredTransfers(kChildRoute, kChildRouteCount);
 static_assert(kParentRequiredTransfers == 73, "the reviewed parent route needs 73 transfers");
-static_assert(kChildRequiredTransfers == 143, "the reviewed child route needs 143 transfers");
+static_assert(kChildRequiredTransfers == 156, "the reviewed child route needs 156 transfers");
 inline constexpr uint32_t kParentTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C};
-inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, kSehHandler, 0x002B5999, 0x002B59A1,
-                                               0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,
-                                               0x002B5880, 0x002B597C};
+inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, 0x002B5E7F, 0x002B39B9, 0x002B5DE5,
+                                                0x002B95AC, kSehHandler, 0x002B5999, 0x002B59A1,
+                                                0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,
+                                                0x002B5880, 0x002B597C};
 inline constexpr uint32_t kAllTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C,
-                                                kChildStop, kSehHandler, 0x002B5999, 0x002B59A1,
+                                                kChildStop, 0x002B5E7F, 0x002B39B9, 0x002B5DE5,
+                                                0x002B95AC, kSehHandler, 0x002B5999, 0x002B59A1,
                                                 0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,
                                                 0x002B5880, 0x002B597C};
 

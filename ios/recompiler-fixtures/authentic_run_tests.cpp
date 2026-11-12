@@ -242,6 +242,8 @@ struct Fixture {
     run::RouteManifest child;
     run::RouteManifest full_parent;
     run::RouteManifest full_child;
+    uint64_t mapping_identity = 0;
+    uint32_t mapping_count = 0;
     bool ready = false;
 };
 
@@ -268,6 +270,8 @@ bool PrepareFixture(Fixture& fixture, std::string& error) {
         return false;
     }
     if (!dispatch::Init(error)) return false;
+    fixture.mapping_identity = dispatch::MappingIdentity();
+    fixture.mapping_count = dispatch::MappingCount();
     if (!kernel::RestartKernelWorkers()) {
         error = "worker gate did not open";
         return false;
@@ -355,6 +359,9 @@ void ResetFullData() {
     mem::Write(full::kVersionSlot, &version, sizeof(version));
     mem::Write(hardware, &flags, sizeof(flags));
     mem::Write(version + 4, &build, sizeof(build));
+    const uint32_t dirty = 0xFFFFFFFFu;
+    mem::Write(full::kDebe8, &dirty, sizeof(dirty));
+    mem::Write(full::kDebec, &dirty, sizeof(dirty));
     for (uint32_t ordinal : {255u, 187u, 277u, 294u, 47u, 107u, 113u}) {
         const uint32_t thunk = dispatch::KernelThunkAddress(ordinal);
         mem::Write(full::SlotFor(ordinal), &thunk, sizeof(thunk));
@@ -500,6 +507,71 @@ bool TraceHasInstructionAt(const run::RunEvidence& evidence, run::Role role, uin
         if (record && record->event == uint8_t(run::EventKind::kInstructionEntry) && record->pc == pc) return true;
     }
     return false;
+}
+
+bool AcceptFullRoute(const Fixture& fixture, const FullRun& run, const run::RouteManifest& parent,
+                     const run::RouteManifest& child, std::string& error) {
+    auto fail = [&error](const char* text) {
+        error = text;
+        return false;
+    };
+    if (run.started.status != run::Status::kReady || !run.have_parent || !run.have_child)
+        return fail("workers did not complete");
+    if (dispatch::MappingIdentity() != fixture.mapping_identity ||
+        dispatch::MappingCount() != fixture.mapping_count)
+        return fail("runtime mapping identity changed");
+    if (parent.identity != fixture.full_parent.identity || child.identity != fixture.full_child.identity)
+        return fail("manifest identity mismatch");
+    if (!run::ManifestTransfersConsistent(parent) || !run::ManifestTransfersConsistent(child))
+        return fail("manifest transfer requirement is inconsistent");
+    if (parent.required_transfers != route::kParentRequiredTransfers ||
+        child.required_transfers != route::kChildRequiredTransfers)
+        return fail("manifest transfer requirement differs from the reviewed route");
+    if (run.parent.status != run::Status::kStopped ||
+        run.parent.instructions != parent.executed_instructions ||
+        run.parent.transfers != parent.required_transfers || run.parent.required_transfers != parent.required_transfers ||
+        run.parent.stop_pc != parent.stop || !run.parent.at_stop)
+        return fail("parent route accounting");
+    if (run.child.status != run::Status::kStopped ||
+        run.child.instructions != child.executed_instructions ||
+        run.child.transfers != child.required_transfers || run.child.required_transfers != child.required_transfers ||
+        run.child.stop_pc != child.stop || !run.child.at_stop)
+        return fail("child route accounting");
+    auto accept_kernels = [&run](const run::RouteManifest& manifest, run::Role role) {
+        size_t index = 0;
+        for (size_t i = 0; i < manifest.count; ++i) {
+            if (manifest.steps[i].kind != route::StepKind::kKernelCall) continue;
+            const run::KernelObservation* observation = run::KernelObservationForRole(role, index++);
+            if (!observation || observation->ordinal != manifest.steps[i].ordinal ||
+                observation->result != 0 || observation->status != run::Status::kReady)
+                return false;
+        }
+        const run::RunEvidence& evidence = role == run::Role::kParent ? run.parent : run.child;
+        return index == evidence.kernel_count;
+    };
+    if (!accept_kernels(parent, run::Role::kParent) || !accept_kernels(child, run::Role::kChild))
+        return fail("kernel ordinal admission");
+    if (!run.child.seh_verified || run.child.seh_check_count != 14)
+        return fail("SEH evidence");
+    for (size_t i = 0; i < run.child.seh_check_count; ++i) {
+        const run::SehCheckStatus status = run::SehCheckStatus(run.child.seh_checks[i].status);
+        if (status == run::SehCheckStatus::kFail || status == run::SehCheckStatus::kUnknown)
+            return fail("SEH predicate");
+    }
+    const run::TlsEvidence& tls = run.child.tls_evidence;
+    if (tls.status != run::TlsEvidenceStatus::kValid || !tls.pointer_read_ok || !tls.block_read_ok ||
+        !tls.hash_recorded || tls.address != run.child.tls ||
+        tls.expected_pointer != run.child.tls + 4 || tls.self_pointer != run.child.tls + 4 ||
+        tls.block_size != child.tls_block_size || tls.content_hash == 0)
+        return fail("TLS evidence");
+    if (run.parent.tls_evidence.status != run::TlsEvidenceStatus::kNotEvaluated)
+        return fail("parent TLS evidence");
+    if (!kernel::Threads().empty() || run::LiveAuthorizationCount() != 0)
+        return fail("worker cleanup");
+    if (TraceHasInstructionAt(run.parent, run::Role::kParent, parent.stop) ||
+        TraceHasInstructionAt(run.child, run::Role::kChild, child.stop))
+        return fail("terminal stop instruction entered");
+    return true;
 }
 
 }  // namespace
@@ -769,7 +841,7 @@ int main() {
     }
 
     // Phase 2D-27B: manifest-derived transfer budgets and the complete
-    // synthetic 211-instruction rehearsal. No authentic instruction runs.
+    // synthetic 224-instruction rehearsal. No authentic instruction runs.
     {
         bool same_shape = full::kParentRouteCount == route::kParentRouteCount &&
                           full::kChildRouteCount == route::kChildRouteCount &&
@@ -792,10 +864,10 @@ int main() {
         Check(same_shape, "the synthetic mirror preserves the reviewed step classes and kernel services");
         Check(full::kParentRequiredTransfers == route::kParentRequiredTransfers &&
                   full::kChildRequiredTransfers == route::kChildRequiredTransfers &&
-                  full::kParentRequiredTransfers == 73 && full::kChildRequiredTransfers == 143,
-              "the mirror derives the reviewed 73/143 transfer requirement");
-        Check(full::kTotalExecutedInstructions == 211 && full::kTotalBoundarySteps == 213,
-              "the mirror keeps 211 retired instructions and 213 boundary steps");
+                  full::kParentRequiredTransfers == 73 && full::kChildRequiredTransfers == 156,
+              "the mirror derives the reviewed 73/156 transfer requirement");
+        Check(full::kTotalExecutedInstructions == 224 && full::kTotalBoundarySteps == 226,
+              "the mirror keeps 224 retired instructions and 226 boundary steps");
     }
 
     {
@@ -819,10 +891,10 @@ int main() {
         const Started short_child = StartFullParent(fixture, 73, 128);
         Check(short_child.status == run::Status::kInvalidPolicy && !short_child.parent,
               "a child transfer budget of 128 is rejected before execution");
-        const Started terminal_child = StartFullParent(fixture, 73, 142);
+        const Started terminal_child = StartFullParent(fixture, 73, route::kChildRequiredTransfers - 1);
         Check(terminal_child.status == run::Status::kInvalidPolicy && !terminal_child.parent,
               "a child budget below the terminal-stop requirement is rejected");
-        const Started short_parent = StartFullParent(fixture, 72, 143);
+        const Started short_parent = StartFullParent(fixture, 72, full::kChildRequiredTransfers);
         Check(short_parent.status == run::Status::kInvalidPolicy && !short_parent.parent,
               "a parent budget of 72 is rejected before execution");
         const Started shared = StartFullParent(fixture, 73, 73);
@@ -843,18 +915,20 @@ int main() {
                                      full::kChildRoute[full::kChildRouteCount - 1].pc, CaptureTlsReference);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
-        Check(run.started.status == run::Status::kReady, "the full 211-instruction synthetic run is authorised");
+        Check(run.started.status == run::Status::kReady, "the full 224-instruction synthetic run is authorised");
         Check(run.have_parent && run.have_child, "both full-route workers leave evidence");
         Check(run.parent.status == run::Status::kStopped && run.parent.instructions == 71 &&
                   run.parent.transfers == 73 && run.parent.required_transfers == 73 &&
                   run.parent.stop_pc == full::kParentStop && run.parent.at_stop,
               "the parent retires 71 instructions in 73 transfers and stops at its reviewed boundary");
-        Check(run.child.status == run::Status::kStopped && run.child.instructions == 140 &&
-                  run.child.transfers == 143 && run.child.required_transfers == 143 &&
+        Check(run.child.status == run::Status::kStopped &&
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers &&
+                  run.child.required_transfers == full::kChildRequiredTransfers &&
                   run.child.stop_pc == full::kChildStop && run.child.at_stop,
-              "the child retires 140 instructions in 143 transfers and stops at its reviewed boundary");
-        Check(run.parent.instructions + run.child.instructions == 211,
-              "the synthetic execution retires exactly 211 instructions");
+              "the child retires 153 instructions in 156 transfers and stops at its reviewed boundary");
+        Check(run.parent.instructions + run.child.instructions == full::kTotalExecutedInstructions,
+              "the synthetic execution retires exactly 224 instructions");
         Check(!TraceHasInstructionAt(run.parent, run::Role::kParent, full::kParentStop) &&
                   !TraceHasInstructionAt(run.child, run::Role::kChild, full::kChildStop),
               "neither mandatory stop instruction is entered");
@@ -941,6 +1015,16 @@ int main() {
                   run.parent.claim_id != run.child.claim_id,
               "the full-route workers have distinct thread and claim identities");
         Check(kernel::Threads().empty(), "both full-route workers unregister after finalisation");
+        Check(read_u32(full::kDebe8) == 0 && read_u32(full::kDebec) == 0,
+              "the extended helper clears the reviewed timer flags");
+        {
+            std::string acceptance_error;
+            const bool accepted = AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child,
+                                                  acceptance_error);
+            const std::string message = accepted ? "the full-route acceptance contract passes"
+                                                 : "acceptance: " + acceptance_error;
+            Check(accepted, message.c_str());
+        }
         run::RunEvidence after_finalize;
         Check(run::EvidenceForRole(run::Role::kChild, &after_finalize) &&
                   after_finalize.tls_evidence.status == run::TlsEvidenceStatus::kValid &&
@@ -961,7 +1045,8 @@ int main() {
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
-                  run.child.instructions == 140 && run.child.transfers == 143 &&
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers &&
                   run.child.tls_evidence.status == run::TlsEvidenceStatus::kReadFailed &&
                   !run.child.tls_evidence.hash_recorded && run.child.tls_evidence.content_hash == 0 &&
                   run.child.tls_evidence.content_hash != ZeroTlsHash(full::kTlsBlockSize),
@@ -977,7 +1062,8 @@ int main() {
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
-                  run.child.instructions == 140 && run.child.transfers == 143 &&
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers &&
                   run.child.tls_evidence.status == run::TlsEvidenceStatus::kMismatch &&
                   run.child.tls_evidence.pointer_read_ok && run.child.tls_evidence.block_read_ok &&
                   run.child.tls_evidence.hash_recorded && !run.child.tls_verified,
@@ -990,7 +1076,8 @@ int main() {
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
-                  run.child.instructions == 140 && run.child.transfers == 143 &&
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers &&
                   run.child.tls_evidence.status == run::TlsEvidenceStatus::kUnavailable &&
                   !run.child.tls_evidence.hash_recorded && run.child.tls_evidence.content_hash == 0,
               "an unavailable TLS pointer is reported without evidence");
@@ -1002,18 +1089,31 @@ int main() {
               "larger budgets are admitted");
         Check(run.parent.status == run::Status::kStopped && run.parent.instructions == 71 &&
                   run.parent.transfers == 73 && run.child.status == run::Status::kStopped &&
-                  run.child.instructions == 140 && run.child.transfers == 143,
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers,
               "larger budgets do not execute past the reviewed route or terminal stops");
+        {
+            std::string acceptance_error;
+            const bool accepted = AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child,
+                                                  acceptance_error);
+            const std::string message = accepted ? "the larger-budget acceptance contract passes"
+                                                 : "acceptance: " + acceptance_error;
+            Check(accepted, message.c_str());
+        }
     }
 
     {
         run::RouteManifest child = FullChildManifest();
         child.required_transfers = 0;  // test-only: exercise the gate's terminal accounting directly
-        const FullRun run = RunFullRoute(fixture, 73, 142, 71, 140, &child);
+        const FullRun run = RunFullRoute(fixture, 73, route::kChildRequiredTransfers - 1, 71,
+                                         full::kChildExecutedInstructions, &child);
         Check(run.started.status == run::Status::kReady, "the terminal-stop probe is admitted");
         Check(run.have_child && run.child.status == run::Status::kBudgetExceeded &&
-                  run.child.instructions == 140 && run.child.stop_pc == full::kChildStop && !run.child.at_stop,
-              "a budget of 142 refuses the terminal stop instead of reporting completion");
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers - 1 &&
+                  run.child.stop_pc == full::kChildStop &&
+                  run.child.stop_target == full::kChildStop && !run.child.at_stop,
+              "a budget one short of the terminal stop refuses it instead of reporting completion");
     }
 
     {
@@ -1024,7 +1124,7 @@ int main() {
         for (const Stage& stage : stages) {
             run::RouteManifest child = FullChildManifest();
             child.required_transfers = 0;  // test-only: the gate budget is the subject
-            const FullRun run = RunFullRoute(fixture, 73, 143, 71, stage.budget, &child);
+            const FullRun run = RunFullRoute(fixture, 73, full::kChildRequiredTransfers, 71, stage.budget, &child);
             Check(run.started.status == run::Status::kReady && run.have_child &&
                       run.child.status == run::Status::kBudgetExceeded &&
                       run.child.instructions == stage.budget,
@@ -1078,7 +1178,8 @@ int main() {
         run::RouteManifest parent = FullParentManifest();
         parent.steps = parent_steps.data();
         parent.identity = run::ManifestIdentity(parent);
-        const FullRun run = RunFullRoute(fixture, 73, 143, 71, 140, nullptr, &parent);
+        const FullRun run = RunFullRoute(fixture, 73, full::kChildRequiredTransfers, 71,
+                                         full::kChildExecutedInstructions, nullptr, &parent);
         Check(run.started.status == run::Status::kReady && run.have_parent &&
                   run.parent.status == run::Status::kStopped && run.parent.instructions == 71 &&
                   run.parent.transfers == 73 && run.parent.stop_pc == full::kParentStop && run.parent.at_stop,
@@ -1095,11 +1196,14 @@ int main() {
         run::RouteManifest child = FullChildManifest();
         child.steps = steps.data();
         child.identity = run::ManifestIdentity(child);
-        const FullRun run = RunFullRoute(fixture, 73, 143, 71, 140, &child);
+        const FullRun run = RunFullRoute(fixture, 73, full::kChildRequiredTransfers, 71,
+                                         full::kChildExecutedInstructions, &child);
         Check(run.started.status == run::Status::kReady && run.have_child &&
-                  run.child.status == run::Status::kKernelRejected && run.child.instructions == 140 &&
-                  !run.child.at_stop,
-              "a rewritten child next is refused at the last reviewed kernel edge");
+                  run.child.status == run::Status::kStopped &&
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers &&
+                  run.child.stop_pc == full::kChildStop && run.child.at_stop,
+              "a rewritten child next cannot continue past the mandatory terminal stop");
     }
 
     {

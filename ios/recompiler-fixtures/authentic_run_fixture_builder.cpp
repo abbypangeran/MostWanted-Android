@@ -57,6 +57,8 @@ constexpr uint32_t kFullDpcContext = 0x00040300;
 constexpr uint32_t kFullHardwareSlot = 0x00040080;
 constexpr uint32_t kFullVersionSlot = 0x00040084;
 constexpr uint32_t kFullHandlerMarker = 0x00040090;
+constexpr uint32_t kFullDebe8 = 0x000400A0;
+constexpr uint32_t kFullDebec = 0x000400A4;
 constexpr uint32_t kFullHandleOut = 0x00040400;
 constexpr uint32_t kFullIdOut = 0x00040404;
 constexpr uint32_t kFullStatusOut = 0x00040408;
@@ -283,6 +285,10 @@ void EncodeStep(bool parent, size_t index, const route::Step& step, const SynthS
         case 133: EmitPushImm32(bytes, kFullDpcContext); return;
         case 134: EmitPushImm32(bytes, kFullHandler); return;
         case 135: EmitPushImm32(bytes, kFullDpcObject); return;
+        case 140: Append(bytes, {0xA1}); Emit32(bytes, kFullHardwareSlot); return;
+        case 141: Append(bytes, {0x83, 0x25}); Emit32(bytes, kFullDebe8); bytes.push_back(0x00); return;
+        case 142: Append(bytes, {0x83, 0x25}); Emit32(bytes, kFullDebec); bytes.push_back(0x00); return;
+        case 143: Append(bytes, {0xF6, 0x00, 0x08}); return;
         case 137: EmitPushImm8(bytes, 0); return;
         case 138: EmitPushImm32(bytes, kFullTimerObject); return;
         default: EmitNop(bytes); return;
@@ -573,6 +579,10 @@ bool WriteFullRoute(std::vector<Chunk>& chunks, const std::filesystem::path& hea
            << std::setfill('0') << kFullVersionSlot << "u;\n";
     header << "inline constexpr uint32_t kHandlerMarker = 0x" << std::hex << std::uppercase << std::setw(8)
            << std::setfill('0') << kFullHandlerMarker << "u;\n";
+    header << "inline constexpr uint32_t kDebe8 = 0x" << std::hex << std::uppercase << std::setw(8)
+           << std::setfill('0') << kFullDebe8 << "u;\n";
+    header << "inline constexpr uint32_t kDebec = 0x" << std::hex << std::uppercase << std::setw(8)
+           << std::setfill('0') << kFullDebec << "u;\n";
     header << "inline constexpr uint32_t kHandleOut = 0x" << std::hex << std::uppercase << std::setw(8)
            << std::setfill('0') << kFullHandleOut << "u;\n";
     header << "inline constexpr uint32_t kIdOut = 0x" << std::hex << std::uppercase << std::setw(8)
