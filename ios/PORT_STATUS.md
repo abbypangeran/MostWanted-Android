@@ -4671,3 +4671,99 @@ The preflight reports child 140, total 211, 213 boundary steps, stop `002B5E37`,
 child `2FA1FDFDA0F3F86B`, mapping `E9DFEF8BB5AC0970` and `AUTH_RUN_RESULT=PASS`.
 
 R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-27B — transfer-budget remediation
+
+**`PHASE_2D27B_TRANSFER_BUDGET_REMEDIATION = PASS`.** This phase closes the fourth authentic run's
+`EARLY_STOP`. No authentic instruction ran; the four historical evidence directories
+(`phase2d19-authentic-run`, `phase2d20-second-authentic-run`, `phase2d21-third-authentic-run`,
+`phase2d27-fourth-authentic-run`) are unchanged, and `kAuthenticExecutionAuthorised` remains `false`.
+
+### Fourth-run finding
+
+The fourth run started the reviewed 211-instruction route with parent/child transfer budgets of 128. The
+parent reached its stop with 71 instructions and 72 recorded transfers (the terminal transfer was not yet
+counted; the reviewed parent total is 73). The child stopped at `002B5673` with `budget-exceeded` after 126
+instructions and 128 transfers; the authentic trace matched the reviewed route. The child was not at fault:
+the configured per-worker budget was.
+
+### Root cause and corrected model
+
+The transfer budget is per worker claim, not shared. It must cover every reviewed transfer, including the
+terminal stop:
+
+| Worker | Instructions | RET transfers | Entries after the first | Terminal | Required transfers |
+|---|---:|---:|---:|---:|---:|
+| Parent | 71 | 2 | 70 | 1 | **73** |
+| Child | 140 | 3 | 139 | 1 | **143** |
+
+`kernel::authentic::route::ComputeRequiredTransfers` derives `(count - 1) + ret_count + 1`.
+`RouteManifest.required_transfers` is bound into the manifest identity and checked for equality with the
+derived value. Parent and child budgets are validated independently against their own manifests; the
+previous child budget of 128 is refused by the static preflight and by authorisation before a worker starts.
+The gate also counts the terminal stop as a transfer and refuses the stop with `budget-exceeded` when the
+configured budget ends one transfer earlier. Instruction ceilings, identity checks, kernel admission and
+stop boundaries remain independently enforced.
+
+The manifest identities changed because the budget requirement is now part of the fingerprint: mapping
+`E9DFEF8BB5AC0970` (225 entries, unchanged), parent `85527B8FA581229F`, child `585C5E1A742B6924`. The
+historical 186-route identities remain historical.
+
+The harness also gained thin checked adapters for ordinals 47/107/113. The authentic experiment target links
+the harness, not `xboxkrnl.cpp`; the adapters call the same production checked implementations
+(`RegisterShutdownNotificationChecked`, `InitializeDpcChecked`, `InitializeTimerExChecked`) with the
+reviewed ABI and the run's verified image identity. This is the path the fifth run would use.
+
+### Synthetic rehearsal
+
+A generated synthetic mirror of the complete reviewed route (parent 71, child 140) is laid out at synthetic
+addresses; no authentic bytes are used. The mirror preserves every step class, kernel ordinal, argument
+count, conditional outcome, RET cleanup and the SEH/TLS/critical-section shape.
+
+- Parent: 71 instructions, 73 transfers, stop before the synthetic parent stop; kernels 255/187.
+- Child: 140 instructions, 143 transfers, stop before the synthetic child stop; kernels 277/294/47/107/113.
+- Combined: 211 retired instructions, 213 boundary steps.
+- Ordinal 47 records the exact object/routine/priority/owner/image identity; ordinal 107 publishes the full
+  0x1C KDPC; ordinal 113 the full 0x28 KTIMER; the critical section returns to its free layout; SEH/TLS are
+  live and all 14 SEH predicates pass; the parent closes the child handle; both workers unregister and the
+  allocation baseline is restored.
+
+Negative cases (all fail closed, all synthetic): child budgets 128 and 142 and parent budget 72 are refused
+before execution; a shared 73/73 accounting is refused; a budget that ends before ordinals 47, 107 or 113
+stops with `budget-exceeded` and executes no further kernel service; a budget one short of the terminal stop
+refuses the stop rather than reporting completion; an unexpected backward loop and an unknown transfer are
+refused at the reviewed edge; rewriting the parent's or child's last `next` cannot continue past the
+mandatory stop.
+
+### Validation (fresh)
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` | 144 PASS / 0 FAIL | 144 PASS / 0 FAIL |
+| `checked_recompiler_tests` | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, 225/225 | PASS, 225/225 |
+| `authentic_run_accounting` | 1280 -> 0 | 1280 -> 0 |
+| `mostwanted_memory_tests` | 454 PASS / 0 FAIL | 454 PASS / 0 FAIL |
+| Android ARM64 syntax (`authentic_run.cpp`, `kernel_objects.cpp`) | PASS | — |
+
+The fresh preflight reports parent 73, child 143, child budget 128 `REFUSED`, identities
+`85527B8FA581229F`/`585C5E1A742B6924`, mapping `E9DFEF8BB5AC0970`, `AUTH_RUN_GENERATED_CHECK=PASS`.
+The historical fourth-run log still records the old parent transfer count of 72; that count predates the
+terminal-stop accounting and is not reused.
+
+### Gates and fifth run
+
+| Gate | Result | Scope |
+|---|---|---|
+| A — preparation | **GO** | image, kernel data, mapping, manifests, budgets and assessment |
+| B — 211-instruction authentic execution | **static/synthetic READY; execution NO-GO** | separate explicit authorisation and a driver that patches the 47/107/113 slots |
+| C — actual game startup | **NO-GO** | later start-routine calls, 867 initializers, retail SEH, ordinal 258, list callback, protections |
+
+`FOURTH_RUN_BUDGET_REMEDIATION = PASS`. A single fifth authentic execution of the unchanged 211-instruction
+route (parent 73 transfers, child 143 transfers, stops `002B3987`/`002B5E37`) is **technically justified**
+by the budget correction, the full-route synthetic rehearsal and the fresh validation. It requires a
+separate explicit authorisation and a driver that uses the committed 73/143 floors; the temporary
+activation/driver is not committed by this phase. It is not Gate C. Do not activate it from this document.
+
+R1.16 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.

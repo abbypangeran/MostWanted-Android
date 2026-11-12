@@ -464,11 +464,13 @@ target_include_directories(authentic_run_fixture_builder PRIVATE ${XBE_SDK}/runt
 set(AUTHENTIC_RUN_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/authentic_run_fixture)
 set(AUTHENTIC_RUN_FIXTURE_XBE ${AUTHENTIC_RUN_FIXTURE_DIR}/authentic_run_fixture.xbe)
 set(AUTHENTIC_RUN_FIXTURE_CONFIG ${AUTHENTIC_RUN_FIXTURE_DIR}/authentic_run_fixture.toml)
+set(AUTHENTIC_RUN_FIXTURE_HEADER ${AUTHENTIC_RUN_FIXTURE_DIR}/authentic_run_full_route.h)
 add_custom_command(
-    OUTPUT ${AUTHENTIC_RUN_FIXTURE_XBE} ${AUTHENTIC_RUN_FIXTURE_CONFIG}
+    OUTPUT ${AUTHENTIC_RUN_FIXTURE_XBE} ${AUTHENTIC_RUN_FIXTURE_CONFIG} ${AUTHENTIC_RUN_FIXTURE_HEADER}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${AUTHENTIC_RUN_FIXTURE_DIR}
     COMMAND authentic_run_fixture_builder ${AUTHENTIC_RUN_FIXTURE_XBE} ${AUTHENTIC_RUN_FIXTURE_CONFIG}
-    DEPENDS authentic_run_fixture_builder
+            ${AUTHENTIC_RUN_FIXTURE_HEADER}
+    DEPENDS authentic_run_fixture_builder ${XBE_SDK}/runtime/kernel/authentic_run_route.h
     VERBATIM
 )
 set(AUTHENTIC_RUN_FIXTURE_GENERATED_DIR ${AUTHENTIC_RUN_FIXTURE_DIR}/generated)
@@ -486,6 +488,7 @@ add_custom_target(generate_authentic_run_fixture DEPENDS ${AUTHENTIC_RUN_FIXTURE
 add_executable(authentic_run_tests
     authentic_run_tests.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/authentic_run.cpp
+    ${AUTHENTIC_RUN_FIXTURE_HEADER}
     ${XBE_SDK}/runtime/cpu/dispatch.cpp
     ${XBE_SDK}/runtime/cpu/dispatch_table.cpp
     ${XBE_SDK}/runtime/core/log.cpp
@@ -506,7 +509,7 @@ add_executable(authentic_run_tests
 add_dependencies(authentic_run_tests generate_authentic_run_fixture)
 target_compile_features(authentic_run_tests PRIVATE cxx_std_20)
 target_include_directories(authentic_run_tests PRIVATE ${XBE_SDK}/runtime ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}
-                            ${CMAKE_CURRENT_SOURCE_DIR})
+                            ${AUTHENTIC_RUN_FIXTURE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(authentic_run_tests PRIVATE
     MOSTWANTED_AUTHENTIC_RUN_HARNESS=1
     MOSTWANTED_AUTHENTIC_RUN_TESTS=1

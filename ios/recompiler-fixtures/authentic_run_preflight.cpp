@@ -341,17 +341,46 @@ int main(int argc, char** argv) {
     Record("AUTH_RUN_CHILD_COUNT", route::kChildRouteCount == route::kChildExecutedInstructions);
     Record("AUTH_RUN_TOTAL_COUNT", route::kParentRouteCount + route::kChildRouteCount ==
                                        route::kTotalExecutedInstructions);
+    // Budget invariant: the manifest-derived totals include every instruction
+    // entry, every RET transfer and the terminal stop. The previous child
+    // budget of 128 is statically insufficient for this route.
+    Record("AUTH_RUN_PARENT_REQUIRED_TRANSFERS",
+           route::kParentRequiredTransfers ==
+               route::ComputeRequiredTransfers(route::kParentRoute, route::kParentRouteCount));
+    Record("AUTH_RUN_CHILD_REQUIRED_TRANSFERS",
+           route::kChildRequiredTransfers ==
+               route::ComputeRequiredTransfers(route::kChildRoute, route::kChildRouteCount));
+    Record("AUTH_RUN_CHILD_BUDGET_128_REFUSED", route::kChildRequiredTransfers > 128);
+    Record("AUTH_RUN_PARENT_BUDGET_72_REFUSED", route::kParentRequiredTransfers > 72);
+    Record("AUTH_RUN_PARENT_BUDGET_73_ACCEPTED", route::kParentRequiredTransfers <= 73);
+    Record("AUTH_RUN_CHILD_BUDGET_143_ACCEPTED", route::kChildRequiredTransfers <= 143);
+    char budget_line[96];
+    std::snprintf(budget_line, sizeof(budget_line), "AUTH_RUN_PARENT_REQUIRED_TRANSFERS=%u",
+                  route::kParentRequiredTransfers);
+    g_lines.emplace_back(budget_line);
+    std::snprintf(budget_line, sizeof(budget_line), "AUTH_RUN_CHILD_REQUIRED_TRANSFERS=%u",
+                  route::kChildRequiredTransfers);
+    g_lines.emplace_back(budget_line);
+    std::snprintf(budget_line, sizeof(budget_line), "AUTH_RUN_PARENT_BOUNDARY_STEPS=%u",
+                  route::kParentBoundarySteps);
+    g_lines.emplace_back(budget_line);
+    std::snprintf(budget_line, sizeof(budget_line), "AUTH_RUN_CHILD_BOUNDARY_STEPS=%u",
+                  route::kChildBoundarySteps);
+    g_lines.emplace_back(budget_line);
+    g_lines.emplace_back("AUTH_RUN_CHILD_BUDGET_128=REFUSED");
     {
         char parent_identity[40], child_identity[40];
         std::snprintf(parent_identity, sizeof(parent_identity), "%016llX",
                       static_cast<unsigned long long>(route::ComputeManifestIdentity(
-                          route::kParentRoute, route::kParentRouteCount, route::kParentEntry, route::kParentStop)));
+                          route::kParentRoute, route::kParentRouteCount, route::kParentEntry, route::kParentStop,
+                          0, 0, 0, 0, 0, 0, 0, 0, 0, route::kParentRequiredTransfers)));
         std::snprintf(child_identity, sizeof(child_identity), "%016llX",
                       static_cast<unsigned long long>(route::ComputeManifestIdentity(
                           route::kChildRoute, route::kChildRouteCount, route::kChildEntry, route::kChildStop,
                           route::kSehCall, route::kSehEntry, route::kSehHandler, route::kSehScopeTable,
                           route::kSehScopeBytes, route::kSehScopeFlag, route::kTlsBlockSize,
-                          route::kCriticalSectionObject, route::kChildStartRoutine)));
+                          route::kCriticalSectionObject, route::kChildStartRoutine,
+                          route::kChildRequiredTransfers)));
         g_lines.emplace_back(std::string("AUTH_RUN_PARENT_MANIFEST_IDENTITY=") + parent_identity);
         g_lines.emplace_back(std::string("AUTH_RUN_CHILD_MANIFEST_IDENTITY=") + child_identity);
     }
@@ -412,6 +441,9 @@ int main(int argc, char** argv) {
         std::printf("  \"total_executed\": %zu,\n  \"stops\": [\"%s\", \"%s\"],\n",
                     route::kParentRouteCount + route::kChildRouteCount, Hex(route::kParentStop).c_str(),
                     Hex(route::kChildStop).c_str());
+        std::printf("  \"parent_required_transfers\": %u,\n  \"child_required_transfers\": %u,\n"
+                    "  \"child_budget_128\": \"REFUSED\",\n",
+                    route::kParentRequiredTransfers, route::kChildRequiredTransfers);
         std::printf("  \"execution\": \"PROHIBITED\",\n  \"checks\": [\n");
         for (size_t i = 0; i < g_checks.size(); ++i)
             std::printf("    {\"name\": \"%s\", \"passed\": %s}%s\n", g_checks[i].name.c_str(),

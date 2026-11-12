@@ -23,16 +23,19 @@
 #include "kernel/authentic_run.h"
 #include "kernel/crypto.h"
 #include "kernel/kernel.h"
+#include "kernel/kernel_objects.h"
 #include "kernel/memory.h"
 #include "xbe/image_loader.h"
 #include "xbe/xbe.h"
 #include "x86_recomp_shared.h"
 
 #include "authentic_run_fixture_route.h"
+#include "authentic_run_full_route.h"
 
 namespace run = kernel::authentic;
 namespace route = kernel::authentic::route;
 namespace fixture = authentic_run_fixture;
+namespace full = authentic_run_full_fixture;
 
 namespace kernel {
 #ifndef MOSTWANTED_FIXTURE_EXTERNAL_G_BASE
@@ -91,6 +94,43 @@ run::RouteManifest ChildManifest() {
     manifest.seh_scope_flag = fixture::kSehScopeFlag;
     manifest.tls_block_size = fixture::kTlsBlockSize;
     manifest.critical_section_object = fixture::kCriticalSectionObject;
+    manifest.identity = run::ManifestIdentity(manifest);
+    return manifest;
+}
+
+run::RouteManifest FullParentManifest() {
+    run::RouteManifest manifest;
+    manifest.steps = full::kParentRoute;
+    manifest.count = full::kParentRouteCount;
+    manifest.entry = full::kParentEntry;
+    manifest.stop = full::kParentStop;
+    manifest.executed_instructions = full::kParentExecutedInstructions;
+    manifest.required_transfers = full::kParentRequiredTransfers;
+    manifest.trap_entries = full::kParentTrapEntries;
+    manifest.trap_count = 1;
+    manifest.identity = run::ManifestIdentity(manifest);
+    return manifest;
+}
+
+run::RouteManifest FullChildManifest() {
+    run::RouteManifest manifest;
+    manifest.steps = full::kChildRoute;
+    manifest.count = full::kChildRouteCount;
+    manifest.entry = full::kChildEntry;
+    manifest.stop = full::kChildStop;
+    manifest.executed_instructions = full::kChildExecutedInstructions;
+    manifest.required_transfers = full::kChildRequiredTransfers;
+    manifest.trap_entries = full::kChildTrapEntries;
+    manifest.trap_count = 2;
+    manifest.seh_call = full::kSehCall;
+    manifest.seh_entry = full::kSehEntry;
+    manifest.seh_handler = full::kSehHandler;
+    manifest.seh_scope_table = full::kSehScopeTable;
+    manifest.seh_scope_bytes = full::kSehScopeBytes;
+    manifest.seh_scope_flag = full::kSehScopeFlag;
+    manifest.tls_block_size = full::kTlsBlockSize;
+    manifest.critical_section_object = full::kCriticalSectionObject;
+    manifest.start_routine = full::kChildStartRoutine;
     manifest.identity = run::ManifestIdentity(manifest);
     return manifest;
 }
@@ -200,6 +240,8 @@ struct Fixture {
     std::string sha1;
     run::RouteManifest parent;
     run::RouteManifest child;
+    run::RouteManifest full_parent;
+    run::RouteManifest full_child;
     bool ready = false;
 };
 
@@ -220,6 +262,11 @@ bool PrepareFixture(Fixture& fixture, std::string& error) {
         error = "synthetic code page is not executable";
         return false;
     }
+    if (mem::Protect(full::kParentEntry & ~(mem::kPage - 1), 0x4000, mem::kRead | mem::kExecute) !=
+        mem::AccessStatus::kOk) {
+        error = "full synthetic code pages are not executable";
+        return false;
+    }
     if (!dispatch::Init(error)) return false;
     if (!kernel::RestartKernelWorkers()) {
         error = "worker gate did not open";
@@ -233,6 +280,15 @@ bool PrepareFixture(Fixture& fixture, std::string& error) {
         error = "synthetic data pages did not commit";
         return false;
     }
+    if (!mem::Commit(full::kDataPage, full::kDataPages * mem::kPage)) {
+        error = "full synthetic data pages did not commit";
+        return false;
+    }
+    if (mem::Protect(full::kDataPage, full::kDataPages * mem::kPage, mem::kRead | mem::kWrite) !=
+        mem::AccessStatus::kOk) {
+        error = "full synthetic data pages are not writable";
+        return false;
+    }
     // The image is executable; the synthetic data page is not.
     if (mem::Protect(fixture::kDataPage, 2 * mem::kPage, mem::kRead | mem::kWrite) != mem::AccessStatus::kOk) {
         error = "synthetic data pages are not writable";
@@ -240,6 +296,8 @@ bool PrepareFixture(Fixture& fixture, std::string& error) {
     }
     fixture.parent = ParentManifest();
     fixture.child = ChildManifest();
+    fixture.full_parent = FullParentManifest();
+    fixture.full_child = FullChildManifest();
     fixture.ready = true;
     return true;
 }
@@ -269,6 +327,40 @@ void ResetData() {
     mem::Write(fixture::kSlot294, &thunk294, sizeof(thunk294));
 }
 
+void ResetFullData() {
+    kernel::ClearShutdownRegistrationsForTest();
+    std::array<uint8_t, full::kDataPages * mem::kPage> zero{};
+    mem::Write(full::kDataPage, zero.data(), zero.size());
+    const uint32_t terminator = 0xFFFFFFFFu;
+    mem::Write(full::kScopeTable, &terminator, sizeof(terminator));
+    const uint32_t header = 0x00040001u, zero32 = 0, self = full::kCriticalSectionAddress + 8;
+    const uint32_t free_count = 0xFFFFFFFFu;
+    mem::Write(full::kCriticalSectionAddress + 0x00, &header, sizeof(header));
+    mem::Write(full::kCriticalSectionAddress + 0x04, &zero32, sizeof(zero32));
+    mem::Write(full::kCriticalSectionAddress + 0x08, &self, sizeof(self));
+    mem::Write(full::kCriticalSectionAddress + 0x0C, &self, sizeof(self));
+    mem::Write(full::kCriticalSectionAddress + 0x10, &free_count, sizeof(free_count));
+    mem::Write(full::kCriticalSectionAddress + 0x14, &zero32, sizeof(zero32));
+    mem::Write(full::kCriticalSectionAddress + 0x18, &zero32, sizeof(zero32));
+    // The shutdown registration object the synthetic route registers: the
+    // callback is the synthetic handler (never invoked).
+    const uint32_t registration[4] = {full::kSehHandler, 0x80000000u, 0, 0};
+    mem::Write(full::kShutdownObject, registration, sizeof(registration));
+    // The synthetic hardware/version data the probe reads through the data
+    // import slots.
+    const uint32_t hardware = full::kDataPage + 0x500;
+    const uint32_t version = full::kDataPage + 0x510;
+    const uint32_t flags = 0x20u, build = 5838u;
+    mem::Write(full::kHardwareSlot, &hardware, sizeof(hardware));
+    mem::Write(full::kVersionSlot, &version, sizeof(version));
+    mem::Write(hardware, &flags, sizeof(flags));
+    mem::Write(version + 4, &build, sizeof(build));
+    for (uint32_t ordinal : {255u, 187u, 277u, 294u, 47u, 107u, 113u}) {
+        const uint32_t thunk = dispatch::KernelThunkAddress(ordinal);
+        mem::Write(full::SlotFor(ordinal), &thunk, sizeof(thunk));
+    }
+}
+
 bool WaitFor(const std::function<bool()>& predicate, std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -293,6 +385,7 @@ bool WaitForRole(run::Role role, std::chrono::milliseconds timeout = std::chrono
                 evidence.status == run::Status::kUnsupportedInstruction ||
                 evidence.status == run::Status::kSehViolation ||
                 evidence.status == run::Status::kKernelRejected ||
+                evidence.status == run::Status::kUnreviewedTransfer ||
                 evidence.status == run::Status::kTlsViolation) &&
                evidence.trace_count > 0;
     }, timeout) &&
@@ -336,13 +429,86 @@ void JoinThread(const kernel::ThreadRef& thread) {
                                      thread->state.load() == kernel::ThreadState::kCancelled; });
 }
 
+Started StartFullParent(const Fixture& fixture, uint32_t parent_transfer = full::kParentRequiredTransfers,
+                        uint32_t child_transfer = full::kChildRequiredTransfers,
+                        uint32_t parent_instructions = full::kParentExecutedInstructions,
+                        uint32_t child_instructions = full::kChildExecutedInstructions,
+                        const run::RouteManifest* child = nullptr,
+                        const run::RouteManifest* parent = nullptr) {
+    WaitForQuiescence();
+    Started started;
+    run::ParentStartRequest request;
+    request.manifest = parent ? parent : &fixture.full_parent;
+    request.child_manifest = child ? child : &fixture.full_child;
+    request.image_sha1 = fixture.sha1.c_str();
+    request.mapping_identity = dispatch::MappingIdentity();
+    request.dispatch_generation = dispatch::CallLease().Generation();
+    request.memory_generation = mem::Generation();
+    request.stack_size = 0x10000;
+    request.tls_size = 0x94;
+    request.instruction_budget = parent_instructions;
+    request.transfer_budget = parent_transfer;
+    request.kernel_budget = 8;
+    request.maximum_call_depth = 8;
+    request.child_instruction_budget = child_instructions;
+    request.child_transfer_budget = child_transfer;
+    request.child_kernel_budget = 8;
+    request.child_maximum_call_depth = 8;
+    request.prepared_thread = &started.parent;
+    started.status = run::StartParentWorkerForTest(request, &started.authorization);
+    return started;
+}
+
+struct FullRun {
+    Started started;
+    run::RunEvidence parent;
+    run::RunEvidence child;
+    bool have_parent = false;
+    bool have_child = false;
+};
+
+FullRun RunFullRoute(const Fixture& fixture, uint32_t parent_transfer = full::kParentRequiredTransfers,
+                     uint32_t child_transfer = full::kChildRequiredTransfers,
+                     uint32_t parent_instructions = full::kParentExecutedInstructions,
+                     uint32_t child_instructions = full::kChildExecutedInstructions,
+                     const run::RouteManifest* child = nullptr,
+                     const run::RouteManifest* parent = nullptr) {
+    ResetFullData();
+    FullRun result;
+    result.started = StartFullParent(fixture, parent_transfer, child_transfer, parent_instructions,
+                                     child_instructions, child, parent);
+    if (result.started.status != run::Status::kReady) return result;
+    JoinThread(result.started.parent);
+    WaitForRole(run::Role::kChild);
+    WaitForRole(run::Role::kParent);
+    result.have_parent = run::EvidenceForRole(run::Role::kParent, &result.parent);
+    result.have_child = run::EvidenceForRole(run::Role::kChild, &result.child);
+    return result;
+}
+
+const run::KernelObservation* FindKernel(const run::RunEvidence& evidence, run::Role role, uint32_t ordinal) {
+    for (size_t i = 0; i < evidence.kernel_count; ++i) {
+        const run::KernelObservation* observation = run::KernelObservationForRole(role, i);
+        if (observation && observation->ordinal == ordinal) return observation;
+    }
+    return nullptr;
+}
+
+bool TraceHasInstructionAt(const run::RunEvidence& evidence, run::Role role, uint32_t pc) {
+    for (size_t i = 0; i < evidence.trace_count; ++i) {
+        const run::TraceRecord* record = run::TraceForRole(role, i);
+        if (record && record->event == uint8_t(run::EventKind::kInstructionEntry) && record->pc == pc) return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // Injection hooks fire at the entry of the named reviewed instruction, before
 // it executes. They are the deterministic failure injection for the tests.
 namespace {
 void ForceBranchNotTaken(X86Context& ctx) { ctx.ecx = 0; }
-void FaultAtTlsWrite(X86Context& ctx) { ctx.edx = 0x00020000; }
+void FaultAtTlsWrite(X86Context& ctx) { ctx.edx = 0x00080000; }
 uint32_t StopFrameE(const X86Context& ctx) { return ctx.ebp - 4; }
 void CorruptScopeFlag(X86Context& ctx) { const uint32_t v = 0x1234; mem::Write(StopFrameE(ctx), &v, 4); }
 void CorruptHandler(X86Context& ctx) { const uint32_t v = 0xDEADBEEF; mem::Write(StopFrameE(ctx) - 8, &v, 4); }
@@ -438,6 +604,7 @@ const run::TraceRecord* FindTrace(const run::RunEvidence& evidence, run::Role ro
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     if (!mem::Init()) {
         std::printf("FAIL: guest memory initializes\n");
         return 1;
@@ -542,6 +709,271 @@ int main() {
         }
         Check(stop_seen, "child trace records the exact stop PC");
         Check(kernel::Threads().empty(), "both guest workers unregister after finalisation");
+    }
+
+    // Phase 2D-27B: manifest-derived transfer budgets and the complete
+    // synthetic 211-instruction rehearsal. No authentic instruction runs.
+    {
+        bool same_shape = full::kParentRouteCount == route::kParentRouteCount &&
+                          full::kChildRouteCount == route::kChildRouteCount &&
+                          full::kTotalExecutedInstructions == route::kTotalExecutedInstructions &&
+                          full::kTotalBoundarySteps == route::kTotalBoundarySteps;
+        for (size_t i = 0; same_shape && i < route::kParentRouteCount; ++i) {
+            const route::Step& reviewed = route::kParentRoute[i];
+            const route::Step& mirrored = full::kParentRoute[i];
+            same_shape = reviewed.kind == mirrored.kind && reviewed.ordinal == mirrored.ordinal &&
+                         reviewed.arguments == mirrored.arguments && reviewed.taken == mirrored.taken &&
+                         reviewed.segment == mirrored.segment && reviewed.ret_pop_bytes == mirrored.ret_pop_bytes;
+        }
+        for (size_t i = 0; same_shape && i < route::kChildRouteCount; ++i) {
+            const route::Step& reviewed = route::kChildRoute[i];
+            const route::Step& mirrored = full::kChildRoute[i];
+            same_shape = reviewed.kind == mirrored.kind && reviewed.ordinal == mirrored.ordinal &&
+                         reviewed.arguments == mirrored.arguments && reviewed.taken == mirrored.taken &&
+                         reviewed.segment == mirrored.segment && reviewed.ret_pop_bytes == mirrored.ret_pop_bytes;
+        }
+        Check(same_shape, "the synthetic mirror preserves the reviewed step classes and kernel services");
+        Check(full::kParentRequiredTransfers == route::kParentRequiredTransfers &&
+                  full::kChildRequiredTransfers == route::kChildRequiredTransfers &&
+                  full::kParentRequiredTransfers == 73 && full::kChildRequiredTransfers == 143,
+              "the mirror derives the reviewed 73/143 transfer requirement");
+        Check(full::kTotalExecutedInstructions == 211 && full::kTotalBoundarySteps == 213,
+              "the mirror keeps 211 retired instructions and 213 boundary steps");
+    }
+
+    {
+        const run::RouteManifest parent = FullParentManifest();
+        const run::RouteManifest child = FullChildManifest();
+        Check(run::TransferBudgetSatisfies(parent, route::kParentRequiredTransfers) &&
+                  !run::TransferBudgetSatisfies(parent, route::kParentRequiredTransfers - 1) &&
+                  run::TransferBudgetSatisfies(child, route::kChildRequiredTransfers) &&
+                  !run::TransferBudgetSatisfies(child, route::kChildRequiredTransfers - 1) &&
+                  !run::TransferBudgetSatisfies(child, 128),
+              "the budget predicate accepts exactly the manifest-derived totals");
+        Check(run::ManifestTransfersConsistent(parent) && run::ManifestTransfersConsistent(child),
+              "the full manifests declare their exact derived transfer totals");
+        run::RouteManifest understated = child;
+        understated.required_transfers = route::kChildRequiredTransfers - 1;
+        Check(!run::ManifestTransfersConsistent(understated),
+              "an understated required_transfers is detected independently of the budget");
+    }
+
+    {
+        const Started short_child = StartFullParent(fixture, 73, 128);
+        Check(short_child.status == run::Status::kInvalidPolicy && !short_child.parent,
+              "a child transfer budget of 128 is rejected before execution");
+        const Started terminal_child = StartFullParent(fixture, 73, 142);
+        Check(terminal_child.status == run::Status::kInvalidPolicy && !terminal_child.parent,
+              "a child budget below the terminal-stop requirement is rejected");
+        const Started short_parent = StartFullParent(fixture, 72, 143);
+        Check(short_parent.status == run::Status::kInvalidPolicy && !short_parent.parent,
+              "a parent budget of 72 is rejected before execution");
+        const Started shared = StartFullParent(fixture, 73, 73);
+        Check(shared.status == run::Status::kInvalidPolicy && !shared.parent,
+              "a shared parent-sized child budget is rejected");
+        Check(!short_child.authorization && !terminal_child.authorization && !short_parent.authorization &&
+                  !shared.authorization && run::LiveAuthorizationCount() == 0,
+              "rejected budgets create no authorisation or worker");
+    }
+
+    {
+        const FullRun run = RunFullRoute(fixture);
+        Check(run.started.status == run::Status::kReady, "the full 211-instruction synthetic run is authorised");
+        Check(run.have_parent && run.have_child, "both full-route workers leave evidence");
+        Check(run.parent.status == run::Status::kStopped && run.parent.instructions == 71 &&
+                  run.parent.transfers == 73 && run.parent.required_transfers == 73 &&
+                  run.parent.stop_pc == full::kParentStop && run.parent.at_stop,
+              "the parent retires 71 instructions in 73 transfers and stops at its reviewed boundary");
+        Check(run.child.status == run::Status::kStopped && run.child.instructions == 140 &&
+                  run.child.transfers == 143 && run.child.required_transfers == 143 &&
+                  run.child.stop_pc == full::kChildStop && run.child.at_stop,
+              "the child retires 140 instructions in 143 transfers and stops at its reviewed boundary");
+        Check(run.parent.instructions + run.child.instructions == 211,
+              "the synthetic execution retires exactly 211 instructions");
+        Check(!TraceHasInstructionAt(run.parent, run::Role::kParent, full::kParentStop) &&
+                  !TraceHasInstructionAt(run.child, run::Role::kChild, full::kChildStop),
+              "neither mandatory stop instruction is entered");
+        Check(run.parent.kernel_calls == 2 && run.child.kernel_calls == 5,
+              "the parent reaches 2 kernel services and the child 5");
+        const run::KernelObservation* create = FindKernel(run.parent, run::Role::kParent, 255);
+        const run::KernelObservation* close = FindKernel(run.parent, run::Role::kParent, 187);
+        Check(create && create->result == 0 && close && close->result == 0,
+              "ordinal 255 creates the child and ordinal 187 closes its handle through the checked ABI");
+        Check(FindKernel(run.child, run::Role::kChild, 277) && FindKernel(run.child, run::Role::kChild, 277)->result == 0 &&
+                  FindKernel(run.child, run::Role::kChild, 294) && FindKernel(run.child, run::Role::kChild, 294)->result == 0,
+              "ordinals 277/294 balance the critical section through the checked ABI");
+        const run::KernelObservation* shutdown = FindKernel(run.child, run::Role::kChild, 47);
+        const run::KernelObservation* dpc = FindKernel(run.child, run::Role::kChild, 107);
+        const run::KernelObservation* timer = FindKernel(run.child, run::Role::kChild, 113);
+        Check(shutdown && shutdown->result == 0 && dpc && dpc->result == 0 && timer && timer->result == 0,
+              "ordinals 47/107/113 reach the production checked implementations");
+        kernel::ShutdownRegistrationRecord registration;
+        Check(kernel::ShutdownRegistrationCountForTest() == 1 &&
+                  kernel::ShutdownRegistrationForTest(0, &registration) &&
+                  registration.object == full::kShutdownObject &&
+                  registration.notification_routine == full::kSehHandler &&
+                  registration.priority == 0x80000000u && registration.owner_thread == run.child.thread_id &&
+                  registration.memory_generation == mem::Generation() &&
+                  std::strcmp(registration.image_sha1, fixture.sha1.c_str()) == 0,
+              "ordinal 47 records the reviewed object, routine, priority, owner and image identity");
+        auto read_u8 = [](uint32_t address) {
+            uint8_t value = 0;
+            mem::Read(address, &value, sizeof(value));
+            return value;
+        };
+        auto read_u32 = [](uint32_t address) {
+            uint32_t value = 0;
+            mem::Read(address, &value, sizeof(value));
+            return value;
+        };
+        Check(read_u8(full::kDpcObject + 0) == 19 && read_u8(full::kDpcObject + 1) == 0 &&
+                  read_u8(full::kDpcObject + 2) == 0 && read_u8(full::kDpcObject + 3) == 0 &&
+                  read_u32(full::kDpcObject + 4) == 0 && read_u32(full::kDpcObject + 8) == 0 &&
+                  read_u32(full::kDpcObject + 0x0C) == full::kSehHandler &&
+                  read_u32(full::kDpcObject + 0x10) == full::kDpcContext &&
+                  read_u32(full::kDpcObject + 0x14) == 0 && read_u32(full::kDpcObject + 0x18) == 0,
+              "ordinal 107 publishes the exact 0x1C KDPC fields");
+        Check(read_u8(full::kTimerObject + 0) == 8 && read_u8(full::kTimerObject + 2) == 10 &&
+                  read_u32(full::kTimerObject + 4) == 0 && read_u32(full::kTimerObject + 8) == full::kTimerObject + 8 &&
+                  read_u32(full::kTimerObject + 12) == full::kTimerObject + 8 &&
+                  read_u32(full::kTimerObject + 0x10) == 0 && read_u32(full::kTimerObject + 0x14) == 0 &&
+                  read_u32(full::kTimerObject + 0x18) == 0 && read_u32(full::kTimerObject + 0x1C) == 0 &&
+                  read_u32(full::kTimerObject + 0x20) == 0 && read_u32(full::kTimerObject + 0x24) == 0,
+              "ordinal 113 publishes the exact 0x28 KTIMER fields");
+        Check(read_u32(full::kCriticalSectionAddress + 0x10) == 0xFFFFFFFFu &&
+                  read_u32(full::kCriticalSectionAddress + 0x14) == 0 &&
+                  read_u32(full::kCriticalSectionAddress + 0x18) == 0,
+              "the checked critical-section enter/leave pair restores the free layout");
+        Check(run.child.seh_verified && run.child.seh_registration != 0 && run.child.tls_verified &&
+                  run.child.tls != 0,
+              "SEH and TLS remain live and verified at the child stop");
+        bool seh_checks_ok = run.child.seh_check_count >= 14;
+        for (size_t i = 0; i < run.child.seh_check_count; ++i) {
+            const run::SehCheck& check = run.child.seh_checks[i];
+            if (check.status == uint8_t(run::SehCheckStatus::kFail) ||
+                check.status == uint8_t(run::SehCheckStatus::kUnknown))
+                seh_checks_ok = false;
+        }
+        Check(seh_checks_ok, "every SEH predicate passes on the full-route frame");
+        const uint32_t handle = read_u32(full::kHandleOut);
+        Check(handle != 0 && !kernel::FromHandle(handle),
+              "the parent closed the created child handle after the ordinal-187 call");
+        Check(read_u32(full::kHandlerMarker) == 0, "the synthetic SEH handler never ran");
+        Check(run.parent.thread_id != run.child.thread_id && run.parent.claim_id && run.child.claim_id &&
+                  run.parent.claim_id != run.child.claim_id,
+              "the full-route workers have distinct thread and claim identities");
+        Check(kernel::Threads().empty(), "both full-route workers unregister after finalisation");
+        std::printf("FULL_ROUTE parent_instructions=%u parent_transfers=%u child_instructions=%u "
+                    "child_transfers=%u total_instructions=%u boundary_steps=%u\n",
+                    run.parent.instructions, run.parent.transfers, run.child.instructions, run.child.transfers,
+                    run.parent.instructions + run.child.instructions,
+                    run.parent.instructions + run.child.instructions + 2);
+    }
+
+    {
+        const FullRun run = RunFullRoute(fixture, 143, 200);
+        Check(run.started.status == run::Status::kReady && run.have_parent && run.have_child,
+              "larger budgets are admitted");
+        Check(run.parent.status == run::Status::kStopped && run.parent.instructions == 71 &&
+                  run.parent.transfers == 73 && run.child.status == run::Status::kStopped &&
+                  run.child.instructions == 140 && run.child.transfers == 143,
+              "larger budgets do not execute past the reviewed route or terminal stops");
+    }
+
+    {
+        run::RouteManifest child = FullChildManifest();
+        child.required_transfers = 0;  // test-only: exercise the gate's terminal accounting directly
+        const FullRun run = RunFullRoute(fixture, 73, 142, 71, 140, &child);
+        Check(run.started.status == run::Status::kReady, "the terminal-stop probe is admitted");
+        Check(run.have_child && run.child.status == run::Status::kBudgetExceeded &&
+                  run.child.instructions == 140 && run.child.stop_pc == full::kChildStop && !run.child.at_stop,
+              "a budget of 142 refuses the terminal stop instead of reporting completion");
+    }
+
+    {
+        struct Stage {
+            uint32_t ordinal;
+            uint32_t budget;
+        } stages[] = {{47, 128}, {107, 136}, {113, 139}};
+        for (const Stage& stage : stages) {
+            run::RouteManifest child = FullChildManifest();
+            child.required_transfers = 0;  // test-only: the gate budget is the subject
+            const FullRun run = RunFullRoute(fixture, 73, 143, 71, stage.budget, &child);
+            Check(run.started.status == run::Status::kReady && run.have_child &&
+                      run.child.status == run::Status::kBudgetExceeded &&
+                      run.child.instructions == stage.budget,
+                  "an instruction budget stops before the next kernel service");
+            Check(!FindKernel(run.child, run::Role::kChild, stage.ordinal),
+                  "no kernel service executes past the budget");
+            Check(run.have_parent && run.parent.status == run::Status::kStopped,
+                  "the parent stop is independent of the child's budget stop");
+        }
+    }
+
+    {
+        run::RouteManifest loop;
+        loop.steps = fixture::kLoopRoute;
+        loop.count = fixture::kLoopRouteCount;
+        loop.entry = fixture::kLoopEntry;
+        loop.stop = fixture::kLoopStop;
+        loop.executed_instructions = fixture::kLoopExecutedInstructions;
+        loop.trap_entries = fixture::kLoopTrapEntries;
+        loop.trap_count = 1;
+        loop.identity = run::ManifestIdentity(loop);
+        const RouteRun run = RunSyntheticRoute(fixture, loop, 4, 8, 1, 2);
+        Check(run.have && run.evidence.status == run::Status::kUnreviewedTransfer &&
+                  run.evidence.instructions == 1 && !run.evidence.at_stop,
+              "an unexpected self-loop is refused at the reviewed edge");
+    }
+
+    {
+        run::RouteManifest unknown;
+        unknown.steps = fixture::kUnknownRoute;
+        unknown.count = fixture::kUnknownRouteCount;
+        unknown.entry = fixture::kUnknownEntry;
+        unknown.stop = fixture::kUnknownStop;
+        unknown.executed_instructions = fixture::kUnknownExecutedInstructions;
+        unknown.trap_entries = fixture::kUnknownTrapEntries;
+        unknown.trap_count = 1;
+        unknown.identity = run::ManifestIdentity(unknown);
+        const RouteRun run = RunSyntheticRoute(fixture, unknown, 4, 8, 1, 2);
+        Check(run.have && run.evidence.status == run::Status::kUnreviewedTransfer &&
+                  run.evidence.instructions == 1 && !run.evidence.at_stop,
+              "an unknown transfer target is refused before execution");
+    }
+
+    {
+        // The parent's last step is a plain tail transfer: rewriting its next
+        // cannot bypass the mandatory stop because the stop target is checked
+        // first.
+        std::array<route::Step, full::kParentRouteCount> parent_steps{};
+        std::copy(std::begin(full::kParentRoute), std::end(full::kParentRoute), parent_steps.begin());
+        parent_steps.back().next = full::kParentEntry;
+        run::RouteManifest parent = FullParentManifest();
+        parent.steps = parent_steps.data();
+        parent.identity = run::ManifestIdentity(parent);
+        const FullRun run = RunFullRoute(fixture, 73, 143, 71, 140, nullptr, &parent);
+        Check(run.started.status == run::Status::kReady && run.have_parent &&
+                  run.parent.status == run::Status::kStopped && run.parent.instructions == 71 &&
+                  run.parent.transfers == 73 && run.parent.stop_pc == full::kParentStop && run.parent.at_stop,
+              "a rewritten parent next cannot continue past the mandatory terminal stop");
+    }
+
+    {
+        // The child's last step is the ordinal-113 kernel call. Rewriting its
+        // next changes the reviewed return address, so the kernel call itself
+        // fails closed before any continuation can be attempted.
+        std::array<route::Step, full::kChildRouteCount> steps{};
+        std::copy(std::begin(full::kChildRoute), std::end(full::kChildRoute), steps.begin());
+        steps.back().next = full::kChildEntry;
+        run::RouteManifest child = FullChildManifest();
+        child.steps = steps.data();
+        child.identity = run::ManifestIdentity(child);
+        const FullRun run = RunFullRoute(fixture, 73, 143, 71, 140, &child);
+        Check(run.started.status == run::Status::kReady && run.have_child &&
+                  run.child.status == run::Status::kKernelRejected && run.child.instructions == 140 &&
+                  !run.child.at_stop,
+              "a rewritten child next is refused at the last reviewed kernel edge");
     }
 
     {
@@ -655,11 +1087,20 @@ int main() {
         policy.mapping_identity = dispatch::MappingIdentity();
         policy.dispatch_generation = dispatch::CallLease().Generation();
         policy.memory_generation = mem::Generation();
-        policy.instruction_budget = 1;
+        policy.instruction_budget = route::kParentExecutedInstructions;
         policy.transfer_budget = 1;
         policy.kernel_budget = 1;
         policy.maximum_call_depth = 1;
+        policy.child_instruction_budget = route::kChildExecutedInstructions;
+        policy.child_transfer_budget = 128;
+        policy.child_kernel_budget = 1;
+        policy.child_maximum_call_depth = 1;
         run::RunAuthorization authorization;
+        const run::Status undersized = run::AuthorizeAuthenticRun(run::Role::kParent, policy, &authorization);
+        Check(undersized == run::Status::kInvalidPolicy && !authorization,
+              "the previous child budget of 128 is refused by the authentic preflight");
+        policy.transfer_budget = route::kParentRequiredTransfers;
+        policy.child_transfer_budget = route::kChildRequiredTransfers;
         const run::Status authentic = run::AuthorizeAuthenticRun(run::Role::kParent, policy, &authorization);
         Check(authentic == run::Status::kAuthenticExecutionNotAuthorised ||
                   authentic == run::Status::kInvalidImage || authentic == run::Status::kInvalidMapping,

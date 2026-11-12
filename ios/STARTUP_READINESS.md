@@ -191,3 +191,27 @@ authentic tests, checked fixtures, CTests, accounting and memory/registration su
 211 boundary is static/synthetic ready for a separately authorised run; Gate C remains NO-GO. A fourth
 authentic run is technically justified only for exactly this 211/213 boundary and with the explicit
 `SCOPED_STARTUP_COMPATIBILITY` / `FULL_KERNEL_SHUTDOWN_FIDELITY=unresolved` caveat.
+
+## Phase 2D-27B — transfer-budget remediation
+
+`PHASE_2D27B_TRANSFER_BUDGET_REMEDIATION = PASS`.
+
+The fourth run stopped early because the child's per-worker transfer budget was 128. The reviewed route
+needs parent 73 / child 143 transfers including the terminal stop; the parent stops before `002B3987` and
+the child before `002B5E37`. `ComputeRequiredTransfers` and `RouteManifest.required_transfers` bind the
+requirement into the fingerprint; authorisation and the static preflight reject the child budget 128 before
+execution, and the gate counts the terminal stop. The new identities are parent `85527B8FA581229F`, child
+`585C5E1A742B6924`; mapping `E9DFEF8BB5AC0970` is unchanged.
+
+A generated synthetic mirror retires 211 instructions in 213 boundary steps (parent 71/73, child 140/143)
+and reaches the production checked implementations of 47/107/113. Exact KDPC/KTIMER/shutdown-registration
+state, the live 14-predicate SEH frame, TLS, the parent handle close, worker finalisation and the
+allocation baseline all pass. Negative budget, loop, unknown-transfer and post-stop cases fail closed.
+
+Fresh Debug/Release: authentic tests 144/0, checked fixtures 812/0, safe CTests 5/5, preflight PASS 225/225,
+accounting 1280 -> 0, memory tests 454/0, Android ARM64 syntax PASS.
+
+Gate A GO; Gate B is static/synthetic ready and execution NO-GO; Gate C NO-GO. A single fifth authentic
+execution of the unchanged 211/213 route is technically justified only with a separate explicit
+authorisation and the 47/107/113 kernel-slot preparation; the temporary activation/driver is not committed
+by this phase and must use the 73/143 floors. It is not Gate C. Do not authorise it from this document.

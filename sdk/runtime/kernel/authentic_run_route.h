@@ -277,6 +277,24 @@ inline constexpr uint32_t kTotalExecutedInstructions = 211;
 inline constexpr uint32_t kParentBoundarySteps = 72;
 inline constexpr uint32_t kChildBoundarySteps = 141;
 inline constexpr uint32_t kTotalBoundarySteps = 213;
+
+// Every reviewed instruction after the first is entered through one transfer,
+// each RET is one additional transfer that does not enter an instruction, and
+// the terminal stop is itself one transfer. The budget must accommodate all of
+// them; a budget that covers only the instruction entries stops at the terminal
+// boundary instead of reaching the reviewed stop.
+inline constexpr uint32_t ComputeRequiredTransfers(const Step* steps, size_t count) {
+    if (!steps || !count) return 0;
+    uint32_t transfers = uint32_t(count - 1);
+    for (size_t i = 0; i < count; ++i)
+        if (steps[i].kind == StepKind::kRet) ++transfers;
+    return transfers + 1;
+}
+
+inline constexpr uint32_t kParentRequiredTransfers = ComputeRequiredTransfers(kParentRoute, kParentRouteCount);
+inline constexpr uint32_t kChildRequiredTransfers = ComputeRequiredTransfers(kChildRoute, kChildRouteCount);
+static_assert(kParentRequiredTransfers == 73, "the reviewed parent route needs 73 transfers");
+static_assert(kChildRequiredTransfers == 143, "the reviewed child route needs 143 transfers");
 inline constexpr uint32_t kParentTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C};
 inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, kSehHandler, 0x002B5999, 0x002B59A1,
                                                0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,
@@ -291,7 +309,7 @@ inline constexpr uint64_t ComputeManifestIdentity(const Step* steps, size_t coun
                                                  uint32_t seh_handler = 0, uint32_t seh_scope_table = 0,
                                                  uint32_t seh_scope_bytes = 0, uint32_t seh_scope_flag = 0,
                                                  uint32_t tls_block_size = 0, uint32_t critical_section_object = 0,
-                                                 uint32_t start_routine = 0) {
+                                                 uint32_t start_routine = 0, uint32_t required_transfers = 0) {
     if (!steps) return 0;
     uint64_t hash = 0xCBF29CE484222325ull;
     auto mix = [&hash](uint32_t value) {
@@ -326,6 +344,7 @@ inline constexpr uint64_t ComputeManifestIdentity(const Step* steps, size_t coun
     mix(tls_block_size);
     mix(critical_section_object);
     mix(start_routine);
+    mix(required_transfers);
     return hash;
 }
 

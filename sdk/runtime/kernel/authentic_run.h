@@ -86,11 +86,17 @@ struct RouteManifest {
     uint32_t tls_block_size = 0;         // 0 if the route does not initialise TLS
     uint32_t critical_section_object = 0;  // reviewed 277/294 object, 0 if none
     uint32_t start_routine = 0;          // the thread start routine this route serves, 0 if none
+    uint32_t required_transfers = 0;     // manifest-derived total including the terminal stop; 0 for test-only routes
 };
 
 const RouteManifest& AuthenticParentManifest();
 const RouteManifest& AuthenticChildManifest();
 uint64_t ManifestIdentity(const RouteManifest& manifest);
+// A reviewed manifest must declare the exact transfer total derived from its
+// steps. A non-zero required_transfers guards the admission floor; zero marks a
+// synthetic test route whose budgets are still enforced dynamically by the gate.
+bool ManifestTransfersConsistent(const RouteManifest& manifest);
+bool TransferBudgetSatisfies(const RouteManifest& manifest, uint32_t budget);
 uint64_t RuntimeMappingIdentity();
 uint32_t RuntimeMappingCount();
 
@@ -105,8 +111,8 @@ struct AuthorizationPolicy {
     uint64_t mapping_identity = 0;          // exact generated mapping identity
     uint64_t dispatch_generation = 0;       // exact, never 0
     uint64_t memory_generation = 0;         // exact, never 0
-    uint32_t instruction_budget = 0;        // must be >= manifest executed instructions
-    uint32_t transfer_budget = 0;
+    uint32_t instruction_budget = 0;        // a ceiling; the reviewed stop still ends the route
+    uint32_t transfer_budget = 0;            // must be >= the manifest's required_transfers
     uint32_t kernel_budget = 0;
     uint32_t maximum_call_depth = 0;
     // the child created through the reviewed ordinal-255 edge
@@ -252,6 +258,7 @@ struct RunEvidence {
     uint32_t stop_target = 0;
     uint32_t instructions = 0;
     uint32_t transfers = 0;
+    uint32_t required_transfers = 0;
     uint32_t kernel_calls = 0;
     uint32_t maximum_depth = 0;
     uint32_t seh_registration = 0;

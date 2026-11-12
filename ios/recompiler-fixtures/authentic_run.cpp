@@ -13,6 +13,7 @@
 
 #include "kernel/authentic_run.h"
 #include "kernel/kernel_data_init.h"
+#include "kernel/kernel_objects.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,6 +41,11 @@ const char* const kImageName255 = "PsCreateSystemThreadEx";
 const char* const kImageName187 = "NtClose";
 const char* const kImageName277 = "RtlEnterCriticalSection";
 const char* const kImageName294 = "RtlLeaveCriticalSection";
+const char* const kImageName47 = "HalRegisterShutdownNotification";
+const char* const kImageName107 = "KeInitializeDpc";
+const char* const kImageName113 = "KeInitializeTimerEx";
+constexpr uint32_t kShutdownCallbackLow = 0x00011000u;
+constexpr uint32_t kShutdownCallbackHigh = 0x00380000u;
 
 struct AuthenticRunStop final {};
 struct AuthenticRunViolation final {};
@@ -241,6 +247,16 @@ bool ClaimSlot(WorkerSlot& slot, Thread& thread) {
     if (dispatch::MappingIdentity() != slot.mapping_identity) return false;
     if (dispatch::CallLease().Generation() != slot.dispatch_generation) return false;
     if (!ImageIdentityMatches(slot.image_sha1)) return false;
+    // The transfer-budget invariant is rechecked at the claim boundary so an
+    // authorisation path that bypassed the policy floor still fails closed
+    // before any reviewed instruction runs.
+    if (!slot.manifest || !ManifestTransfersConsistent(*slot.manifest) ||
+        !TransferBudgetSatisfies(*slot.manifest, slot.transfer_budget))
+        return false;
+    if (slot.role == Role::kParent && slot.child_manifest &&
+        (!ManifestTransfersConsistent(*slot.child_manifest) ||
+         !TransferBudgetSatisfies(*slot.child_manifest, slot.child_transfer_budget)))
+        return false;
     slot.claimed = true;
     slot.claim_id = g_next_claim++;
     slot.completed = false;
@@ -370,7 +386,12 @@ bool VerifyStopSeh(WorkerSlot& slot, Thread& thread, const RouteManifest& manife
     check(SehCheckKind::kStackBounds, bounds_ok, stack_top, e, e);
     const bool esp_ok = t_context->esp <= post_prologue_esp && t_context->esp >= stack_bottom;
     check(SehCheckKind::kPostPrologueEsp, esp_ok, post_prologue_esp, t_context->esp, e);
-    const bool ebp_ok = t_context->ebp == e + 4;
+    // The stop may be inside a nested frame (the kernel-init helper has its
+    // own push ebp/mov ebp,esp after the SEH prologue). The live SEH record is
+    // checked below at [e-...] and [e+4]; here only require the current frame
+    // pointer to be a valid address in this worker's stack.
+    const bool ebp_ok = t_context->ebp >= stack_bottom && t_context->ebp < stack_top &&
+                        (t_context->ebp & 3u) == 0;
     check(SehCheckKind::kCallerEbp, ebp_ok, e + 4, t_context->ebp, e);
 
     struct Word {
@@ -496,6 +517,9 @@ bool KernelNameMatches(uint32_t ordinal) {
         case 187: expected = kImageName187; break;
         case 277: expected = kImageName277; break;
         case 294: expected = kImageName294; break;
+        case 47: expected = kImageName47; break;
+        case 107: expected = kImageName107; break;
+        case 113: expected = kImageName113; break;
         default: return false;
     }
     const char* name = kernel::ExportName(ordinal);
@@ -682,10 +706,11 @@ const RouteManifest& AuthenticParentManifest() {
         route::kParentStop,
         route::kParentExecutedInstructions,
         route::ComputeManifestIdentity(route::kParentRoute, route::kParentRouteCount, route::kParentEntry,
-                                       route::kParentStop, 0, 0, 0, 0, 0, 0, 0, 0),
+                                       route::kParentStop, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                       route::kParentRequiredTransfers),
         route::kParentTrapEntries,
         sizeof(route::kParentTrapEntries) / sizeof(route::kParentTrapEntries[0]),
-        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, route::kParentRequiredTransfers,
     };
     return manifest;
 }
@@ -701,7 +726,7 @@ const RouteManifest& AuthenticChildManifest() {
                                        route::kChildStop, route::kSehCall, route::kSehEntry, route::kSehHandler,
                                        route::kSehScopeTable, route::kSehScopeBytes, route::kSehScopeFlag,
                                        route::kTlsBlockSize, route::kCriticalSectionObject,
-                                       route::kChildStartRoutine),
+                                       route::kChildStartRoutine, route::kChildRequiredTransfers),
         route::kChildTrapEntries,
         sizeof(route::kChildTrapEntries) / sizeof(route::kChildTrapEntries[0]),
         route::kSehCall,
@@ -713,6 +738,7 @@ const RouteManifest& AuthenticChildManifest() {
         route::kTlsBlockSize,
         route::kCriticalSectionObject,
         route::kChildStartRoutine,
+        route::kChildRequiredTransfers,
     };
     return manifest;
 }
@@ -722,7 +748,17 @@ uint64_t ManifestIdentity(const RouteManifest& manifest) {
                                           manifest.seh_call, manifest.seh_entry, manifest.seh_handler,
                                           manifest.seh_scope_table, manifest.seh_scope_bytes, manifest.seh_scope_flag,
                                           manifest.tls_block_size, manifest.critical_section_object,
-                                          manifest.start_routine);
+                                          manifest.start_routine, manifest.required_transfers);
+}
+
+bool ManifestTransfersConsistent(const RouteManifest& manifest) {
+    if (!manifest.required_transfers) return true;
+    return manifest.steps && manifest.count &&
+           manifest.required_transfers == route::ComputeRequiredTransfers(manifest.steps, manifest.count);
+}
+
+bool TransferBudgetSatisfies(const RouteManifest& manifest, uint32_t budget) {
+    return !manifest.required_transfers || budget >= manifest.required_transfers;
 }
 
 uint64_t RuntimeMappingIdentity() { return dispatch::MappingIdentity(); }
@@ -774,6 +810,16 @@ Status AuthorizeRunForThread(Thread* thread, const AuthorizationPolicy& policy, 
         (!policy.child_manifest || !ValidManifestPtr(policy.child_manifest) ||
          !policy.child_instruction_budget || !policy.child_transfer_budget || !policy.child_kernel_budget ||
          !policy.child_maximum_call_depth))
+        return Status::kInvalidPolicy;
+    // The transfer budget must cover the manifest-derived total, terminal stop
+    // included. Parent and child are checked independently against their own
+    // manifests; a shared or per-worker mis-accounting fails here.
+    if (!ManifestTransfersConsistent(*policy.manifest) ||
+        !TransferBudgetSatisfies(*policy.manifest, policy.transfer_budget))
+        return Status::kInvalidPolicy;
+    if (policy.role == Role::kParent &&
+        (!ManifestTransfersConsistent(*policy.child_manifest) ||
+         !TransferBudgetSatisfies(*policy.child_manifest, policy.child_transfer_budget)))
         return Status::kInvalidPolicy;
     if (policy.origin == Origin::kAuthenticImage) return Status::kAuthenticExecutionNotAuthorised;
     if (policy.origin != Origin::kSyntheticFixture) return Status::kInvalidPolicy;
@@ -841,6 +887,17 @@ Status AuthorizeAuthenticRun(Role role, const AuthorizationPolicy& policy, RunAu
     } else if (policy.manifest != &reviewed_child) {
         return Status::kInvalidRoute;
     }
+    // The reviewed manifests must declare their exact transfer totals, and the
+    // configured budgets must cover them. This is checked even while execution
+    // is disabled so the previous 128-transfer child budget is refused before
+    // any authorisation state can be created.
+    if (!ManifestTransfersConsistent(*policy.manifest) ||
+        !TransferBudgetSatisfies(*policy.manifest, policy.transfer_budget))
+        return Status::kInvalidPolicy;
+    if (role == Role::kParent &&
+        (!ManifestTransfersConsistent(*policy.child_manifest) ||
+         !TransferBudgetSatisfies(*policy.child_manifest, policy.child_transfer_budget)))
+        return Status::kInvalidPolicy;
     if (policy.dispatch_generation != dispatch::CallLease().Generation()) return Status::kStaleDispatch;
     if (policy.memory_generation != mem::Generation()) return Status::kStaleMemory;
     if (!KernelWorkersAccepting()) return Status::kShutdown;
@@ -905,8 +962,11 @@ void AdmitGeneratedTransfer(X86Context& ctx, uint32_t target, uint32_t return_ad
         if (target == manifest.stop) {
             // The reviewed dynamic start-routine call retires (its return
             // address is pushed) and the callee entry is refused. Zero
-            // instructions of the target execute.
-            slot.transfers++;
+            // instructions of the target execute. The terminal boundary is
+            // itself a transfer and must fit the configured budget.
+            if (slot.transfers + 1 > slot.transfer_budget)
+                Violation(slot, Status::kBudgetExceeded, transfer_pc, target);
+            ++slot.transfers;
             x86_mem_write<uint32_t>(transfer_pc, ctx.esp - 4, return_address);
             ctx.esp -= 4;
             slot.stop_target = target;
@@ -954,6 +1014,12 @@ void AdmitGeneratedTransfer(X86Context& ctx, uint32_t target, uint32_t return_ad
             break;
     }
     if (target == manifest.stop) {
+        // The mandatory stop is a transfer like any other. Counting it here
+        // means a budget of required_transfers - 1 refuses the stop instead of
+        // reporting a completed route.
+        if (slot.transfers + 1 > slot.transfer_budget)
+            Violation(slot, Status::kBudgetExceeded, transfer_pc, target);
+        ++slot.transfers;
         slot.stop_target = target;
         Stop(slot, Status::kStopped);
     }
@@ -988,6 +1054,8 @@ void AdmitGuestReturn(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
     const uint32_t call_node = slot.call_stack[--slot.depth];
     if (manifest.steps[call_node].next != step.next)
         Violation(slot, Status::kUnreviewedTransfer, pc, return_address);
+    if (slot.transfers + 1 > slot.transfer_budget)
+        Violation(slot, Status::kBudgetExceeded, pc, return_address);
     ++slot.transfers;
     TraceEvent(slot, EventKind::kReturnTransfer, pc, return_address);
     TraceContext(slot);
@@ -1199,6 +1267,7 @@ bool EvidenceForRole(Role role, RunEvidence* evidence) {
     evidence->stop_target = slot.stop_target;
     evidence->instructions = slot.instructions;
     evidence->transfers = slot.transfers;
+    evidence->required_transfers = slot.manifest->required_transfers;
     evidence->kernel_calls = slot.kernel_calls;
     evidence->maximum_depth = slot.maximum_depth_seen;
     evidence->seh_registration = slot.seh_registration;
@@ -1316,6 +1385,66 @@ void HarnessCriticalLeave(X86Context& ctx, uint8_t*) {
            1);
 }
 
+[[noreturn]] void RejectKernelObject(WorkerSlot& slot, const char* reason) {
+    (void)reason;
+    Violation(slot, Status::kKernelRejected, t_pending_kernel ? t_pending_kernel->call_pc : 0);
+}
+
+// The harness versions of ordinals 47/107/113 are thin adapters over the
+// production checked implementations. They exist because the authentic
+// experiment target links the harness, not the full xboxkrnl export table.
+void HarnessShutdownRegistration(X86Context& ctx, uint8_t*) {
+    uint32_t object = 0, action = 0;
+    if (mem::Read(ctx.esp + 4, &object, sizeof(object)) != mem::AccessStatus::kOk ||
+        mem::Read(ctx.esp + 8, &action, sizeof(action)) != mem::AccessStatus::kOk) {
+        if (t_active) RejectKernelObject(*t_active, "shutdown registration arguments");
+        Return(ctx, kAccessViolation, 2);
+        return;
+    }
+    Thread* thread = Current();
+    if (!t_active || !thread) {
+        Return(ctx, kInvalidParameter, 2);
+        return;
+    }
+    const KernelObjectStatus status = RegisterShutdownNotificationChecked(
+        object, action, thread->id, t_active->image_sha1, kShutdownCallbackLow, kShutdownCallbackHigh);
+    if (status != KernelObjectStatus::kOk) RejectKernelObject(*t_active, "shutdown registration");
+    Return(ctx, 0, 2);
+}
+
+void HarnessInitializeDpc(X86Context& ctx, uint8_t*) {
+    uint32_t arguments[3] = {};
+    if (mem::Read(ctx.esp + 4, arguments, sizeof(arguments)) != mem::AccessStatus::kOk) {
+        if (t_active) RejectKernelObject(*t_active, "initialise DPC arguments");
+        Return(ctx, kAccessViolation, 3);
+        return;
+    }
+    const KernelObjectStatus status =
+        InitializeDpcChecked(arguments[0], arguments[1], arguments[2]);
+    if (status != KernelObjectStatus::kOk) {
+        if (t_active) RejectKernelObject(*t_active, "initialise DPC");
+        Return(ctx, kInvalidParameter, 3);
+        return;
+    }
+    Return(ctx, 0, 3);
+}
+
+void HarnessInitializeTimerEx(X86Context& ctx, uint8_t*) {
+    uint32_t arguments[2] = {};
+    if (mem::Read(ctx.esp + 4, arguments, sizeof(arguments)) != mem::AccessStatus::kOk) {
+        if (t_active) RejectKernelObject(*t_active, "initialise timer arguments");
+        Return(ctx, kAccessViolation, 2);
+        return;
+    }
+    const KernelObjectStatus status = InitializeTimerExChecked(arguments[0], arguments[1]);
+    if (status != KernelObjectStatus::kOk) {
+        if (t_active) RejectKernelObject(*t_active, "initialise timer");
+        Return(ctx, kInvalidParameter, 2);
+        return;
+    }
+    Return(ctx, 0, 2);
+}
+
 }  // namespace
 
 Status InstallHarnessKernelExports() {
@@ -1323,7 +1452,12 @@ Status InstallHarnessKernelExports() {
     RegisterExport(187, kImageName187, HarnessClose);
     RegisterExport(277, kImageName277, HarnessCriticalEnter);
     RegisterExport(294, kImageName294, HarnessCriticalLeave);
-    if (!HasExport(255) || !HasExport(187) || !HasExport(277) || !HasExport(294)) return Status::kInternalError;
+    RegisterExport(47, kImageName47, HarnessShutdownRegistration);
+    RegisterExport(107, kImageName107, HarnessInitializeDpc);
+    RegisterExport(113, kImageName113, HarnessInitializeTimerEx);
+    if (!HasExport(255) || !HasExport(187) || !HasExport(277) || !HasExport(294) || !HasExport(47) ||
+        !HasExport(107) || !HasExport(113))
+        return Status::kInternalError;
     return Status::kReady;
 }
 

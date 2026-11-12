@@ -1,8 +1,8 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-27",
-  "milestone": "BOUNDARY_211",
-  "result": "PARTIAL",
+  "phase": "2D-27B",
+  "milestone": "TRANSFER_BUDGET_REMEDIATION",
+  "result": "PASS",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
   "image_sha1": "f636a16af04171089f879a4bed646e185c734233",
@@ -171,9 +171,18 @@
       "stop": "0x002B38A7"
     },
     "allowed_kernel_ordinals": {
-      "parent": [255, 187],
-      "child": [277, 294],
-      "data_imports": [322, 324]
+      "parent": [
+        255,
+        187
+      ],
+      "child": [
+        277,
+        294
+      ],
+      "data_imports": [
+        322,
+        324
+      ]
     },
     "required_memory": [
       "image .text/.rdata/.data",
@@ -211,18 +220,20 @@
     "ios/recompiler-fixtures/CMakeLists.txt"
   ],
   "validation": {
-    "authentic_run_tests": "95 PASS / 0 FAIL, Debug and Release",
+    "authentic_run_tests": "144 PASS / 0 FAIL, Debug and Release",
     "checked_recompiler_fixtures": "812 PASS / 0 FAIL, Debug and Release",
     "safe_ctests": "5/5, Debug and Release (-E execution_probe)",
-    "authentic_run_preflight": "PASS, 200/200, 186 executed / 188 boundary steps",
-    "identity_preflight": "mapping 07AEBFC052075330, parent 48120EDC4D3D4466, child 322795BF56BE60B6",
+    "authentic_run_preflight": "PASS, 225/225, 211 executed / 213 boundary steps",
+    "identity_preflight": "mapping E9DFEF8BB5AC0970, parent 85527B8FA581229F, child 585C5E1A742B6924",
     "data_import_slots": "322/324 verified",
     "authentic_run_accounting": "PASS, virtual 1280 -> 0",
     "gate_b_preflight": "PASS, historical 145 boundary, execution prohibited",
     "root_secondary_integrated_static": "PASS; integrated 143/143; production assessment validated-but-execution-prohibited",
-    "android_arm64_harness_syntax": "PASS (authentic_run.cpp)",
+    "android_arm64_harness_syntax": "PASS (authentic_run.cpp, kernel_objects.cpp)",
     "authentic_image_executed": false,
-    "old_evidence_modified": false
+    "old_evidence_modified": false,
+    "mostwanted_memory_tests": "454 PASS / 0 FAIL, Debug and Release",
+    "child_budget_128": "REFUSED by the static preflight"
   },
   "gates": {
     "gate_a_preparation": {
@@ -356,12 +367,183 @@
     "extension_instructions": 25,
     "mapping_identity": "E9DFEF8BB5AC0970",
     "mapping_entries": 225,
-    "parent_manifest": "48120EDC4D3D4466",
-    "child_manifest": "2FA1FDFDA0F3F86B",
+    "parent_manifest": "85527B8FA581229F",
+    "child_manifest": "585C5E1A742B6924",
     "preflight": "PASS 225/225",
-    "historical_186_identities": ["07AEBFC052075330", "48120EDC4D3D4466", "322795BF56BE60B6"]
+    "historical_186_identities": [
+      "07AEBFC052075330",
+      "48120EDC4D3D4466",
+      "322795BF56BE60B6"
+    ],
+    "parent_required_transfers": 73,
+    "child_required_transfers": 143,
+    "child_budget_128": "REFUSED",
+    "note": "The 48120EDC4D3D4466 / 2FA1FDFDA0F3F86B identities predate the required_transfers fingerprint."
   },
   "authorises_authentic_execution": false,
   "r1_16": "ON_HOLD",
-  "customer_release": "NOT_READY"
+  "customer_release": "NOT_READY",
+  "baseline_head": "4b7aad616374d0ea45b7200a95fdb26f02448ff7",
+  "fourth_run": {
+    "result": "EARLY_STOP",
+    "authentic_run": true,
+    "parent_instructions": 71,
+    "parent_recorded_transfers_historical": 72,
+    "parent_required_transfers_corrected": 73,
+    "child_instructions_retired": 126,
+    "child_recorded_transfers": 128,
+    "child_required_transfers_corrected": 143,
+    "child_stop": "0x002B5673",
+    "cause": "per-worker child transfer budget of 128 was below the reviewed 143-transfer requirement",
+    "trace_matched_reviewed_route": true,
+    "evidence": ".local/ios-port/phase2d27-fourth-authentic-run/",
+    "note": "The recorded parent 72 and child 128 counts predate terminal-stop accounting."
+  },
+  "budget_model": {
+    "scope": "per worker claim, not shared",
+    "formula": "required_transfers = (instructions - 1) + RET transfers + 1 terminal stop",
+    "parent_required_transfers": 73,
+    "child_required_transfers": 143,
+    "parent_instruction_ceiling": 71,
+    "child_instruction_ceiling": 140,
+    "total_instructions": 211,
+    "boundary_steps": 213,
+    "manifest_field": "RouteManifest.required_transfers",
+    "manifest_identity_binds_requirement": true,
+    "authorisation_floor": "transfer_budget >= required_transfers for each worker independently",
+    "terminal_stop_counted": true,
+    "previous_child_budget_128": "REFUSED",
+    "previous_child_budget_128_rejection": "static preflight, authentic authorisation and synthetic authorisation"
+  },
+  "synthetic_rehearsal_2d27b": {
+    "fixture": "generated synthetic mirror at synthetic addresses; no authentic bytes",
+    "parent_instructions": 71,
+    "parent_transfers": 73,
+    "child_instructions": 140,
+    "child_transfers": 143,
+    "total_instructions": 211,
+    "boundary_steps": 213,
+    "parent_stop_before": "synthetic mirror of 0x002B3987",
+    "child_stop_before": "synthetic mirror of 0x002B5E37",
+    "kernels": {
+      "parent": [
+        255,
+        187
+      ],
+      "child": [
+        277,
+        294,
+        47,
+        107,
+        113
+      ]
+    },
+    "kernel_objects": {
+      "ordinal_47": "exact registration object, callback, priority, owner, generation and image identity",
+      "ordinal_107": "exact 0x1C KDPC fields",
+      "ordinal_113": "exact 0x28 KTIMER fields"
+    },
+    "seh": "live record and all 14 predicates pass",
+    "tls": "verified",
+    "handle": "child handle closed through ordinal 187",
+    "cleanup": "workers unregister; allocation baseline restored",
+    "negative_cases": [
+      "child budget 128 rejected before execution",
+      "child budget 142 rejected before execution",
+      "parent budget 72 rejected before execution",
+      "shared 73/73 accounting rejected",
+      "instruction budget stops before ordinals 47, 107 and 113",
+      "budget 142 refuses the terminal stop instead of completing",
+      "unexpected backward loop refused",
+      "unknown transfer refused",
+      "rewritten parent next cannot continue past the stop",
+      "rewritten child next refused at the last kernel edge"
+    ]
+  },
+  "validation_2d27b": {
+    "authentic_run_tests": {
+      "debug": "144 PASS / 0 FAIL",
+      "release": "144 PASS / 0 FAIL"
+    },
+    "checked_recompiler_fixtures": {
+      "debug": "812 PASS / 0 FAIL",
+      "release": "812 PASS / 0 FAIL"
+    },
+    "safe_ctests": {
+      "debug": "5/5",
+      "release": "5/5"
+    },
+    "authentic_run_preflight": {
+      "debug": "PASS 225/225",
+      "release": "PASS 225/225"
+    },
+    "authentic_run_accounting": {
+      "debug": "1280 -> 0",
+      "release": "1280 -> 0"
+    },
+    "mostwanted_memory_tests": {
+      "debug": "454 PASS / 0 FAIL",
+      "release": "454 PASS / 0 FAIL"
+    },
+    "android_arm64_syntax": "PASS (authentic_run.cpp, kernel_objects.cpp)",
+    "identities": "parent 85527B8FA581229F, child 585C5E1A742B6924, mapping E9DFEF8BB5AC0970",
+    "child_budget_128": "REFUSED by the preflight",
+    "authentic_image_executed": false,
+    "historical_evidence_modified": false
+  },
+  "gates_2d27b": {
+    "gate_a_preparation": {
+      "result": "GO",
+      "scope": "image, kernel data, mapping, manifests, budgets and assessment"
+    },
+    "gate_b_211_boundary": {
+      "result": "static/synthetic READY; execution NO-GO",
+      "scope": "parent 71/73 + child 140/143; stops 002B3987/002B5E37",
+      "blockers": [
+        "one separate explicit authorisation",
+        "a run driver that patches the 47/107/113 kernel slots and the 322/324 data slots",
+        "observed KPRCB+0x250 == 0 and [0x8001003C] == 0 preconditions"
+      ]
+    },
+    "gate_c_authentic_startup": {
+      "result": "NO-GO",
+      "blockers": [
+        "all later start-routine calls",
+        "867 initializer targets",
+        "retail SEH 302/312",
+        "ordinal 258",
+        "dynamic list callback",
+        "001C8C20 and descendants",
+        "CLI/STI, INT3 and protection"
+      ]
+    }
+  },
+  "fifth_run": {
+    "authorised": false,
+    "technically_justified": true,
+    "scope": "exactly the unchanged 211-instruction route, parent 73 transfers, child 143 transfers",
+    "mapping_identity": "E9DFEF8BB5AC0970",
+    "parent_manifest": "85527B8FA581229F",
+    "child_manifest": "585C5E1A742B6924",
+    "requirements": [
+      "one separate explicit authorisation",
+      "the temporary activation/driver is not committed; use the committed 73/143 budget floors",
+      "patch kernel slots 003C9E38/003C9E30/003C9E1C and data slots 003C9E34/003C9E3C",
+      "retain the four reviewed kernel import patches",
+      "observe KPRCB+0x250 == 0, [0x8001003C] == 0 and no INIT signature",
+      "reach both stops 002B3987/002B5E37 with 71/140 instructions and 73/143 transfers",
+      "observe kernels 255/187/277/294/47/107/113",
+      "verify the live 14-predicate SEH frame and TLS",
+      "verify the exact KDPC/KTIMER/shutdown-registration objects",
+      "return accounting to 0 and finalise all workers/claims/leases"
+    ],
+    "excluded": [
+      "Gate C items",
+      "later start-routine calls",
+      "initializers and callbacks",
+      "retail SEH delivery",
+      "ordinal 258",
+      "CLI/STI execution"
+    ]
+  }
 }

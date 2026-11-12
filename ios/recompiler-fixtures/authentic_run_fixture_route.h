@@ -193,11 +193,29 @@ inline constexpr uint32_t kUnsupportedStop = 0x00011302u;
 inline constexpr uint32_t kUnsupportedTrapEntries[] = {kUnsupportedStop};
 
 inline constexpr Step kMemoryRoute[] = {
-    {0x00011310u, 5, StepKind::kSequential, 0x00011315u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "mov eax, [0x00020000]"},
+    {0x00011310u, 5, StepKind::kSequential, 0x00011315u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "mov eax, [0x00080000]"},
 };
 inline constexpr size_t kMemoryRouteCount = 1;
 inline constexpr uint32_t kMemoryStop = 0x00011315u;
 inline constexpr uint32_t kMemoryTrapEntries[] = {kMemoryStop};
+
+inline constexpr Step kLoopRoute[] = {
+    {0x00011600u, 5, StepKind::kSequential, 0x00011602u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "jmp 0x11604"},
+};
+inline constexpr size_t kLoopRouteCount = 1;
+inline constexpr uint32_t kLoopEntry = 0x00011600;
+inline constexpr uint32_t kLoopStop = 0x00011602;
+inline constexpr uint32_t kLoopExecutedInstructions = 1;
+inline constexpr uint32_t kLoopTrapEntries[] = {kLoopStop};
+
+inline constexpr Step kUnknownRoute[] = {
+    {0x00011610u, 5, StepKind::kSequential, 0x00011615u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "jmp 0x11620"},
+};
+inline constexpr size_t kUnknownRouteCount = 1;
+inline constexpr uint32_t kUnknownEntry = 0x00011610;
+inline constexpr uint32_t kUnknownStop = 0x00011615;
+inline constexpr uint32_t kUnknownExecutedInstructions = 1;
+inline constexpr uint32_t kUnknownTrapEntries[] = {kUnknownStop};
 
 inline constexpr Step kRetImmRoute[] = {
     {0x0011400u, 5, StepKind::kSequential, 0x0011405u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kParentRoot, "push 0x1234"},
