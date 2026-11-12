@@ -288,8 +288,8 @@ A reproducible local driver (never committed) was built off and on. The reversib
 route: mapping `94166820FBB48A28` (242), parent `85527B8FA581229F` (71/73), child `3440CAC0FC3A57FB`
 (153/156), stop `002B5E5F`, kernels 2/5. The off build refuses; the on build's prepare-only admission
 passes with cleanup and accounting, and every negative (missing/wrong token, missing explicit
-authorisation, off build, stale fifth admission, tampered instructions/transfers/stop) fails closed without
-starting a worker.
+authorisation, off build, stale fifth admission, tampered instructions/transfers/stop) fails closed with
+`SIXTH_RUN = NO_GO` and starts no worker.
 
 The synthetic mirror checks the exact five-argument continuation stack, `eax = ebp-0x0C`, stop
 `esp`/`ebp`/`eax`, zero timer flags, the not-taken `002B5E4D` conditional (never `002B5E7F`), the absence of

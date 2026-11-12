@@ -4994,8 +4994,9 @@ preflight, dump, route-header and reviewed-data-slot value to agree.
 The off build refuses the prepared admission (`AUTHORISATION=DISABLED`). The on build's prepare-only
 admission prepares and authorises both workers, cancels them without starting either, and cleans up
 (`AUTHORISATION=PERMITTED`, `parent=1 child=1 ceilings=2/5 cleanup=1 accounting=1`). Refusal negatives all
-fail closed without starting a worker: missing token, wrong token, missing explicit authorisation, off
-build with a valid token, stale fifth admission and tampered child instruction, transfer and stop values.
+fail closed with `SIXTH_RUN = NO_GO` and start no worker: missing token, wrong token, missing explicit
+authorisation, off build with a valid token, stale fifth admission and tampered child instruction,
+transfer and stop values.
 
 ### Continuation and evidence validation
 

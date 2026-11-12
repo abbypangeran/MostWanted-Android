@@ -831,7 +831,8 @@
         "tampered child instructions",
         "tampered child transfers",
         "tampered child stop"
-      ]
+      ],
+      "failure_result_line": "SIXTH_RUN = NO_GO"
     },
     "continuation_checks": [
       "five-argument frame 0x11, [ebp-0x0C], [ebp-0x04], 4, [ebp-0x08]",
