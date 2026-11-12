@@ -68,6 +68,14 @@ inline constexpr bool kAuthenticExecutionAuthorised = false;
 
 inline constexpr uint32_t kSyntheticImageIdentity = 0x53324431u;  // "S2D1"
 
+// A reviewed stop may require transient guest state that the worker releases
+// at finalisation. The capture is performed by VerifyStopState while the
+// worker still holds the stack lease, and is copied into RunEvidence.
+enum class StopStackFrame : uint8_t {
+    kNone = 0,
+    kContinuationDeviceQuery = 1,
+};
+
 struct RouteManifest {
     const route::Step* steps = nullptr;
     size_t count = 0;
@@ -87,6 +95,8 @@ struct RouteManifest {
     uint32_t critical_section_object = 0;  // reviewed 277/294 object, 0 if none
     uint32_t start_routine = 0;          // the thread start routine this route serves, 0 if none
     uint32_t required_transfers = 0;     // manifest-derived total including the terminal stop; 0 for test-only routes
+    StopStackFrame stop_stack_frame = StopStackFrame::kNone;
+    uint8_t stop_stack_words = 0;        // 0 disables; kContinuationDeviceQuery requires 5
 };
 
 const RouteManifest& AuthenticParentManifest();
@@ -274,6 +284,42 @@ struct TlsEvidence {
     bool hash_recorded = false;
 };
 
+// A host-owned snapshot of transient worker stack memory at a mandatory stop.
+// capture status is independent of the semantic validation flags: a complete
+// checked read may still contain the wrong frame, and a failed read never
+// becomes a zero-filled valid snapshot.
+enum class StopStackStatus : uint8_t {
+    kNotEvaluated,
+    kValid,
+    kUnavailable,
+    kReadFailed,
+    kMismatch,
+};
+
+const char* StopStackStatusName(StopStackStatus status);
+
+struct StopStackEvidence {
+    uint32_t pc = 0;
+    uint32_t esp = 0;
+    uint32_t ebp = 0;
+    uint32_t eax = 0;
+    uint32_t requested_words = 0;
+    uint32_t words[5] = {};
+    uint32_t bytes_read = 0;
+    uint32_t content_hash = 0;       // FNV-1a over the read bytes, only when recorded
+    uint64_t memory_generation = 0;
+    uint64_t memory_generation_after = 0;
+    StopStackStatus status = StopStackStatus::kNotEvaluated;
+    bool complete_read = false;
+    bool hash_recorded = false;
+    bool aligned = false;
+    bool in_stack_bounds = false;
+    bool registers_valid = false;
+    bool layout_valid = false;
+    bool values_valid = false;
+    bool generation_stable = false;
+};
+
 struct RunEvidence {
     uint32_t role = 0;
     uint32_t origin = 0;
@@ -291,6 +337,8 @@ struct RunEvidence {
     uint32_t tls = 0;
     uint32_t tls_pointer = 0;  // mirrors tls_evidence.self_pointer
     TlsEvidence tls_evidence;
+    StopStackEvidence stop_stack;
+    bool stop_stack_verified = false;
     bool seh_verified = false;
     bool tls_verified = false;
     bool at_stop = false;
@@ -367,6 +415,9 @@ Status AuthorizeSyntheticRouteForThread(Thread* thread, const RouteManifest& man
                                         uint32_t transfer_budget, uint32_t kernel_budget, uint32_t maximum_call_depth,
                                         RunAuthorization* authorization);
 void SetRunCancelForTest(Role role);
+// Deterministic capture failure injection; it never writes guest memory.
+enum class StopStackCaptureFaultForTest : uint8_t { kNone = 0, kUnavailable, kReadFailed, kPartial };
+void SetStopStackCaptureFaultForTest(Role role, StopStackCaptureFaultForTest fault);
 #endif
 
 // Transfer gate entry points called from cpu/dispatch.cpp. They throw

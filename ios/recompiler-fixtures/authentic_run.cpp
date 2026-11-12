@@ -90,6 +90,7 @@ struct WorkerSlot {
     uint32_t seh_registration = 0;
     uint32_t tls = 0;
     TlsEvidence tls_evidence;
+    StopStackEvidence stop_stack;
     bool seh_verified = false;
     bool tls_verified = false;
     SehCheck seh_checks[16] = {};
@@ -125,6 +126,7 @@ struct Injection {
 };
 Injection g_injections[8];
 std::mutex g_injection_lock;
+std::atomic<uint8_t> g_stop_stack_fault[2] = {};
 #endif
 
 WorkerSlot& Slot(Role role) { return g_slots[role == Role::kParent ? 0 : 1]; }
@@ -150,6 +152,7 @@ void ResetSession() {
         slot.tls = 0;
         slot.tls_evidence = {};
         slot.tls_verified = false;
+        slot.stop_stack = {};
     }
 }
 
@@ -284,6 +287,7 @@ bool ClaimSlot(WorkerSlot& slot, Thread& thread) {
     slot.tls = 0;
     slot.tls_evidence = {};
     slot.tls_verified = false;
+    slot.stop_stack = {};
     slot.at_stop = false;
     slot.finished = false;
     return true;
@@ -482,6 +486,102 @@ bool VerifyStopSeh(WorkerSlot& slot, Thread& thread, const RouteManifest& manife
     return ok;
 }
 
+// Read the transient stop frame while RunBoundWorker still holds the stack
+// lease. This is the only stack-memory access in the stop path; the result is
+// copied into host-owned evidence and is never re-read after finalisation.
+void CaptureStopStack(WorkerSlot& slot, Thread& thread) {
+    const RouteManifest& manifest = *slot.manifest;
+    StopStackEvidence evidence;
+    evidence.pc = slot.stop_pc;
+    evidence.requested_words = manifest.stop_stack_words;
+    evidence.memory_generation = mem::Generation();
+    auto finish = [&] {
+        evidence.memory_generation_after = mem::Generation();
+        evidence.generation_stable = evidence.memory_generation == evidence.memory_generation_after;
+        slot.stop_stack = evidence;
+    };
+    if (!t_context) {
+        evidence.status = StopStackStatus::kUnavailable;
+        finish();
+        return;
+    }
+    evidence.esp = t_context->esp;
+    evidence.ebp = t_context->ebp;
+    evidence.eax = t_context->eax;
+    const uint32_t requested = manifest.stop_stack_words;
+    const uint32_t bytes = requested <= 5 ? requested * 4u : 0u;
+    const bool stack_valid = thread.stack_size && thread.stack_top >= thread.stack_size;
+    const uint32_t stack_bottom = stack_valid ? thread.stack_top - thread.stack_size : 0;
+    evidence.aligned = (evidence.esp & 3u) == 0;
+    evidence.in_stack_bounds =
+        stack_valid && requested <= 5 && evidence.esp >= stack_bottom && evidence.esp <= thread.stack_top &&
+        bytes <= thread.stack_top - evidence.esp;
+    evidence.registers_valid =
+        stack_valid && evidence.ebp >= stack_bottom && evidence.ebp <= thread.stack_top &&
+        evidence.eax == evidence.ebp - 0x0C;
+    evidence.layout_valid =
+        evidence.aligned && evidence.in_stack_bounds && evidence.esp == evidence.ebp - 0x20;
+    StopStackCaptureFaultForTest fault = StopStackCaptureFaultForTest::kNone;
+#ifdef MOSTWANTED_AUTHENTIC_RUN_TESTS
+    fault = StopStackCaptureFaultForTest(g_stop_stack_fault[slot.role == Role::kParent ? 0 : 1].load());
+#endif
+    if (fault == StopStackCaptureFaultForTest::kUnavailable) {
+        evidence.status = StopStackStatus::kUnavailable;
+        finish();
+        return;
+    }
+    if (!evidence.in_stack_bounds) {
+        evidence.status = StopStackStatus::kUnavailable;
+        finish();
+        return;
+    }
+    bool read_ok = false;
+    if (fault == StopStackCaptureFaultForTest::kReadFailed) {
+        uint32_t sink[5] = {};
+        mem::Read(0, sink, sizeof(sink));
+    } else if (fault == StopStackCaptureFaultForTest::kPartial) {
+        constexpr uint32_t kPartialBytes = 12;
+        read_ok = mem::Read(evidence.esp, evidence.words, kPartialBytes) == mem::AccessStatus::kOk;
+        evidence.bytes_read = read_ok ? kPartialBytes : 0;
+    } else if (requested == 5) {
+        read_ok = mem::Read(evidence.esp, evidence.words, bytes) == mem::AccessStatus::kOk;
+        if (read_ok) {
+            evidence.bytes_read = bytes;
+            evidence.complete_read = true;
+            uint32_t hash = 0x811C9DC5u;
+            const uint8_t* bytes_view = reinterpret_cast<const uint8_t*>(evidence.words);
+            for (uint32_t i = 0; i < bytes; ++i) {
+                hash ^= bytes_view[i];
+                hash *= 0x01000193u;
+            }
+            evidence.content_hash = hash;
+            evidence.hash_recorded = true;
+            const bool continuation = manifest.stop_stack_frame == StopStackFrame::kContinuationDeviceQuery;
+            evidence.values_valid =
+                continuation && evidence.words[0] == 0x00000011u &&
+                evidence.words[1] == evidence.ebp - 0x0C && evidence.words[2] == evidence.ebp - 4 &&
+                evidence.words[3] == 0x00000004u && evidence.words[4] == evidence.ebp - 8;
+        }
+    }
+    evidence.memory_generation_after = mem::Generation();
+    evidence.generation_stable = evidence.memory_generation == evidence.memory_generation_after;
+    if (!evidence.complete_read) {
+        evidence.values_valid = false;
+        evidence.status = StopStackStatus::kReadFailed;
+        finish();
+        return;
+    }
+    if (manifest.stop_stack_frame != StopStackFrame::kContinuationDeviceQuery || requested != 5 ||
+        !evidence.registers_valid || !evidence.layout_valid || !evidence.values_valid ||
+        !evidence.generation_stable) {
+        evidence.status = StopStackStatus::kMismatch;
+        finish();
+        return;
+    }
+    evidence.status = StopStackStatus::kValid;
+    finish();
+}
+
 void VerifyStopState(WorkerSlot& slot) {
     const RouteManifest& manifest = *slot.manifest;
     Thread* thread = Current();
@@ -489,6 +589,7 @@ void VerifyStopState(WorkerSlot& slot) {
         slot.status = Status::kInternalError;
         return;
     }
+    if (manifest.stop_stack_frame != StopStackFrame::kNone) CaptureStopStack(slot, *thread);
     if (manifest.seh_call) {
         uint32_t registration = 0;
         slot.seh_verified = VerifyStopSeh(slot, *thread, manifest, registration);
@@ -712,6 +813,17 @@ const char* TlsEvidenceStatusName(TlsEvidenceStatus status) {
     return "unknown";
 }
 
+const char* StopStackStatusName(StopStackStatus status) {
+    switch (status) {
+        case StopStackStatus::kNotEvaluated: return "not-evaluated";
+        case StopStackStatus::kValid: return "valid";
+        case StopStackStatus::kUnavailable: return "unavailable";
+        case StopStackStatus::kReadFailed: return "read-failed";
+        case StopStackStatus::kMismatch: return "mismatch";
+    }
+    return "unknown";
+}
+
 const char* StatusName(Status status) {
     switch (status) {
         case Status::kReady: return "ready";
@@ -793,6 +905,8 @@ const RouteManifest& AuthenticChildManifest() {
         route::kCriticalSectionObject,
         route::kChildStartRoutine,
         route::kChildRequiredTransfers,
+        StopStackFrame::kContinuationDeviceQuery,
+        5,
     };
     return manifest;
 }
@@ -1328,6 +1442,8 @@ bool EvidenceForRole(Role role, RunEvidence* evidence) {
     evidence->tls = slot.tls;
     evidence->tls_pointer = slot.tls_evidence.self_pointer;
     evidence->tls_evidence = slot.tls_evidence;
+    evidence->stop_stack = slot.stop_stack;
+    evidence->stop_stack_verified = slot.stop_stack.status == StopStackStatus::kValid;
     evidence->seh_verified = slot.seh_verified;
     evidence->tls_verified = slot.tls_verified;
     evidence->at_stop = slot.at_stop;
@@ -1594,6 +1710,10 @@ Status StartParentWorkerForTest(const ParentStartRequest& request, RunAuthorizat
 }
 
 void SetRunCancelForTest(Role role) { Slot(role).cancelled = true; }
+
+void SetStopStackCaptureFaultForTest(Role role, StopStackCaptureFaultForTest fault) {
+    g_stop_stack_fault[role == Role::kParent ? 0 : 1].store(uint8_t(fault));
+}
 
 void SetInjectionHookForTest(Role role, uint32_t at_pc, InjectionHook hook) {
     std::lock_guard lock(g_injection_lock);

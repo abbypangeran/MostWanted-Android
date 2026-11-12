@@ -1,7 +1,7 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-28B",
-  "milestone": "SIXTH_RUN_PREPARATION_224",
+  "phase": "2D-28D",
+  "milestone": "STOP_EVIDENCE_REMEDIATION",
   "result": "PASS",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
@@ -220,7 +220,7 @@
     "ios/recompiler-fixtures/CMakeLists.txt"
   ],
   "validation": {
-    "authentic_run_tests": "160 PASS / 0 FAIL, Debug and Release",
+    "authentic_run_tests": "180 PASS / 0 FAIL, Debug and Release",
     "checked_recompiler_fixtures": "812 PASS / 0 FAIL, Debug and Release",
     "safe_ctests": "5/5, Debug and Release (-E execution_probe)",
     "authentic_run_preflight": "PASS, 242/242",
@@ -230,7 +230,9 @@
     "mostwanted_memory_tests": "454 PASS / 0 FAIL, Debug and Release",
     "android_arm64_syntax": "PASS (authentic_run.cpp, kernel_objects.cpp)",
     "authentic_image_executed": false,
-    "historical_evidence_modified": false
+    "historical_evidence_modified": false,
+    "stop_evidence_lifecycle": "PASS, synthetic 224 route and negative capture tests",
+    "experimental_driver": "compiled off/on; prepare-only admission PASS; no authentic execution"
   },
   "gates": {
     "gate_a_preparation": {
@@ -380,7 +382,7 @@
   "authorises_authentic_execution": false,
   "r1_16": "ON_HOLD",
   "customer_release": "NOT_READY",
-  "baseline_head": "912baa2aac4f9128353d8b17c6ef6c5090f28e16",
+  "baseline_head": "d6b8abce6ec8e5cb2c79afabb76806a9a750f23a",
   "fourth_run": {
     "result": "EARLY_STOP",
     "authentic_run": true,
@@ -772,12 +774,11 @@
     "parent_manifest": "85527B8FA581229F",
     "child_manifest": "3440CAC0FC3A57FB",
     "requirements": [
-      "prepared sixth driver/admission available locally for the reviewed identities",
-      "one separate explicit authorisation",
+      "separate explicit authorisation for any later authentic run",
+      "use the stop-time stack snapshot contract; never re-read released worker memory",
       "stop before 002B5E5F; do not enter the device query or timer DPC",
       "no authentic callback authorisation",
-      "fresh preflight, prepare-only admission and cleanup",
-      "preserve the historical fifth-run FAIL evidence"
+      "preserve FIFTH_AUTHENTIC_RUN=FAIL and SIXTH_AUTHENTIC_RUN=FAIL"
     ]
   },
   "phase_2d28b_sixth_run_preparation": {
@@ -861,5 +862,118 @@
       "gate_c_authentic_startup": "NO-GO"
     },
     "evidence": ".local/ios-port/phase2d28b-sixth-prep/"
+  },
+  "phase_2d28c_sixth_authentic_run": {
+    "result": "FAIL",
+    "authentic_run": true,
+    "executions": 1,
+    "retried": false,
+    "route_completion": "COMPLETE",
+    "driver_acceptance": "FAIL",
+    "parent": {
+      "instructions": 71,
+      "transfers": 73,
+      "stop": "0x002B3987"
+    },
+    "child": {
+      "instructions": 153,
+      "transfers": 156,
+      "stop": "0x002B5E5F"
+    },
+    "total": {
+      "instructions": 224,
+      "boundary_steps": 226
+    },
+    "kernels": {
+      "parent": [
+        255,
+        187
+      ],
+      "child": [
+        277,
+        294,
+        47,
+        107,
+        113
+      ],
+      "all_result_zero": true
+    },
+    "seh": "14 checks: 13 pass, 1 skipped, 0 fail/unknown",
+    "tls": {
+      "status": "valid",
+      "address": "0xD005FF6C",
+      "self_pointer": "0xD005FF70",
+      "hash": "0xFDEAE6ED"
+    },
+    "cleanup": {
+      "stop": 1,
+      "threads_empty": 1,
+      "workers": 0,
+      "claims": 0,
+      "virtual_before": 1280,
+      "virtual_after": 0,
+      "accounting": "1280 -> 0"
+    },
+    "failure": {
+      "phase": "post-finalisation evidence collection",
+      "stop_registers": {
+        "esp": "0xD005FE94",
+        "ebp": "0xD005FEB4",
+        "eax": "0xD005FEA8"
+      },
+      "observed_stack_args": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "expected_stack_args": [
+        "0x00000011",
+        "0xD005FEA8",
+        "0xD005FEB0",
+        "0x00000004",
+        "0xD005FEAC"
+      ],
+      "observed": false
+    },
+    "evidence": ".local/ios-port/phase2d28c-sixth-authentic-run/"
+  },
+  "phase_2d28d_stop_evidence": {
+    "result": "PASS",
+    "authentic_execution": false,
+    "root_cause": "worker stack lease ends at RunBoundWorker return; driver captured the continuation stack after worker finalisation and read a zero fallback",
+    "contract": {
+      "manifest_fields": [
+        "StopStackFrame",
+        "stop_stack_words"
+      ],
+      "identity_includes_capture_spec": false,
+      "statuses": [
+        "not-evaluated",
+        "valid",
+        "unavailable",
+        "read-failed",
+        "mismatch"
+      ],
+      "capture_site": "VerifyStopState, before worker finalisation, under the stack lease",
+      "guest_access": "checked mem::Read only; no guest writes; no retained pointers",
+      "host_owned": "RunEvidence.stop_stack",
+      "validation": [
+        "EAX=EBP-0x0C",
+        "ESP=EBP-0x20",
+        "alignment",
+        "stack bounds",
+        "exact five-word frame",
+        "generation stable",
+        "hash only after complete read"
+      ]
+    },
+    "tests": {
+      "authentic_run_tests": "180 PASS / 0 FAIL, Debug and Release",
+      "new_checks": 20
+    },
+    "driver": "compiled off/on; prepare-only admission PASS; no authentic execution",
+    "evidence": ".local/ios-port/phase2d28d-stop-evidence/"
   }
 }

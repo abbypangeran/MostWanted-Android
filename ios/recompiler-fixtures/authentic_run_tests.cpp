@@ -131,6 +131,8 @@ run::RouteManifest FullChildManifest() {
     manifest.tls_block_size = full::kTlsBlockSize;
     manifest.critical_section_object = full::kCriticalSectionObject;
     manifest.start_routine = full::kChildStartRoutine;
+    manifest.stop_stack_frame = run::StopStackFrame::kContinuationDeviceQuery;
+    manifest.stop_stack_words = 5;
     manifest.identity = run::ManifestIdentity(manifest);
     return manifest;
 }
@@ -576,6 +578,17 @@ bool AcceptFullRoute(const Fixture& fixture, const FullRun& run, const run::Rout
         return fail("TLS evidence");
     if (run.parent.tls_evidence.status != run::TlsEvidenceStatus::kNotEvaluated)
         return fail("parent TLS evidence");
+    const run::StopStackEvidence& stack = run.child.stop_stack;
+    if (!run.child.stop_stack_verified || stack.status != run::StopStackStatus::kValid ||
+        !stack.complete_read || stack.bytes_read != 20 || stack.pc != child.stop ||
+        !stack.generation_stable || !stack.registers_valid || !stack.layout_valid || !stack.values_valid ||
+        !stack.hash_recorded || stack.content_hash == 0 || stack.eax != stack.ebp - 0x0C ||
+        stack.esp != stack.ebp - 0x20 || stack.words[0] != 0x00000011u ||
+        stack.words[1] != stack.ebp - 0x0C || stack.words[2] != stack.ebp - 4 ||
+        stack.words[3] != 0x00000004u || stack.words[4] != stack.ebp - 8)
+        return fail("continuation stack evidence");
+    if (run.parent.stop_stack.status != run::StopStackStatus::kNotEvaluated)
+        return fail("parent stop-stack evidence");
     if (!kernel::Threads().empty() || run::LiveAuthorizationCount() != 0)
         return fail("worker cleanup");
     if (TraceHasInstructionAt(run.parent, run::Role::kParent, parent.stop) ||
@@ -689,6 +702,13 @@ void CaptureContinuationState(X86Context& ctx) {
 
 // Test-only negative injections. They mutate the thread's TLS address or the
 // TLS self-pointer immediately before the stop verification.
+void CorruptContinuationArgument(X86Context& ctx) {
+    const uint32_t value = 0xDEADBEEFu;
+    mem::Write(ctx.esp + 0x0C, &value, sizeof(value));
+}
+void CorruptStopEax(X86Context& ctx) { ctx.eax = 0; }
+void CorruptStopEbp(X86Context& ctx) { ctx.ebp += 4; }
+
 void CorruptTlsAddress(X86Context&) {
     if (kernel::Thread* thread = kernel::Current()) thread->tls = 0x00080000;
 }
@@ -1053,6 +1073,14 @@ int main() {
               "the TLS snapshot matches the independent pre-stop reference");
         Check(run.parent.tls_evidence.status == run::TlsEvidenceStatus::kNotEvaluated,
               "a route without TLS leaves the snapshot not evaluated");
+        const run::StopStackEvidence& stack = run.child.stop_stack;
+        Check(run.child.stop_stack_verified && stack.status == run::StopStackStatus::kValid &&
+                  stack.complete_read && stack.bytes_read == 20 && stack.pc == full::kChildStop &&
+                  stack.memory_generation != 0 && stack.generation_stable && stack.registers_valid && stack.layout_valid &&
+                  stack.values_valid && stack.hash_recorded && stack.content_hash != 0 &&
+                  stack.eax == stack.ebp - 0x0C && stack.esp == stack.ebp - 0x20 &&
+                  stack.words[0] == 0x11u && stack.words[3] == 4u,
+              "the stop-time continuation stack snapshot is complete and valid");
         Check(g_cont_read_ok.load() && g_cont_flags_ok.load() && g_cont_ebp.load() != 0 &&
                   g_cont_eax.load() == g_cont_ebp.load() - 0x0C &&
                   g_cont_arg0.load() == 0x11u &&
@@ -1060,6 +1088,12 @@ int main() {
                   g_cont_arg2.load() == g_cont_ebp.load() - 4 &&
                   g_cont_arg3.load() == 4u && g_cont_arg4.load() == g_cont_ebp.load() - 8,
               "the continuation prepares the exact five-argument stack and register state");
+        Check(stack.esp == g_cont_esp.load() - 4 && stack.ebp == g_cont_ebp.load() &&
+                  stack.eax == g_cont_eax.load() && stack.words[0] == 0x11u &&
+                  stack.words[1] == g_cont_arg1.load() && stack.words[2] == g_cont_arg2.load() &&
+                  stack.words[3] == g_cont_arg3.load() && stack.words[4] == g_cont_arg4.load() &&
+                  stack.content_hash == TlsHash(reinterpret_cast<const uint8_t*>(stack.words), 20),
+              "the stop-time stack snapshot matches the independent pre-stop reference and hash");
         const run::TraceRecord* child_stop = FindTrace(run.child, run::Role::kChild, run::EventKind::kStop);
         Check(child_stop && child_stop->esp == g_cont_esp.load() - 4 &&
                   child_stop->ebp == g_cont_ebp.load() && child_stop->eax == g_cont_eax.load(),
@@ -1112,6 +1146,12 @@ int main() {
                   after_finalize.tls_evidence.self_pointer == g_tls_reference_self.load() &&
                   after_finalize.tls_evidence.address == g_tls_reference_address.load(),
               "the host-owned TLS snapshot survives child-worker finalisation");
+        Check(after_finalize.stop_stack.status == run::StopStackStatus::kValid &&
+                  after_finalize.stop_stack.content_hash == stack.content_hash &&
+                  after_finalize.stop_stack.bytes_read == 20 &&
+                  after_finalize.stop_stack.words[0] == stack.words[0] &&
+                  after_finalize.stop_stack.words[4] == stack.words[4],
+              "the host-owned continuation stack snapshot survives child-worker finalisation");
         std::printf("FULL_ROUTE parent_instructions=%u parent_transfers=%u child_instructions=%u "
                     "child_transfers=%u total_instructions=%u boundary_steps=%u\n",
                     run.parent.instructions, run.parent.transfers, run.child.instructions, run.child.transfers,
@@ -1161,6 +1201,135 @@ int main() {
                   run.child.tls_evidence.status == run::TlsEvidenceStatus::kUnavailable &&
                   !run.child.tls_evidence.hash_recorded && run.child.tls_evidence.content_hash == 0,
               "an unavailable TLS pointer is reported without evidence");
+    }
+
+    {
+        run::SetInjectionHookForTest(run::Role::kChild,
+                                     full::kChildRoute[full::kChildRouteCount - 1].pc,
+                                     CorruptContinuationArgument);
+        const FullRun run = RunFullRoute(fixture);
+        run::ClearInjectionHooksForTest();
+        Check(run.have_child && run.child.status == run::Status::kStopped &&
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers,
+              "a wrong continuation argument does not change the reviewed route");
+        Check(run.child.stop_stack.status == run::StopStackStatus::kMismatch &&
+                  run.child.stop_stack.complete_read && run.child.stop_stack.bytes_read == 20 &&
+                  !run.child.stop_stack.values_valid && !run.child.stop_stack_verified,
+              "a wrong continuation argument is captured and rejected");
+        std::string error;
+        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child, error) &&
+                  error == "continuation stack evidence",
+              "the acceptance contract rejects wrong continuation arguments");
+    }
+
+    {
+        run::SetInjectionHookForTest(run::Role::kChild,
+                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CorruptStopEax);
+        const FullRun run = RunFullRoute(fixture);
+        run::ClearInjectionHooksForTest();
+        Check(run.have_child && run.child.status == run::Status::kStopped &&
+                  run.child.stop_stack.status == run::StopStackStatus::kMismatch &&
+                  run.child.stop_stack.complete_read && !run.child.stop_stack.registers_valid &&
+                  !run.child.stop_stack_verified,
+              "a wrong stop EAX is captured and rejected");
+        std::string error;
+        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child, error) &&
+                  error == "continuation stack evidence",
+              "the acceptance contract rejects a wrong stop EAX");
+    }
+
+    {
+        run::SetInjectionHookForTest(run::Role::kChild,
+                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CorruptStopEbp);
+        const FullRun run = RunFullRoute(fixture);
+        run::ClearInjectionHooksForTest();
+        Check(run.have_child && run.child.status == run::Status::kStopped &&
+                  run.child.stop_stack.status == run::StopStackStatus::kMismatch &&
+                  run.child.stop_stack.complete_read && !run.child.stop_stack.registers_valid &&
+                  !run.child.stop_stack.layout_valid && !run.child.stop_stack.values_valid &&
+                  !run.child.stop_stack_verified,
+              "a wrong stop EBP/ESP relationship is captured and rejected");
+        std::string error;
+        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child, error) &&
+                  error == "continuation stack evidence",
+              "the acceptance contract rejects a wrong stop EBP");
+    }
+
+    {
+        run::SetStopStackCaptureFaultForTest(run::Role::kChild,
+                                             run::StopStackCaptureFaultForTest::kReadFailed);
+        const FullRun run = RunFullRoute(fixture);
+        run::SetStopStackCaptureFaultForTest(run::Role::kChild, run::StopStackCaptureFaultForTest::kNone);
+        Check(run.have_child && run.child.status == run::Status::kStopped &&
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers,
+              "a failed stop-stack read does not change the reviewed route");
+        Check(run.child.stop_stack.status == run::StopStackStatus::kReadFailed &&
+                  !run.child.stop_stack.complete_read && run.child.stop_stack.bytes_read == 0 &&
+                  !run.child.stop_stack.hash_recorded && run.child.stop_stack.content_hash == 0 &&
+                  run.child.stop_stack.generation_stable && !run.child.stop_stack_verified,
+              "a failed stop-stack read cannot produce valid evidence or a fallback hash");
+        std::string error;
+        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child, error) &&
+                  error == "continuation stack evidence",
+              "the acceptance contract rejects a failed stop-stack read");
+    }
+
+    {
+        run::SetStopStackCaptureFaultForTest(run::Role::kChild,
+                                             run::StopStackCaptureFaultForTest::kPartial);
+        const FullRun run = RunFullRoute(fixture);
+        run::SetStopStackCaptureFaultForTest(run::Role::kChild, run::StopStackCaptureFaultForTest::kNone);
+        Check(run.have_child && run.child.status == run::Status::kStopped &&
+                  run.child.stop_stack.status == run::StopStackStatus::kReadFailed &&
+                  !run.child.stop_stack.complete_read && run.child.stop_stack.bytes_read == 12 &&
+                  !run.child.stop_stack.hash_recorded && run.child.stop_stack.content_hash == 0 &&
+                  run.child.stop_stack.generation_stable && !run.child.stop_stack_verified,
+              "a partial stop-stack read is rejected without a fallback hash");
+        std::string error;
+        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child, error) &&
+                  error == "continuation stack evidence",
+              "the acceptance contract rejects a partial stop-stack read");
+    }
+
+    {
+        run::SetStopStackCaptureFaultForTest(run::Role::kChild,
+                                             run::StopStackCaptureFaultForTest::kUnavailable);
+        const FullRun run = RunFullRoute(fixture);
+        run::SetStopStackCaptureFaultForTest(run::Role::kChild, run::StopStackCaptureFaultForTest::kNone);
+        Check(run.have_child && run.child.status == run::Status::kStopped &&
+                  run.child.stop_stack.status == run::StopStackStatus::kUnavailable &&
+                  !run.child.stop_stack.complete_read && !run.child.stop_stack.hash_recorded &&
+                  run.child.stop_stack.content_hash == 0 && run.child.stop_stack.generation_stable &&
+                  !run.child.stop_stack_verified,
+              "an unavailable stop-stack capture is rejected without fabricating data");
+        std::string error;
+        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child, error) &&
+                  error == "continuation stack evidence",
+              "the acceptance contract rejects an unavailable stop-stack capture");
+    }
+
+    {
+        run::RouteManifest no_stack = fixture.full_child;
+        no_stack.stop_stack_frame = run::StopStackFrame::kNone;
+        no_stack.stop_stack_words = 0;
+        no_stack.identity = run::ManifestIdentity(no_stack);
+        const FullRun run = RunFullRoute(fixture, full::kParentRequiredTransfers,
+                                         full::kChildRequiredTransfers, full::kParentExecutedInstructions,
+                                         full::kChildExecutedInstructions, &no_stack, nullptr);
+        Check(run.have_child && run.child.status == run::Status::kStopped &&
+                  run.child.instructions == full::kChildExecutedInstructions &&
+                  run.child.transfers == full::kChildRequiredTransfers,
+              "a route without a stack specification still completes its boundary");
+        Check(run.child.stop_stack.status == run::StopStackStatus::kNotEvaluated &&
+                  !run.child.stop_stack.complete_read && run.child.stop_stack.bytes_read == 0 &&
+                  run.child.stop_stack.words[0] == 0 && !run.child.stop_stack_verified,
+              "a missing stack snapshot is not fabricated");
+        std::string error;
+        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, no_stack, error) &&
+                  error == "continuation stack evidence",
+              "the acceptance contract fails a missing stack snapshot");
     }
 
     {

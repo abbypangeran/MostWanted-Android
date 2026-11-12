@@ -5034,3 +5034,104 @@ read-only evidence and cleanup checks. No authentic route completion is claimed 
 
 The historical fifth run remains FAIL. No sixth run is authorised or performed by this phase. R1.16
 remains ON_HOLD and `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-28C — sixth authentic run (historical result)
+
+`SIXTH_AUTHENTIC_RUN = FAIL`; `SIXTH_RUN_ROUTE_COMPLETION = COMPLETE`;
+`SIXTH_RUN_DRIVER_ACCEPTANCE = FAIL`. Exactly one execution was performed and no retry was made.
+
+The run retired the complete reviewed route: parent 71 instructions / 73 transfers before `002B3987`, child
+153 / 156 before `002B5E5F`, 224 / 226 total; all seven reviewed kernel calls returned 0; SEH (14 checks,
+13 pass and 1 skip) and the host-owned TLS snapshot (address `D005FF6C`, self-pointer `D005FF70`, hash
+`FDEAE6ED`) were valid; no ordinal 24/301/149 or callback was reached; cleanup was `stop=1`,
+`threads_empty=1`, `workers=0`, `claims=0`, `virtual=1280` with accounting `1280 -> 0`.
+
+The driver failed acceptance after finalisation: its continuation-stack read at `D005FE94` failed
+(`all five words 00000000`, `ok=0`, `read_only=0`), because the child worker had already released the
+stack. The verified stop registers were `ESP=D005FE94`, `EBP=D005FEB4`, `EAX=D005FEA8`
+(`EAX == EBP-0x0C`). The reviewed frame (`00000011, D005FEA8, D005FEB0, 00000004, D005FEAC`) was therefore
+not observed by the sixth run; those values are historical expectations, not observed evidence. The TLS
+snapshot was valid, so this was not a repeat of the fifth run's TLS defect. `FIFTH_AUTHENTIC_RUN = FAIL`
+remains preserved and the sixth run is not converted to PASS.
+
+Evidence: `.local/ios-port/phase2d28c-sixth-authentic-run/`.
+
+## Phase 2D-28D — stop-time evidence contract remediation
+
+**`PHASE_2D28D_STOP_EVIDENCE = PASS`** (offline remediation). No authentic instruction ran; no sixth-run
+retry or seventh run was started.
+
+### Proven root cause
+
+`RunBoundWorker` holds a read-write lease on the worker stack from the first reviewed instruction through
+the final `AuthenticRunStop`; `VerifyStopState` runs inside that lease, but the driver captured evidence
+only after the worker returned and the stack allocation had been released. The checked read of `ESP` then
+failed and the driver's zero-initialised fallback buffer was reported as the frame. The TLS evidence did
+not have this defect because Phase 2D-27C moved its capture into `VerifyStopState`; the continuation stack
+needed the same treatment.
+
+### Stop-time contract
+
+- `RouteManifest` now declares `StopStackFrame` (`kNone`, `kContinuationDeviceQuery`) and
+  `stop_stack_words`; the flag is not part of `ManifestIdentity`, so mapping/manifest identities are
+  unchanged.
+- `StopStackEvidence` is a host-owned snapshot with `pc`, `ESP`/`EBP`/`EAX`, five words, requested and
+  read byte counts, optional FNV-1a hash, memory generation before/after, and independent
+  `complete_read`, `registers_valid`, `layout_valid`, `values_valid`, `generation_stable` and
+  `hash_recorded` flags.
+- `StopStackStatus` distinguishes `not-evaluated`, `valid`, `unavailable`, `read-failed` and `mismatch`.
+  A failed or partial read never records a hash and never becomes valid; the zero fallback is never
+  validated.
+- `CaptureStopStack` runs in `VerifyStopState` before SEH/TLS verification, while the stack lease is live.
+  It performs only checked `mem::Read` calls, copies the values into `RunEvidence.stop_stack`, and never
+  retains a guest pointer. `EvidenceForRole` copies the snapshot; reset/claim clears it.
+- The capture validates `EAX == EBP-0x0C`, `ESP == EBP-0x20`, alignment, stack bounds, exact five-word
+  order and values, and a stable memory generation. The TLS snapshot remains unchanged.
+- `RunEvidence` carries `stop_stack_verified`; the shared acceptance contract requires a valid TLS snapshot
+  and a valid continuation-stack snapshot. Route completion (stops/counts/kernels) is reported separately
+  from evidence validity and driver acceptance.
+- Test-only capture-fault injection (`unavailable`, `read-failed`, `partial`) is compiled only under
+  `MOSTWANTED_AUTHENTIC_RUN_TESTS`; it performs no guest writes and is not part of production builds.
+
+The experimental driver now consumes `RunEvidence.stop_stack` and never re-reads released stack memory.
+The other post-finalisation reads are persistent kernel objects/data (registration object, KDPC, KTIMER,
+timer flags); the TLS and stack are host-owned snapshots, and trace/SEH/authorisation records are host
+copies.
+
+### Regression coverage
+
+`authentic_run_tests` now has 180 checks. New coverage proves the exact stack contents at the stop, an
+independent pre-stop reference match and hash, survival after finalisation/stack release, detection of
+wrong arguments, wrong EAX and wrong EBP/ESP relationships, missing snapshots, unavailable/read-failed/
+partial captures, no fabricated hash or valid status, generation stability, TLS retention, and the full
+224-instruction route with route/evidence/acceptance separation. The forbidden branch, unreviewed kernel
+ordinals 24/301/149, callback and terminal-stop negatives remain.
+
+### Fresh validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` | 180 PASS / 0 FAIL | 180 PASS / 0 FAIL |
+| `checked_recompiler_tests` | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, 242/242 | PASS, 242/242 |
+| `authentic_run_accounting` | 1280 -> 0 | 1280 -> 0 |
+| `mostwanted_memory_tests` | 454 PASS / 0 FAIL | 454 PASS / 0 FAIL |
+| Android ARM64 syntax (`authentic_run.cpp`, `kernel_objects.cpp`) | PASS | — |
+
+The corrected driver compiled in authorisation-disabled and authorisation-enabled configurations, and its
+prepare-only admission passed with cleanup and accounting; no authentic execution was started. Mapping
+`94166820FBB48A28` (242), parent `85527B8FA581229F`, child `3440CAC0FC3A57FB`, stops and 224/226 counts
+are unchanged.
+
+### Historical classification and readiness
+
+`FIFTH_AUTHENTIC_RUN = FAIL` and `SIXTH_AUTHENTIC_RUN = FAIL` are preserved. The sixth run completed the
+route (`SIXTH_RUN_ROUTE_COMPLETION = COMPLETE`) but failed driver acceptance
+(`SIXTH_RUN_DRIVER_ACCEPTANCE = FAIL`); its continuation-stack contents were not captured before
+finalisation. No retroactive PASS is claimed.
+
+The offline stop-evidence contract is ready for subsequent offline startup development. A later authentic
+run would require a new, separate explicit authorisation; it is not authorised or started here. Gate A GO;
+Gate B remains preparation READY with execution NOT AUTHORISED; Gate C NO-GO. R1.16 remains ON_HOLD and
+`CUSTOMER_RELEASE = NOT_READY`.

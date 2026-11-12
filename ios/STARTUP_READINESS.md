@@ -300,3 +300,37 @@ ran, the fifth run was not retried, no sixth run was started, and the historical
 Fresh Debug/Release: authentic tests 160/0, checked fixtures 812/0, safe CTests 5/5, preflight PASS 242/242,
 accounting 1280 -> 0, memory tests 454/0, Android ARM64 syntax PASS. Gate A GO; Gate B is preparation
 READY with sixth execution NOT AUTHORISED; Gate C remains NO-GO.
+
+## Phase 2D-28C — sixth authentic run (historical FAIL)
+
+`SIXTH_AUTHENTIC_RUN = FAIL`; one execution, no retry. Route completion was `COMPLETE` (parent 71/73,
+child 153/156, stop `0x002B5E5F`, seven kernel calls, SEH/TLS and cleanup), but driver acceptance was
+`FAIL`: the post-finalisation continuation-stack read at `ESP=D005FE94` failed after the worker released
+the stack. The stop registers were `ESP=D005FE94`, `EBP=D005FEB4`, `EAX=D005FEA8`; the expected frame
+`00000011, D005FEA8, D005FEB0, 00000004, D005FEAC` was not observed. The TLS snapshot was valid. Evidence:
+`.local/ios-port/phase2d28c-sixth-authentic-run/`.
+
+## Phase 2D-28D — stop-time evidence contract remediation
+
+`PHASE_2D28D_STOP_EVIDENCE = PASS` (offline only; no authentic execution).
+
+Root cause: the worker stack lease ends when `RunBoundWorker` returns, after `VerifyStopState` but before
+the driver's evidence collection. The driver's checked stack read then failed and its zero fallback was
+reported. TLS was already safe because its snapshot is taken inside the stop verification.
+
+`RunEvidence` now carries a host-owned `StopStackEvidence` snapshot with explicit capture/validation
+status, five words, registers, byte count, optional hash, memory-generation stability and separate
+`complete_read`/`registers_valid`/`layout_valid`/`values_valid` flags. `CaptureStopStack` runs in
+`VerifyStopState` under the stack lease, uses checked reads only, validates `EAX=EBP-0x0C`,
+`ESP=EBP-0x20`, alignment, bounds and the exact frame, and never retains a guest pointer or hashes a
+fallback. `RouteManifest` declares the frame; the field is not part of the manifest identity. The shared
+`AcceptFullRoute` contract consumes both TLS and stack snapshots; route completion remains distinct from
+evidence validity and driver acceptance. The experimental driver consumes the host snapshot and no longer
+re-reads released worker memory.
+
+Fresh Debug/Release: authentic tests 180/0 (20 new stop-evidence checks), checked fixtures 812/0, safe
+CTests 5/5, preflight PASS 242/242, accounting 1280 -> 0, memory tests 454/0, Android ARM64 syntax PASS.
+The corrected driver compiled off/on and passed prepare-only admission with cleanup/accounting; no
+authentic execution was started. `FIFTH_AUTHENTIC_RUN = FAIL` and `SIXTH_AUTHENTIC_RUN = FAIL` remain
+preserved; the sixth run's route completed but its stack evidence was not captured. Gate A GO; Gate B is
+preparation READY with execution NOT AUTHORISED; Gate C remains NO-GO.
