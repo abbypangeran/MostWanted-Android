@@ -539,6 +539,10 @@ void x86_checked_register_jmp(X86Context& ctx, uint8_t* base, uint32_t target, u
 
 void x86_checked_indirect_jmp(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t pc) {
     const uint32_t target = x86_mem_read<uint32_t>(pc, operand_address);
+    if (target >= kKernelThunkBase && target < kKernelThunkBase + 400 * 4) {
+        x86_checked_kernel_tail(ctx, base, (target - kKernelThunkBase) / 4, operand_address, pc);
+        return;
+    }
     CheckedTailJump(ctx, base, target, pc, operand_address, false);
 }
 
@@ -558,6 +562,30 @@ void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
         frame->returned = true;
     }
     ctx.esp += 4 + pop_bytes;
+}
+
+void x86_checked_kernel_tail(X86Context& ctx, uint8_t* base, uint32_t ordinal, uint32_t slot_address,
+                             uint32_t pc) {
+    X86CheckedCallFrame* frame = ctx.checked_call;
+    const uint32_t return_address = kernel::R32(ctx.esp);
+    if (frame && (frame->returned || return_address != frame->return_address)) {
+        char reason[112];
+        std::snprintf(reason, sizeof(reason), "tail kernel return address: expected %08X, found %08X",
+                      frame->return_address, return_address);
+        x86_checked_trap(ctx, pc, reason);
+    }
+#if defined(MOSTWANTED_AUTHENTIC_RUN_HARNESS)
+    if (kernel::authentic::GateActive()) {
+        kernel::authentic::AdmitKernelTailCall(ctx, base, ordinal, slot_address, return_address, pc);
+    } else
+#endif
+    {
+        x86_kernel(ctx, base, ordinal);
+    }
+    if (frame) {
+        ctx.checked_call = frame->previous;
+        frame->returned = true;
+    }
 }
 
 void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r) {

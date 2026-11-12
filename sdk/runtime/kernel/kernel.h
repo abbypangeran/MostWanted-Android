@@ -55,6 +55,7 @@ enum : uint32_t {
     kFileIsADirectory = 0xC00000BA,
     kNotSupported = 0xC00000BB,
     kDeviceNotConnected = 0xC000009D,
+    kDeviceDataError = 0xC000009C,
     kCannotDelete = 0xC0000121,
 };
 
@@ -494,5 +495,12 @@ const char* OrdinalName(uint32_t ordinal);  // public name, "?" past the table
 // guest kernel variables updated by the host
 extern uint32_t g_tick_count_va;
 extern uint32_t g_launch_data_page_va;
+
+#ifdef MOSTWANTED_AUTHENTIC_RUN_TESTS
+// Deterministic non-volatile-setting controls for the synthetic device-query
+// rehearsal. They affect only the harness test/driver configuration.
+void SetNonVolatileMiscFlagsForTest(uint32_t value);
+void SetNonVolatileQueryFaultForTest(uint32_t status);
+#endif
 
 }  // namespace kernel

@@ -56,7 +56,6 @@ int main(int argc, char** argv) {
         switch (pc) {
             case route::kParentStop: return 1;
             case route::kChildStop: return 5;
-            case 0x002B5E7F: return 5;
             case 0x002B39B9: return 0x22;
             case 0x002B5DE5: return 0x1B;
             case 0x002B95AC: return 6;

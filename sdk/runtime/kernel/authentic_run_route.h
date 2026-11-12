@@ -260,13 +260,41 @@ inline constexpr Step kChildRoute[] = {
     {0x002B5E59u, 3, StepKind::kSequential, 0x002B5E5Cu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "lea eax, [ebp-0x0C]"},
     {0x002B5E5Cu, 1, StepKind::kSequential, 0x002B5E5Du, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push eax"},
     {0x002B5E5Du, 2, StepKind::kSequential, 0x002B5E5Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push 0x11"},
+    // XC_MISC device query, wrapper 0x002B39B9, its ExQueryNonVolatileSetting
+    // (24) thunk and the reviewed RtlNtStatusToDosError (301) conversion.
+    // The selected route is the success/fallthrough path at 0x002B5E66; the
+    // failure target 0x002B5E75 remains a reviewed alternative but is not an
+    // edge of this manifest, so it fails closed here.
+    {0x002B5E5Fu, 5, StepKind::kCall, 0x002B5E64u, 0x002B39B9u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "call 0x002B39B9"},
+    {0x002B39B9u, 1, StepKind::kSequential, 0x002B39BAu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push ebp"},
+    {0x002B39BAu, 2, StepKind::kSequential, 0x002B39BCu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "mov ebp, esp"},
+    {0x002B39BCu, 3, StepKind::kSequential, 0x002B39BFu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push [ebp+0x18]"},
+    {0x002B39BFu, 3, StepKind::kSequential, 0x002B39C2u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push [ebp+0x14]"},
+    {0x002B39C2u, 3, StepKind::kSequential, 0x002B39C5u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push [ebp+0x10]"},
+    {0x002B39C5u, 3, StepKind::kSequential, 0x002B39C8u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push [ebp+0x0C]"},
+    {0x002B39C8u, 3, StepKind::kSequential, 0x002B39CBu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push [ebp+0x08]"},
+    {0x002B39CBu, 5, StepKind::kCall, 0x002B39D0u, 0x002B95ACu, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "call 0x002B95AC"},
+    {0x002B95ACu, 6, StepKind::kKernelCall, 0x002B39D0u, 0x00000000u, 0x003C9D34u, 0x80000018u, 24, 5, false, Segment::kKernelInit, "jmp [0x003C9D34]"},
+    {0x002B39D0u, 1, StepKind::kSequential, 0x002B39D1u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "push eax"},
+    {0x002B39D1u, 6, StepKind::kKernelCall, 0x002B39D7u, 0x00000000u, 0x003C9DC0u, 0x8000012Du, 301, 1, false, Segment::kKernelInit, "call [0x003C9DC0]"},
+    {0x002B39D7u, 1, StepKind::kSequential, 0x002B39D8u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "pop ebp"},
+    {0x002B39D8u, 3, StepKind::kRet, 0x002B5E64u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "ret 0x14", 0x14},
+    {0x002B5E64u, 2, StepKind::kSequential, 0x002B5E66u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "test eax, eax"},
+    {0x002B5E66u, 2, StepKind::kConditional, 0x002B5E68u, 0x002B5E75u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "jnz 0x002B5E75"},
+    {0x002B5E68u, 3, StepKind::kSequential, 0x002B5E6Bu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "mov eax, [ebp-0x04]"},
+    {0x002B5E6Bu, 3, StepKind::kSequential, 0x002B5E6Eu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "and eax, 0x01"},
+    {0x002B5E6Eu, 5, StepKind::kSequential, 0x002B5E73u, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "mov [0x004EDBE8], eax"},
+    {0x002B5E73u, 2, StepKind::kSequential, 0x002B5E7Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0, 0, false, Segment::kKernelInit, "jmp 0x002B5E7F"},
 };
 inline constexpr size_t kChildRouteCount = sizeof(kChildRoute) / sizeof(kChildRoute[0]);
 
 inline constexpr uint32_t kParentEntry = 0x002B3916;
 inline constexpr uint32_t kParentStop = 0x002B3987;
 inline constexpr uint32_t kChildEntry = 0x002B5C0F;
-inline constexpr uint32_t kChildStop = 0x002B5E5F;
+inline constexpr uint32_t kChildStop = 0x002B5E7F;
+// The reviewed call boundary whose five-word query frame is captured while the
+// child stack is live, before the wrapper consumes it.
+inline constexpr uint32_t kChildDeviceQueryCall = 0x002B5E5F;
 inline constexpr uint32_t kChildStartRoutine = 0x002B38A2;
 inline constexpr uint32_t kChildStartContext = 0;
 inline constexpr uint32_t kChildSystemRoutine = 0x002B5C0F;
@@ -289,11 +317,11 @@ inline constexpr uint32_t kSehScopeFlag = 0x00000000;
 inline constexpr uint32_t kCriticalSectionObject = 0x0046C8B0;
 inline constexpr uint32_t kTlsBlockSize = 0x94;
 inline constexpr uint32_t kParentExecutedInstructions = 71;
-inline constexpr uint32_t kChildExecutedInstructions = 153;
-inline constexpr uint32_t kTotalExecutedInstructions = 224;
+inline constexpr uint32_t kChildExecutedInstructions = 173;
+inline constexpr uint32_t kTotalExecutedInstructions = 244;
 inline constexpr uint32_t kParentBoundarySteps = 72;
-inline constexpr uint32_t kChildBoundarySteps = 154;
-inline constexpr uint32_t kTotalBoundarySteps = 226;
+inline constexpr uint32_t kChildBoundarySteps = 174;
+inline constexpr uint32_t kTotalBoundarySteps = 246;
 
 // Every reviewed instruction after the first is entered through one transfer,
 // each RET is one additional transfer that does not enter an instruction, and
@@ -311,17 +339,15 @@ inline constexpr uint32_t ComputeRequiredTransfers(const Step* steps, size_t cou
 inline constexpr uint32_t kParentRequiredTransfers = ComputeRequiredTransfers(kParentRoute, kParentRouteCount);
 inline constexpr uint32_t kChildRequiredTransfers = ComputeRequiredTransfers(kChildRoute, kChildRouteCount);
 static_assert(kParentRequiredTransfers == 73, "the reviewed parent route needs 73 transfers");
-static_assert(kChildRequiredTransfers == 156, "the reviewed child route needs 156 transfers");
+static_assert(kChildRequiredTransfers == 177, "the reviewed child route needs 177 transfers");
 inline constexpr uint32_t kParentTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C};
-inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, 0x002B5E7F, 0x002B39B9, 0x002B5DE5,
-                                                0x002B95AC, kSehHandler, 0x002B5999, 0x002B59A1,
-                                                0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,
-                                                0x002B5880, 0x002B597C};
+inline constexpr uint32_t kChildTrapEntries[] = {kChildStop, 0x002B5DE5, kSehHandler, 0x002B5999,
+                                                0x002B59A1, 0x002B5923, 0x002B5918, 0x002B5908,
+                                                0x002B58F8, 0x002B5880, 0x002B597C};
 inline constexpr uint32_t kAllTrapEntries[] = {kParentStop, 0x002B5CEC, 0x002B3975, 0x002B276C,
-                                                kChildStop, 0x002B5E7F, 0x002B39B9, 0x002B5DE5,
-                                                0x002B95AC, kSehHandler, 0x002B5999, 0x002B59A1,
-                                                0x002B5923, 0x002B5918, 0x002B5908, 0x002B58F8,
-                                                0x002B5880, 0x002B597C};
+                                                kChildStop, 0x002B5DE5, kSehHandler, 0x002B5999,
+                                                0x002B59A1, 0x002B5923, 0x002B5918, 0x002B5908,
+                                                0x002B58F8, 0x002B5880, 0x002B597C};
 
 inline constexpr uint64_t ComputeManifestIdentity(const Step* steps, size_t count, uint32_t entry, uint32_t stop,
                                                  uint32_t seh_call = 0, uint32_t seh_entry = 0,

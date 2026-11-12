@@ -502,6 +502,7 @@ add_executable(authentic_run_tests
     ${XBE_SDK}/runtime/kernel/threads.cpp
     ${XBE_SDK}/runtime/kernel/kernel_data_init.cpp
     ${XBE_SDK}/runtime/kernel/crypto.cpp
+    ${XBE_SDK}/runtime/kernel/nv_settings.cpp
     ${XBE_SDK}/runtime/xbe/image_loader.cpp
     ${AUTHENTIC_RUN_FIXTURE_GENERATED_SOURCE}
     ${AUTHENTIC_RUN_FIXTURE_GENERATED_DIR}/x86_func_mapping.cpp

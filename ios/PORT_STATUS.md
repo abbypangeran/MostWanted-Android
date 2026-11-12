@@ -5135,3 +5135,117 @@ The offline stop-evidence contract is ready for subsequent offline startup devel
 run would require a new, separate explicit authorisation; it is not authorised or started here. Gate A GO;
 Gate B remains preparation READY with execution NOT AUTHORISED; Gate C NO-GO. R1.16 remains ON_HOLD and
 `CUSTOMER_RELEASE = NOT_READY`.
+
+## Phase 2D-29 — non-volatile device query and startup continuation
+
+**`PHASE_2D29_DEVICE_QUERY = PASS`** (offline only). No authentic XBE instruction ran; no seventh run
+was started.
+
+### Device query contract
+
+The authentic caller at `002B5E5F` calls the reviewed wrapper `002B39B9`, which forwards five stack
+arguments to the `002B95AC` thunk:
+
+| PC | Bytes | Instruction | Meaning |
+|---|---|---|---|
+| `002B5E5F` | 5 | `call 0x002B39B9` | wrapper call |
+| `002B39BC..C8` | 3 each | `push [ebp+18/14/10/0C/08]` | reverse-order five-argument copy |
+| `002B39CB` | 5 | `call 0x002B95AC` | query thunk call |
+| `002B95AC` | 6 | `jmp [003C9D34]` | `ExQueryNonVolatileSetting` (24), encoding `80000018` |
+| `002B39D0` | 1 | `push eax` | NTSTATUS |
+| `002B39D1` | 6 | `call [003C9DC0]` | `RtlNtStatusToDosError` (301), encoding `8000012D` |
+| `002B39D7/D8` | 1/3 | `pop ebp; ret 0x14` | wrapper return and five-argument cleanup |
+
+The setting is **XC_MISC (0x0011)**, a `REG_DWORD` of four bytes. The caller writes the type output to
+`[ebp-0x0C]`, the value to `[ebp-0x04]`, the requested length `4`, and the result length to
+`[ebp-0x08]`. The runtime's defined EEPROM user default is `MiscFlags = 0` (automatic power-down
+disabled; bit 0 is `XC_MISC_FLAG_AUTOPOWERDOWN`); both 0 and 1 success values are tested. The title
+masks bit 0 into `[004EDBE8]`. A query error takes the reviewed failure branch at `002B5E75`, which sets
+`[004EDBEC] = 1`; both branches converge at the selected stop.
+
+`ExQueryNonVolatileSetting` is implemented in `sdk/runtime/kernel/nv_settings.cpp` with checked guest
+pointers and buffer lengths: `REG_DWORD`/4-byte type and result length, `STATUS_BUFFER_TOO_SMALL` without
+touching the value buffer, `STATUS_ACCESS_VIOLATION` for invalid pointers, and
+`STATUS_OBJECT_NAME_NOT_FOUND` for unsupported indexes. A complete read failure is represented by
+`STATUS_DEVICE_DATA_ERROR` (only injected in tests); it never becomes success.
+`RtlNtStatusToDosError` is the reviewed table from the Xbox kernel references, including
+`STATUS_DEVICE_DATA_ERROR -> ERROR_CRC (23)`, `STATUS_BUFFER_TOO_SMALL -> 122`,
+`STATUS_OBJECT_NAME_NOT_FOUND -> 2` and success `0`.
+
+### Selected continuation and branches
+
+The authentic manifest selects the grounded success/fallthrough path (`002B5E66` not taken) through
+`002B5E68`, `002B5E6B`, `002B5E6E`, `002B5E73`, and stops **before `002B5E7F`**. The failure branch is
+reviewed and independently exercised by a synthetic failure-route rehearsal; the authentic manifest
+does not admit that edge, so an unexpected query failure fails closed at the conditional instead of
+following an unselected path. Both paths were tested with the production checked query/status
+implementations.
+
+### Route accounting
+
+| Item | Before | After |
+|---|---:|---:|
+| Parent | 71 instructions / 73 transfers | 71 / 73 (unchanged) |
+| Child | 153 / 156 | **173 / 177** |
+| Total | 224 / 226 | **244 / 246** |
+| Child stop | `002B5E5F` | **`002B5E7F`** |
+| Child kernels | 5 | **7** (`277,294,47,107,113,24,301`) |
+| Parent kernels | 2 | 2 (`255,187`) |
+| Child manifest | `3440CAC0FC3A57FB` | **`4F974C3816F3D56A`** |
+| Parent manifest | `85527B8FA581229F` | unchanged |
+| Mapping | `94166820FBB48A28` (242) | **`8D0082429CE5EB01` (259)** |
+
+The new import slots were verified in the image: `003C9D34=80000018`, `003C9DC0=8000012D`,
+`003C9E20=80000095` (`KeSetTimer` 149) and `003C9E88=80000168` (`HalInitiateShutdown` 360).
+
+### Stop-time evidence
+
+The continuation-stack contract remains the Phase 2D-28D host-owned snapshot, captured at the reviewed
+query call boundary `002B5E5F` while the child stack is still leased, before the wrapper consumes the
+five-word frame. The terminal stop `002B5E7F` needs no new transient stack evidence; the query outputs
+are persistent flags. TLS remains independently snapshotted. The synthetic success and failure routes
+verify both snapshots after worker finalisation.
+
+### Offline kernel and route tests
+
+`authentic_run_tests` has 194 checks. They cover the full 244/246 success route, the reviewed failure
+route (170 instructions / 174 transfers), exact `XC_MISC` output/type/result length, success and failure
+branch stores, checked invalid pointers and short buffers, unsupported index, the test-only device-data
+failure and DOS conversion, full stack/TLS lifecycle, worker cleanup, and the forbidden branch to
+`002B5E7F`/timer ordinals. The timer helper is not entered.
+
+### Timer dependency assessment (not implemented)
+
+`002B5E7F` calls `002B5DE5`; that helper calls `KeSetTimer` (149, slot encoding `80000095`) with timer
+`004EDBC0`, DPC `004EDBA0` and the two-word due time pushed by `002B5DE5` (`FFFFFFCD` / `B5659000`).
+The DPC at `002B5E00` checks `004EDBE8`; if nonzero it calls `HalInitiateShutdown` (360, slot encoding
+`80000168`), otherwise it returns `ret 0x10`. Timer initialisation (113), scheduling (149), expiration,
+DPC dispatch and shutdown are distinct operations. None is executed or authorised in this phase. A
+future boundary could admit a checked `KeSetTimer` representation that records the due time and DPC
+without dispatching it, but the DPC/shutdown path remains prohibited; the currently selected stop is
+before the helper.
+
+### Fresh validation
+
+| Check | Debug | Release |
+|---|---:|---:|
+| `authentic_run_tests` | 194 PASS / 0 FAIL | 194 PASS / 0 FAIL |
+| `checked_recompiler_tests` | 812 PASS / 0 FAIL | 812 PASS / 0 FAIL |
+| Safe CTests (`-E execution_probe`) | 5/5 | 5/5 |
+| `authentic_run_preflight --generated` | PASS, 259/259 | PASS, 259/259 |
+| `authentic_run_accounting` | 1280 -> 0 | 1280 -> 0 |
+| `mostwanted_memory_tests` | 454 PASS / 0 FAIL | 454 PASS / 0 FAIL |
+| Android ARM64 syntax (`authentic_run.cpp`, `authentic_run_tests.cpp`, `nv_settings.cpp`, `kernel_objects.cpp`) | PASS | — |
+
+The corrected experimental driver compiled in off/on configurations; off build refused and on build
+prepare-only admission passed with `parent=1 child=1 ceilings=2/7 cleanup=1 accounting=1`. No
+`--execute` was invoked. Mapping `8D0082429CE5EB01` (259), parent `85527B8FA581229F`, child
+`4F974C3816F3D56A`, stops `002B3987`/`002B5E7F`, budgets 73/177 and kernels 2/7 are the reviewed
+continuation identities.
+
+### Gates and readiness
+
+Gate A GO; Gate B is static/synthetic READY with execution **NO-GO** pending a separate explicit
+authorisation; Gate C remains NO-GO. The timer/DPC/shutdown dependency remains a blocker for
+continuation past `002B5E7F`. `FIFTH_AUTHENTIC_RUN = FAIL` and `SIXTH_AUTHENTIC_RUN = FAIL` remain
+preserved. No authentic execution, seventh run or timer scheduling was performed.

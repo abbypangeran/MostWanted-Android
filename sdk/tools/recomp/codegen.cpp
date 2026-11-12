@@ -493,7 +493,12 @@ void CodeGen::EmitInsn(uint32_t va, const ZydisDecodedInstruction& in, const Zyd
                            uint32_t(ops[0].mem.disp.value) < an_.img.kernel_thunk + 0x400) {
                     uint32_t ord = 0;
                     an_.img.Read32(uint32_t(ops[0].mem.disp.value), ord);
-                    Line(Fmt("\tx86_kernel(ctx, base, %u); return;", ord & 0x7FFFFFFF));
+                    if (an_.cfg.checked_memory) {
+                        Line(Fmt("\tx86_checked_kernel_tail(ctx, base, %u, 0x%Xu, 0x%Xu); return;",
+                                 ord & 0x7FFFFFFF, uint32_t(ops[0].mem.disp.value), va));
+                    } else {
+                        Line(Fmt("\tx86_kernel(ctx, base, %u); return;", ord & 0x7FFFFFFF));
+                    }
                 } else if (an_.cfg.checked_memory) {
                     if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
                         Line(Fmt("\t{ uint32_t t = %s; X86_SAVE_FLAGS(); x86_checked_register_jmp(ctx, base, t, 0x%Xu); return; }",

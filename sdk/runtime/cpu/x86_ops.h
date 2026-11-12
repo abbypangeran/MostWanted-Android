@@ -73,6 +73,11 @@ void x86_checked_register_jmp(X86Context& ctx, uint8_t* base, uint32_t target, u
 void x86_checked_indirect_jmp(X86Context& ctx, uint8_t* base, uint32_t operand_address, uint32_t pc);
 void x86_checked_ret(X86Context& ctx, uint32_t pc, uint32_t pop_bytes);
 void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal);
+// checked entry for a guest `jmp [kernel slot]` import thunk: it consumes the
+// caller's return address as the kernel's stdcall return and preserves the
+// checked-call frame/route transition.
+void x86_checked_kernel_tail(X86Context& ctx, uint8_t* base, uint32_t ordinal, uint32_t slot_address,
+                             uint32_t pc);
 [[noreturn]] void x86_trap(X86Context& ctx, uint32_t va, const char* what);
 struct X86MemoryFault {
     uint32_t instruction, address;

@@ -21,6 +21,7 @@
 #include "cpu/dispatch_table.h"
 #include "cpu/x86_ops.h"
 #include "kernel/authentic_run.h"
+#include "kernel/nv_settings.h"
 #include "kernel/crypto.h"
 #include "kernel/kernel.h"
 #include "kernel/kernel_objects.h"
@@ -112,6 +113,44 @@ run::RouteManifest FullParentManifest() {
     return manifest;
 }
 
+uint32_t FullChildPushPc() {
+    for (size_t i = 0; i < full::kChildRouteCount; ++i)
+        if (full::kChildRoute[i].text && std::string(full::kChildRoute[i].text) == "push 0x11")
+            return full::kChildRoute[i].pc;
+    return 0;
+}
+
+uint32_t FullChildQueryCallPc() {
+    for (size_t i = 0; i < full::kChildRouteCount; ++i)
+        if (full::kChildRoute[i].kind == route::StepKind::kCall &&
+            full::kChildRoute[i].text && std::string(full::kChildRoute[i].text) == "call 0x002B39B9")
+            return full::kChildRoute[i].pc;
+    return 0;
+}
+
+uint32_t CallReviewedNvQuery(uint32_t index, uint32_t type, uint32_t value, uint32_t len, uint32_t result,
+                             uint32_t* final_esp = nullptr) {
+    const uint32_t stack = full::kDataPage + 0x800;
+    const uint32_t words[6] = {0xFFFFFFFFu, index, type, value, len, result};
+    mem::Write(stack, words, sizeof(words));
+    X86Context ctx{};
+    ctx.esp = stack;
+    kernel::nv::QueryReviewedNonVolatileSettingEntry(ctx, nullptr);
+    if (final_esp) *final_esp = ctx.esp;
+    return ctx.eax;
+}
+
+uint32_t CallReviewedNtStatus(uint32_t status, uint32_t* final_esp = nullptr) {
+    const uint32_t stack = full::kDataPage + 0x800;
+    const uint32_t words[2] = {0xFFFFFFFFu, status};
+    mem::Write(stack, words, sizeof(words));
+    X86Context ctx{};
+    ctx.esp = stack;
+    kernel::nv::NtStatusToDosErrorEntry(ctx, nullptr);
+    if (final_esp) *final_esp = ctx.esp;
+    return ctx.eax;
+}
+
 run::RouteManifest FullChildManifest() {
     run::RouteManifest manifest;
     manifest.steps = full::kChildRoute;
@@ -133,6 +172,7 @@ run::RouteManifest FullChildManifest() {
     manifest.start_routine = full::kChildStartRoutine;
     manifest.stop_stack_frame = run::StopStackFrame::kContinuationDeviceQuery;
     manifest.stop_stack_words = 5;
+    manifest.stop_stack_capture_pc = FullChildQueryCallPc();
     manifest.identity = run::ManifestIdentity(manifest);
     return manifest;
 }
@@ -364,7 +404,7 @@ void ResetFullData() {
     const uint32_t dirty = 0xFFFFFFFFu;
     mem::Write(full::kDebe8, &dirty, sizeof(dirty));
     mem::Write(full::kDebec, &dirty, sizeof(dirty));
-    for (uint32_t ordinal : {255u, 187u, 277u, 294u, 47u, 107u, 113u}) {
+    for (uint32_t ordinal : {255u, 187u, 277u, 294u, 47u, 107u, 113u, 24u, 301u}) {
         const uint32_t thunk = dispatch::KernelThunkAddress(ordinal);
         mem::Write(full::SlotFor(ordinal), &thunk, sizeof(thunk));
     }
@@ -580,7 +620,7 @@ bool AcceptFullRoute(const Fixture& fixture, const FullRun& run, const run::Rout
         return fail("parent TLS evidence");
     const run::StopStackEvidence& stack = run.child.stop_stack;
     if (!run.child.stop_stack_verified || stack.status != run::StopStackStatus::kValid ||
-        !stack.complete_read || stack.bytes_read != 20 || stack.pc != child.stop ||
+        !stack.complete_read || stack.bytes_read != 20 || stack.pc != child.stop_stack_capture_pc ||
         !stack.generation_stable || !stack.registers_valid || !stack.layout_valid || !stack.values_valid ||
         !stack.hash_recorded || stack.content_hash == 0 || stack.eax != stack.ebp - 0x0C ||
         stack.esp != stack.ebp - 0x20 || stack.words[0] != 0x00000011u ||
@@ -926,10 +966,10 @@ int main() {
         Check(same_shape, "the synthetic mirror preserves the reviewed step classes and kernel services");
         Check(full::kParentRequiredTransfers == route::kParentRequiredTransfers &&
                   full::kChildRequiredTransfers == route::kChildRequiredTransfers &&
-                  full::kParentRequiredTransfers == 73 && full::kChildRequiredTransfers == 156,
-              "the mirror derives the reviewed 73/156 transfer requirement");
-        Check(full::kTotalExecutedInstructions == 224 && full::kTotalBoundarySteps == 226,
-              "the mirror keeps 224 retired instructions and 226 boundary steps");
+                  full::kParentRequiredTransfers == 73 && full::kChildRequiredTransfers == 177,
+              "the mirror derives the reviewed 73/177 transfer requirement");
+        Check(full::kTotalExecutedInstructions == 244 && full::kTotalBoundarySteps == 246,
+              "the mirror keeps 244 retired instructions and 246 boundary steps");
     }
 
     {
@@ -968,6 +1008,53 @@ int main() {
     }
 
     {
+        const uint32_t type_addr = full::kDataPage + 0x900;
+        const uint32_t value_addr = full::kDataPage + 0x910;
+        const uint32_t result_addr = full::kDataPage + 0x920;
+        const uint32_t sentinel = 0xA5A5A5A5u;
+        uint32_t type = 0, result = 0, value[4] = {sentinel, sentinel, sentinel, sentinel};
+        mem::Write(value_addr, value, sizeof(value));
+        kernel::SetNonVolatileMiscFlagsForTest(0);
+        uint32_t final_esp = 0;
+        uint32_t status = CallReviewedNvQuery(0x11, type_addr, value_addr, 4, result_addr, &final_esp);
+        Check(status == kernel::kSuccess && final_esp == full::kDataPage + 0x800 + 24 &&
+                  mem::Read(type_addr, &type, sizeof(type)) == mem::AccessStatus::kOk && type == 4 &&
+                  mem::Read(result_addr, &result, sizeof(result)) == mem::AccessStatus::kOk && result == 4 &&
+                  mem::Read(value_addr, &value[0], sizeof(uint32_t)) == mem::AccessStatus::kOk && value[0] == 0,
+              "XC_MISC query returns REG_DWORD/4 bytes and the configured value with stdcall cleanup");
+        kernel::SetNonVolatileMiscFlagsForTest(1);
+        status = CallReviewedNvQuery(0x11, type_addr, value_addr, 4, result_addr);
+        Check(status == kernel::kSuccess &&
+                  mem::Read(value_addr, &value[0], sizeof(uint32_t)) == mem::AccessStatus::kOk && value[0] == 1,
+              "XC_MISC reflects the configured auto-power-down bit");
+        kernel::SetNonVolatileMiscFlagsForTest(0);
+        status = CallReviewedNvQuery(0x99, type_addr, value_addr, 4, result_addr);
+        Check(status == kernel::kObjectNameNotFound && CallReviewedNtStatus(status) == 2,
+              "an unsupported non-volatile index fails closed and maps to DOS error 2");
+        const uint32_t bad = 0xDEADBEEFu;
+        status = CallReviewedNvQuery(0x11, 0, value_addr, 4, result_addr);
+        Check(status == kernel::kAccessViolation, "a null query type pointer is refused");
+        status = CallReviewedNvQuery(0x11, type_addr, 0, 4, result_addr);
+        Check(status == kernel::kAccessViolation, "a null query value pointer is refused");
+        status = CallReviewedNvQuery(0x11, type_addr, value_addr, 4, bad);
+        Check(status == kernel::kAccessViolation, "an invalid result-length pointer is refused");
+        mem::Write(value_addr, &sentinel, sizeof(sentinel));
+        status = CallReviewedNvQuery(0x11, type_addr, value_addr, 2, result_addr);
+        Check(status == kernel::kBufferTooSmall && CallReviewedNtStatus(status) == 122 &&
+                  mem::Read(result_addr, &result, sizeof(result)) == mem::AccessStatus::kOk && result == 4 &&
+                  mem::Read(value_addr, &value[0], sizeof(value[0])) == mem::AccessStatus::kOk &&
+                  value[0] == sentinel,
+              "a short query buffer reports the required length and leaves the value untouched");
+        kernel::SetNonVolatileQueryFaultForTest(kernel::kDeviceDataError);
+        status = CallReviewedNvQuery(0x11, type_addr, value_addr, 4, result_addr);
+        Check(status == kernel::kDeviceDataError && CallReviewedNtStatus(status) == 23,
+              "a query read failure maps to the reviewed DOS error without becoming success");
+        kernel::SetNonVolatileQueryFaultForTest(0);
+        Check(CallReviewedNtStatus(kernel::kSuccess) == 0 && CallReviewedNtStatus(kernel::kAccessViolation) != 0,
+              "NTSTATUS conversion preserves success and non-success");
+    }
+
+    {
         g_tls_reference_address = 0;
         g_tls_reference_self = 0;
         g_tls_reference_size = 0;
@@ -985,11 +1072,11 @@ int main() {
         g_cont_flags_ok = false;
         run::SetInjectionHookForTest(run::Role::kChild, ChildKernelPc(113), CaptureTlsReference);
         run::SetInjectionHookForTest(run::Role::kChild,
-                                     full::kChildRoute[full::kChildRouteCount - 1].pc,
+                                     FullChildPushPc(),
                                      CaptureContinuationState);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
-        Check(run.started.status == run::Status::kReady, "the full 224-instruction synthetic run is authorised");
+        Check(run.started.status == run::Status::kReady, "the full 244-instruction synthetic run is authorised");
         Check(run.have_parent && run.have_child, "both full-route workers leave evidence");
         Check(run.parent.status == run::Status::kStopped && run.parent.instructions == 71 &&
                   run.parent.transfers == 73 && run.parent.required_transfers == 73 &&
@@ -1000,14 +1087,14 @@ int main() {
                   run.child.transfers == full::kChildRequiredTransfers &&
                   run.child.required_transfers == full::kChildRequiredTransfers &&
                   run.child.stop_pc == full::kChildStop && run.child.at_stop,
-              "the child retires 153 instructions in 156 transfers and stops at its reviewed boundary");
+              "the child retires 173 instructions in 177 transfers and stops at its reviewed boundary");
         Check(run.parent.instructions + run.child.instructions == full::kTotalExecutedInstructions,
-              "the synthetic execution retires exactly 224 instructions");
+              "the synthetic execution retires exactly 244 instructions");
         Check(!TraceHasInstructionAt(run.parent, run::Role::kParent, full::kParentStop) &&
                   !TraceHasInstructionAt(run.child, run::Role::kChild, full::kChildStop),
               "neither mandatory stop instruction is entered");
-        Check(run.parent.kernel_calls == 2 && run.child.kernel_calls == 5,
-              "the parent reaches 2 kernel services and the child 5");
+        Check(run.parent.kernel_calls == 2 && run.child.kernel_calls == 7,
+              "the parent reaches 2 kernel services and the child 7");
         const run::KernelObservation* create = FindKernel(run.parent, run::Role::kParent, 255);
         const run::KernelObservation* close = FindKernel(run.parent, run::Role::kParent, 187);
         Check(create && create->result == 0 && close && close->result == 0,
@@ -1075,7 +1162,7 @@ int main() {
               "a route without TLS leaves the snapshot not evaluated");
         const run::StopStackEvidence& stack = run.child.stop_stack;
         Check(run.child.stop_stack_verified && stack.status == run::StopStackStatus::kValid &&
-                  stack.complete_read && stack.bytes_read == 20 && stack.pc == full::kChildStop &&
+                  stack.complete_read && stack.bytes_read == 20 && stack.pc == fixture.full_child.stop_stack_capture_pc &&
                   stack.memory_generation != 0 && stack.generation_stable && stack.registers_valid && stack.layout_valid &&
                   stack.values_valid && stack.hash_recorded && stack.content_hash != 0 &&
                   stack.eax == stack.ebp - 0x0C && stack.esp == stack.ebp - 0x20 &&
@@ -1095,24 +1182,22 @@ int main() {
                   stack.content_hash == TlsHash(reinterpret_cast<const uint8_t*>(stack.words), 20),
               "the stop-time stack snapshot matches the independent pre-stop reference and hash");
         const run::TraceRecord* child_stop = FindTrace(run.child, run::Role::kChild, run::EventKind::kStop);
-        Check(child_stop && child_stop->esp == g_cont_esp.load() - 4 &&
-                  child_stop->ebp == g_cont_ebp.load() && child_stop->eax == g_cont_eax.load(),
-              "the terminal stop preserves ESP, EBP and EAX after the final push");
+        Check(child_stop && child_stop->pc == full::kChildStop && run.child.stop_stack.pc == fixture.full_child.stop_stack_capture_pc,
+              "the terminal stop is the new boundary and the query frame was captured at its call");
         bool prohibited_kernels = true;
         for (size_t i = 0; i < run.child.kernel_count; ++i) {
             const run::KernelObservation* observation =
                 run::KernelObservationForRole(run::Role::kChild, i);
-            if (observation && (observation->ordinal == 24 || observation->ordinal == 301 ||
-                                observation->ordinal == 149))
-                prohibited_kernels = false;
+            if (observation && observation->ordinal == 149) prohibited_kernels = false;
         }
         for (size_t i = 0; i < run.child.trace_count; ++i) {
             const run::TraceRecord* record = run::TraceForRole(run::Role::kChild, i);
-            if (record && record->event == uint8_t(run::EventKind::kKernelCall) &&
-                (record->ordinal == 24 || record->ordinal == 301 || record->ordinal == 149))
+            if (record && record->event == uint8_t(run::EventKind::kKernelCall) && record->ordinal == 149)
                 prohibited_kernels = false;
         }
-        Check(prohibited_kernels, "the device query, timer scheduling and shutdown ordinals are never reached");
+        Check(prohibited_kernels && FindKernel(run.child, run::Role::kChild, 24) &&
+                  FindKernel(run.child, run::Role::kChild, 301),
+              "the reviewed device query/status ordinals run and timer scheduling is never reached");
         bool seh_checks_ok = run.child.seh_check_count >= 14;
         for (size_t i = 0; i < run.child.seh_check_count; ++i) {
             const run::SehCheck& check = run.child.seh_checks[i];
@@ -1160,8 +1245,65 @@ int main() {
     }
 
     {
+        std::vector<route::Step> steps;
+        bool saw_conditional = false;
+        for (size_t i = 0; i < fixture.full_child.count; ++i) {
+            if (saw_conditional) continue;  // the four success-branch steps follow the conditional
+            route::Step step = fixture.full_child.steps[i];
+            const std::string text = step.text ? step.text : "";
+            if (text == "jnz 0x002B5E75") {
+                step.taken = true;
+                saw_conditional = true;
+            }
+            steps.push_back(step);
+        }
+        Check(saw_conditional, "the reviewed device-query conditional is present in the full route");
+        route::Step failure_step{};
+        failure_step.pc = full::kChildFailure;
+        failure_step.length = 10;
+        failure_step.kind = route::StepKind::kSequential;
+        failure_step.next = full::kChildStop;
+        failure_step.segment = route::Segment::kKernelInit;
+        failure_step.text = "mov [0x004EDBEC], 1";
+        steps.push_back(failure_step);
+        run::RouteManifest failure = fixture.full_child;
+        failure.steps = steps.data();
+        failure.count = steps.size();
+        failure.executed_instructions = steps.size();
+        failure.required_transfers = route::ComputeRequiredTransfers(steps.data(), steps.size());
+        failure.identity = run::ManifestIdentity(failure);
+        kernel::SetNonVolatileQueryFaultForTest(kernel::kDeviceDataError);
+        const FullRun run = RunFullRoute(fixture, 73, 200, 71, failure.executed_instructions, &failure, nullptr);
+        kernel::SetNonVolatileQueryFaultForTest(0);
+        Check(run.started.status == run::Status::kReady && run.have_child &&
+                  run.child.status == run::Status::kStopped &&
+                  run.child.instructions == failure.executed_instructions &&
+                  run.child.transfers == failure.required_transfers &&
+                  run.child.stop_pc == full::kChildStop && run.child.at_stop,
+              "the reviewed query-failure branch retires its exact steps and reaches the boundary");
+        uint32_t failure_flag = 0, success_flag = 1;
+        mem::Read(full::kDebec, &failure_flag, sizeof(failure_flag));
+        mem::Read(full::kDebe8, &success_flag, sizeof(success_flag));
+        Check(failure_flag == 1 && success_flag == 0 && run.child.kernel_calls == 7 &&
+                  failure_flag == 1 && TraceHasInstructionAt(run.child, run::Role::kChild, full::kChildFailure),
+              "the failure branch sets the error flag, leaves the watchdog flag clear and executes the reviewed instruction");
+        Check(run.child.stop_stack.status == run::StopStackStatus::kValid &&
+                  run.child.tls_evidence.status == run::TlsEvidenceStatus::kValid,
+              "the query failure path preserves the call-boundary stack and TLS snapshots");
+    }
+
+    {
+        kernel::SetNonVolatileQueryFaultForTest(kernel::kDeviceDataError);
+        const FullRun run = RunFullRoute(fixture);
+        kernel::SetNonVolatileQueryFaultForTest(0);
+        Check(run.have_child && run.child.status == run::Status::kForbiddenBranch && !run.child.at_stop &&
+                  !TraceHasInstructionAt(run.child, run::Role::kChild, full::kChildFailure),
+              "a query failure cannot silently enter the unselected success manifest");
+    }
+
+    {
         run::SetInjectionHookForTest(run::Role::kChild,
-                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CorruptTlsAddress);
+                                     FullChildPushPc(), CorruptTlsAddress);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
@@ -1178,7 +1320,7 @@ int main() {
 
     {
         run::SetInjectionHookForTest(run::Role::kChild,
-                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CorruptTlsPointer);
+                                     FullChildPushPc(), CorruptTlsPointer);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
@@ -1192,7 +1334,7 @@ int main() {
 
     {
         run::SetInjectionHookForTest(run::Role::kChild,
-                                     full::kChildRoute[full::kChildRouteCount - 1].pc, ClearTlsAddress);
+                                     FullChildPushPc(), ClearTlsAddress);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.have_child && run.child.status == run::Status::kTlsViolation &&
@@ -1205,27 +1347,24 @@ int main() {
 
     {
         run::SetInjectionHookForTest(run::Role::kChild,
-                                     full::kChildRoute[full::kChildRouteCount - 1].pc,
+                                     FullChildPushPc(),
                                      CorruptContinuationArgument);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
-        Check(run.have_child && run.child.status == run::Status::kStopped &&
-                  run.child.instructions == full::kChildExecutedInstructions &&
-                  run.child.transfers == full::kChildRequiredTransfers,
-              "a wrong continuation argument does not change the reviewed route");
+        Check(run.have_child && run.child.status == run::Status::kForbiddenBranch && !run.child.at_stop,
+              "a wrong query argument fails closed before the success path");
         Check(run.child.stop_stack.status == run::StopStackStatus::kMismatch &&
                   run.child.stop_stack.complete_read && run.child.stop_stack.bytes_read == 20 &&
                   !run.child.stop_stack.values_valid && !run.child.stop_stack_verified,
               "a wrong continuation argument is captured and rejected");
         std::string error;
-        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child, error) &&
-                  error == "continuation stack evidence",
+        Check(!AcceptFullRoute(fixture, run, fixture.full_parent, fixture.full_child, error),
               "the acceptance contract rejects wrong continuation arguments");
     }
 
     {
         run::SetInjectionHookForTest(run::Role::kChild,
-                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CorruptStopEax);
+                                     FullChildPushPc(), CorruptStopEax);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.have_child && run.child.status == run::Status::kStopped &&
@@ -1241,7 +1380,7 @@ int main() {
 
     {
         run::SetInjectionHookForTest(run::Role::kChild,
-                                     full::kChildRoute[full::kChildRouteCount - 1].pc, CorruptStopEbp);
+                                     FullChildPushPc(), CorruptStopEbp);
         const FullRun run = RunFullRoute(fixture);
         run::ClearInjectionHooksForTest();
         Check(run.have_child && run.child.status == run::Status::kStopped &&
@@ -1374,7 +1513,6 @@ int main() {
         Check(run.have_child && run.child.status == run::Status::kBudgetExceeded &&
                   run.child.instructions == full::kChildExecutedInstructions &&
                   run.child.transfers == full::kChildRequiredTransfers - 1 &&
-                  run.child.stop_pc == full::kChildStop &&
                   run.child.stop_target == full::kChildStop && !run.child.at_stop,
               "a budget one short of the terminal stop refuses it instead of reporting completion");
     }

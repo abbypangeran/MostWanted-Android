@@ -97,6 +97,7 @@ struct RouteManifest {
     uint32_t required_transfers = 0;     // manifest-derived total including the terminal stop; 0 for test-only routes
     StopStackFrame stop_stack_frame = StopStackFrame::kNone;
     uint8_t stop_stack_words = 0;        // 0 disables; kContinuationDeviceQuery requires 5
+    uint32_t stop_stack_capture_pc = 0;  // reviewed call boundary; 0 captures at the terminal stop
 };
 
 const RouteManifest& AuthenticParentManifest();
@@ -433,6 +434,12 @@ void AdmitGuestReturn(X86Context& ctx, uint32_t pc, uint32_t pop_bytes);
 // memory, 0 for a register target.
 void AdmitKernelCall(X86Context& ctx, uint8_t* base, uint32_t target, uint32_t return_address, uint32_t transfer_pc,
                      uint32_t slot_address);
+// A generated kernel-import thunk (`jmp [slot]`) enters the kernel with the
+// caller's return address already on the stack. It is the same kernel call as
+// a direct `call [slot]`, with a tail return continuation instead of a newly
+// pushed return address.
+void AdmitKernelTailCall(X86Context& ctx, uint8_t* base, uint32_t ordinal, uint32_t slot_address,
+                         uint32_t return_address, uint32_t transfer_pc);
 
 // Test-only injection hooks. They fire once at the named boundary so a test can
 // mutate a page, revoke a claim or stop a worker deterministically.

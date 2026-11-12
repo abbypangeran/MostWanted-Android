@@ -9,6 +9,7 @@
 #include "kernel/crypto.h"
 #include "kernel/kernel_data_init.h"
 #include "kernel/kernel_objects.h"
+#include "kernel/nv_settings.h"
 #include "kernel/worker_lifecycle.h"
 #include "kernel/exports.h"
 #include "xbe/image_loader.h"
@@ -1028,33 +1029,6 @@ KERNEL_EXPORT(269, RtlCompareMemoryUlong, 3) {
     return n;
 }
 
-KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
-    switch (a[0]) {
-        case kSuccess: return 0;
-        case kPending: return 997;
-        case kTimeout: return 1460;
-        case kNoSuchFile:
-        case kObjectNameNotFound: return 2;
-        case kObjectPathNotFound: return 3;
-        case kAccessDenied:
-        case kCannotDelete:
-        case kFileIsADirectory: return 5;
-        case kInvalidHandle: return 6;
-        case kNoMemory: return 8;
-        case kNoMoreFiles: return 18;
-        case kEndOfFile: return 38;
-        case kNotSupported: return 50;
-        case kInvalidParameter: return 87;
-        case kNotImplemented: return 120;
-        case kBufferTooSmall: return 122;
-        case kObjectNameInvalid: return 123;
-        case kObjectNameCollision: return 183;
-        case kNotADirectory: return 267;
-        case 0xC000007F: return 112;  // disk full
-        case kDeviceNotConnected: return 1167;
-        default: return (a[0] & 0xC0000000) ? 317 : 0;
-    }
-}
 
 // exceptions, debug, shutdown
 
@@ -1277,6 +1251,7 @@ static uint32_t VideoFlags() { return (app::Widescreen() ? 0x00010000 : 0) | 0x0
 
 KERNEL_EXPORT(24, ExQueryNonVolatileSetting, 5) {
     uint32_t index = a[0], type_out = a[1], value = a[2], len = a[3], result_len = a[4];
+    if (index == 0x11) return nv::QueryReviewedNonVolatileSetting(a);  // XC_MISC
     uint32_t v = 0;
     switch (index) {
         case 7: v = ::app::ConsoleLanguage(); break;  // XC_LANGUAGE
@@ -1285,7 +1260,8 @@ KERNEL_EXPORT(24, ExQueryNonVolatileSetting, 5) {
         case 0x103: v = 0x00400100; break;         // XC_FACTORY_AV_REGION NTSC-M
         case 0x104: v = 1; break;                  // XC_FACTORY_GAME_REGION north america
         case 0x12: v = 1; break;                   // XC_DVD_REGION
-        default: break;
+        case 0xFFFF: v = 0; break;                 // whole EEPROM image
+        default: return kObjectNameNotFound;
     }
     if (value && len) std::memset(HostPtr(value), 0, len);
     if (index == 0xFFFF) {
@@ -1307,6 +1283,8 @@ KERNEL_EXPORT(24, ExQueryNonVolatileSetting, 5) {
     LOG_FIRST(32, "ExQueryNonVolatileSetting %X -> %X", index, v);
     return kSuccess;
 }
+
+
 
 KERNEL_EXPORT(1, AvGetSavedDataAddress, 0) { return SavedDataAddress(); }
 KERNEL_EXPORT(4, AvSetSavedDataAddress, 1) {

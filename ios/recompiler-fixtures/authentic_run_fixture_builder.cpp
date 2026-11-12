@@ -145,6 +145,7 @@ struct SynthRoute {
     std::vector<SynthStep> child;
     uint32_t parent_stop = 0;
     uint32_t child_stop = 0;
+    uint32_t child_failure = 0;
     uint32_t handler = kFullHandler;
     uint32_t seh_call = 0;
     uint32_t seh_entry = 0;
@@ -180,6 +181,12 @@ void EncodeStep(bool parent, size_t index, const route::Step& step, const SynthS
             EmitCallRel(bytes, pc, map(step.target));
             return;
         case route::StepKind::kConditional: {
+            if (!parent && index == 168) {
+                bytes.push_back(0x0F);
+                bytes.push_back(0x85);
+                Emit32(bytes, map(step.target) - (pc + 6));
+                return;
+            }
             if (!parent && index == 144) {
                 bytes.push_back(0x0F);
                 bytes.push_back(0x85);
@@ -191,7 +198,13 @@ void EncodeStep(bool parent, size_t index, const route::Step& step, const SynthS
             return;
         }
         case route::StepKind::kKernelCall:
-            EmitCallAbs(bytes, SlotFor(step.ordinal));
+            if (StartsWith(step.text, "jmp [")) {
+                bytes.push_back(0xFF);
+                bytes.push_back(0x25);
+                Emit32(bytes, SlotFor(step.ordinal));
+            } else {
+                EmitCallAbs(bytes, SlotFor(step.ordinal));
+            }
             return;
         case route::StepKind::kRet:
             if (step.ret_pop_bytes)
@@ -306,6 +319,19 @@ void EncodeStep(bool parent, size_t index, const route::Step& step, const SynthS
         case 150: Append(bytes, {0x8D, 0x45, 0xF4}); return;
         case 151: EmitPushReg(bytes, 0); return;
         case 152: EmitPushImm8(bytes, 0x11); return;
+        case 154: bytes.push_back(0x55); return;
+        case 155: Append(bytes, {0x8B, 0xEC}); return;
+        case 156: Append(bytes, {0xFF, 0x75, 0x18}); return;
+        case 157: Append(bytes, {0xFF, 0x75, 0x14}); return;
+        case 158: Append(bytes, {0xFF, 0x75, 0x10}); return;
+        case 159: Append(bytes, {0xFF, 0x75, 0x0C}); return;
+        case 160: Append(bytes, {0xFF, 0x75, 0x08}); return;
+        case 163: bytes.push_back(0x50); return;
+        case 165: bytes.push_back(0x5D); return;
+        case 167: Append(bytes, {0x85, 0xC0}); return;
+        case 169: Append(bytes, {0x8B, 0x45, 0xFC}); return;
+        case 170: Append(bytes, {0x83, 0xE0, 0x01}); return;
+        case 171: bytes.push_back(0xA3); Emit32(bytes, kFullDebe8); return;
         case 137: EmitPushImm8(bytes, 0); return;
         case 138: EmitPushImm32(bytes, kFullTimerObject); return;
         default: EmitNop(bytes); return;
@@ -348,7 +374,8 @@ SynthRoute BuildFullRoute() {
     // regions follow after the stop; calls, jumps and returns cross regions
     // through the reviewed map.
     auto assign = [&](const route::Step* steps, size_t count, const std::map<size_t, uint32_t>& sizes,
-                      uint32_t base, uint32_t stop_pc, uint32_t& stop) {
+                      uint32_t base, uint32_t stop_pc, uint32_t& stop, uint32_t& failure,
+                      bool reserve_failure) {
         std::vector<size_t> sorted(count);
         for (size_t i = 0; i < count; ++i) sorted[i] = i;
         std::sort(sorted.begin(), sorted.end(), [steps](size_t a, size_t b) { return steps[a].pc < steps[b].pc; });
@@ -378,19 +405,26 @@ SynthRoute BuildFullRoute() {
                 pc += sizes.at(index);
             }
             if (r == stop_region) {
-                stop = pc;
-                pc += 0x10;
+                if (reserve_failure) {
+                    failure = pc;
+                    stop = pc + 10;
+                } else {
+                    stop = pc;
+                }
+                pc = stop + 0x10;
             } else {
                 pc += 0x10;
             }
         }
     };
+    uint32_t parent_failure = 0;
     assign(route::kParentRoute, route::kParentRouteCount, parent_sizes, kFullParentBase, route::kParentStop,
-           result.parent_stop);
+           result.parent_stop, parent_failure, false);
     assign(route::kChildRoute, route::kChildRouteCount, child_sizes, kFullChildBase, route::kChildStop,
-           result.child_stop);
+           result.child_stop, result.child_failure, true);
     map.traps[route::kParentStop] = result.parent_stop;
     map.traps[route::kChildStop] = result.child_stop;
+    map.traps[0x002B5E75u] = result.child_failure;
     map.traps[route::kSehHandler] = kFullHandler;
     for (uint32_t trap : route::kParentTrapEntries)
         if (trap != route::kParentStop) map(trap);
@@ -518,12 +552,16 @@ bool WriteFullRoute(std::vector<Chunk>& chunks, const std::filesystem::path& hea
     chunks.push_back({kFullHandler,
                       {0xC7, 0x05, 0x90, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x31, 0xC0, 0xC3}});
     chunks.push_back({route.parent_stop, {0xC3}});
+    chunks.push_back({route.child_failure,
+                      {0xC7, 0x05, uint8_t(kFullDebec & 0xFF), uint8_t((kFullDebec >> 8) & 0xFF),
+                       uint8_t((kFullDebec >> 16) & 0xFF), uint8_t((kFullDebec >> 24) & 0xFF),
+                       0x01, 0x00, 0x00, 0x00}});
     chunks.push_back({route.child_stop, {0xC3}});
 
     std::ofstream header(header_path);
     if (!header) return false;
     header << "// Generated by authentic_run_fixture_builder. Do not edit.\n"
-              "// Synthetic 211-instruction mirror of the reviewed route; no authentic bytes.\n"
+              "// Synthetic 244-instruction mirror of the reviewed route; no authentic bytes.\n"
               "#pragma once\n\n"
               "#include <cstddef>\n"
               "#include <cstdint>\n\n"
@@ -559,6 +597,8 @@ bool WriteFullRoute(std::vector<Chunk>& chunks, const std::filesystem::path& hea
            << std::setw(8) << std::setfill('0') << kFullCriticalSection << "u;\n";
     header << "inline constexpr uint32_t kParentExecutedInstructions = " << std::dec << route.parent.size()
            << "u;\n";
+    header << "inline constexpr uint32_t kChildFailure = 0x" << std::hex << std::uppercase
+           << std::setw(8) << std::setfill('0') << route.child_failure << "u;\n";
     header << "inline constexpr uint32_t kChildExecutedInstructions = " << std::dec << route.child.size()
            << "u;\n";
     header << "inline constexpr uint32_t kTotalExecutedInstructions = " << std::dec
@@ -628,6 +668,8 @@ bool WriteFullRoute(std::vector<Chunk>& chunks, const std::filesystem::path& hea
            << route.parent_stop << "\nend = 0x" << std::setw(8) << route.parent_stop + 1 << "\n";
     config << "\n[[function]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
            << route.child_stop << "\nend = 0x" << std::setw(8) << route.child_stop + 1 << "\n";
+    config << "\n[[function]]\nat = 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
+           << route.child_failure << "\nend = 0x" << std::setw(8) << route.child_failure + 10 << "\n";
     config << std::dec;
     return true;
 }

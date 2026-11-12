@@ -1,7 +1,7 @@
 {
   "schema": "mostwanted.startup-readiness/1",
-  "phase": "2D-28D",
-  "milestone": "STOP_EVIDENCE_REMEDIATION",
+  "phase": "2D-29",
+  "milestone": "DEVICE_QUERY_CONTINUATION_244",
   "result": "PASS",
   "authentic_execution": "prohibited",
   "authentic_execution_authorised": false,
@@ -217,14 +217,18 @@
     "ios/recompiler-fixtures/authentic_run_fixture_route.h",
     "ios/recompiler-fixtures/authentic_run_fixture_builder.cpp",
     "ios/recompiler-fixtures/authentic_run_tests.cpp",
-    "ios/recompiler-fixtures/CMakeLists.txt"
+    "ios/recompiler-fixtures/CMakeLists.txt",
+    "sdk/runtime/kernel/nv_settings.cpp",
+    "sdk/runtime/kernel/nv_settings.h",
+    "sdk/runtime/cpu/dispatch.cpp",
+    "sdk/tools/recomp/codegen.cpp"
   ],
   "validation": {
-    "authentic_run_tests": "180 PASS / 0 FAIL, Debug and Release",
+    "authentic_run_tests": "194 PASS / 0 FAIL, Debug and Release",
     "checked_recompiler_fixtures": "812 PASS / 0 FAIL, Debug and Release",
     "safe_ctests": "5/5, Debug and Release (-E execution_probe)",
-    "authentic_run_preflight": "PASS, 242/242",
-    "identity_preflight": "mapping 94166820FBB48A28, parent 85527B8FA581229F, child 3440CAC0FC3A57FB",
+    "authentic_run_preflight": "PASS, 259/259, Debug and Release",
+    "identity_preflight": "mapping 8D0082429CE5EB01, parent 85527B8FA581229F, child 4F974C3816F3D56A",
     "data_import_slots": "322/324 verified",
     "authentic_run_accounting": "PASS, virtual 1280 -> 0",
     "mostwanted_memory_tests": "454 PASS / 0 FAIL, Debug and Release",
@@ -232,7 +236,9 @@
     "authentic_image_executed": false,
     "historical_evidence_modified": false,
     "stop_evidence_lifecycle": "PASS, synthetic 224 route and negative capture tests",
-    "experimental_driver": "compiled off/on; prepare-only admission PASS; no authentic execution"
+    "experimental_driver": "compiled off/on; prepare-only admission PASS; no authentic execution",
+    "device_query": "XC_MISC 0x0011 success/failure and 24/301 checked implementation tests PASS",
+    "timer_dependency": "assessed only; KeSetTimer/DPC/HalInitiateShutdown not executed"
   },
   "gates": {
     "gate_a_preparation": {
@@ -382,7 +388,7 @@
   "authorises_authentic_execution": false,
   "r1_16": "ON_HOLD",
   "customer_release": "NOT_READY",
-  "baseline_head": "d6b8abce6ec8e5cb2c79afabb76806a9a750f23a",
+  "baseline_head": "02f3857ab9b1a9a4fb05bee8d832c50efbd551c7",
   "fourth_run": {
     "result": "EARLY_STOP",
     "authentic_run": true,
@@ -769,15 +775,15 @@
   "next_authentic_gate": {
     "authorised": false,
     "technically_justified": true,
-    "scope": "exactly the 224-instruction route, parent 73 transfers, child 156 transfers, stop 002B5E5F",
-    "mapping_identity": "94166820FBB48A28",
+    "scope": "exactly the 244-instruction route, parent 73 transfers, child 177 transfers, stop 0x002B5E7F; timer/DPC/shutdown not admitted",
+    "mapping_identity": "8D0082429CE5EB01",
     "parent_manifest": "85527B8FA581229F",
-    "child_manifest": "3440CAC0FC3A57FB",
+    "child_manifest": "4F974C3816F3D56A",
     "requirements": [
       "separate explicit authorisation for any later authentic run",
-      "use the stop-time stack snapshot contract; never re-read released worker memory",
-      "stop before 002B5E5F; do not enter the device query or timer DPC",
-      "no authentic callback authorisation",
+      "use the stop-time snapshots; never re-read released worker memory",
+      "stop before 002B5E7F; do not enter the timer helper, KeSetTimer or DPC",
+      "no authentic callback or shutdown authorisation",
       "preserve FIFTH_AUTHENTIC_RUN=FAIL and SIXTH_AUTHENTIC_RUN=FAIL"
     ]
   },
@@ -975,5 +981,167 @@
     },
     "driver": "compiled off/on; prepare-only admission PASS; no authentic execution",
     "evidence": ".local/ios-port/phase2d28d-stop-evidence/"
+  },
+  "boundary_244": {
+    "parent": 71,
+    "child": 173,
+    "total": 244,
+    "boundary_steps": 246,
+    "parent_transfers": 73,
+    "child_transfers": 177,
+    "parent_stop": "0x002B3987",
+    "child_stop": "0x002B5E7F",
+    "child_stack_capture": "0x002B5E5F",
+    "kernels": {
+      "parent": [
+        255,
+        187
+      ],
+      "child": [
+        277,
+        294,
+        47,
+        107,
+        113,
+        24,
+        301
+      ]
+    },
+    "parent_manifest": "85527B8FA581229F",
+    "child_manifest": "4F974C3816F3D56A",
+    "mapping_identity": "8D0082429CE5EB01",
+    "mapping_entries": 259,
+    "preflight": "PASS 259/259",
+    "historical_224_identities": [
+      "94166820FBB48A28",
+      "85527B8FA581229F",
+      "3440CAC0FC3A57FB"
+    ]
+  },
+  "device_query": {
+    "setting": "XC_MISC",
+    "index": "0x0011",
+    "type": "REG_DWORD",
+    "length": 4,
+    "caller": "0x002B5E5F -> 0x002B39B9",
+    "thunk": "0x002B95AC jmp [0x003C9D34] ordinal 24 encoding 0x80000018",
+    "status_conversion": "0x002B39D1 call [0x003C9DC0] ordinal 301 encoding 0x8000012D",
+    "return": "0x002B39D7 pop ebp; 0x002B39D8 ret 0x14",
+    "success_branch": [
+      "0x002B5E68",
+      "0x002B5E6B",
+      "0x002B5E6E",
+      "0x002B5E73"
+    ],
+    "failure_branch": [
+      "0x002B5E75"
+    ],
+    "convergence_stop": "0x002B5E7F",
+    "default_misc_flags": "0 (auto power-down disabled; bit 0 XC_MISC_FLAG_AUTOPOWERDOWN)",
+    "success_values_tested": [
+      0,
+      1
+    ],
+    "failure_values_tested": [
+      3221225628,
+      3221225524,
+      3221225507,
+      3221225477
+    ],
+    "kernel_24": {
+      "type": "REG_DWORD",
+      "size": 4,
+      "result_length": 4,
+      "checked": "guest type/value/result pointers and buffer length",
+      "statuses": {
+        "success": "0x00000000",
+        "buffer_too_small": "0xC0000023",
+        "access_violation": "0xC0000005",
+        "object_name_not_found": "0xC0000034",
+        "device_data_error": "0xC000009C"
+      },
+      "source": "sdk/runtime/kernel/nv_settings.cpp"
+    },
+    "kernel_301": {
+      "mapping": "reviewed Xbox kernel RtlNtStatusToDosError table",
+      "examples": {
+        "success": 0,
+        "object_name_not_found": 2,
+        "device_data_error": 23,
+        "buffer_too_small": 122
+      },
+      "unknown": "non-success (317) not converted to success"
+    },
+    "references": [
+      "nxdk xboxkrnl.h",
+      "Xbox kernel settings.c",
+      "Xbox kernel generr.c",
+      "Cxbx EEPROM defaults"
+    ]
+  },
+  "phase_2d29_device_query": {
+    "result": "PASS",
+    "authentic_execution": false,
+    "route": {
+      "parent": 71,
+      "child": 173,
+      "total": 244,
+      "boundary_steps": 246,
+      "parent_transfers": 73,
+      "child_transfers": 177,
+      "parent_stop": "0x002B3987",
+      "child_stop": "0x002B5E7F",
+      "child_stack_capture": "0x002B5E5F",
+      "kernels": {
+        "parent": [
+          255,
+          187
+        ],
+        "child": [
+          277,
+          294,
+          47,
+          107,
+          113,
+          24,
+          301
+        ]
+      },
+      "parent_manifest": "85527B8FA581229F",
+      "child_manifest": "4F974C3816F3D56A",
+      "mapping_identity": "8D0082429CE5EB01",
+      "mapping_entries": 259,
+      "preflight": "PASS 259/259",
+      "historical_224_identities": [
+        "94166820FBB48A28",
+        "85527B8FA581229F",
+        "3440CAC0FC3A57FB"
+      ]
+    },
+    "kernel_support": [
+      "ordinal 24 checked XC_MISC",
+      "ordinal 301 reviewed DOS conversion"
+    ],
+    "branches": {
+      "success": "full synthetic success route PASS",
+      "failure": "separate synthetic failure route PASS (170/174)",
+      "unexpected_failure_on_success_manifest": "kForbiddenBranch"
+    },
+    "timer_dependency": {
+      "status": "assessed, not implemented",
+      "path": [
+        "0x002B5E7F",
+        "0x002B5DE5",
+        "KeSetTimer 149",
+        "0x002B5E00 DPC",
+        "HalInitiateShutdown 360"
+      ],
+      "slots": {
+        "set_timer": "0x003C9E20=0x80000095",
+        "shutdown": "0x003C9E88=0x80000168"
+      },
+      "selected_stop": "0x002B5E7F"
+    },
+    "evidence": ".local/ios-port/phase2d29-device-query/"
   }
 }

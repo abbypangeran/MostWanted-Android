@@ -353,8 +353,8 @@ int main(int argc, char** argv) {
     Record("AUTH_RUN_CHILD_BUDGET_128_REFUSED", route::kChildRequiredTransfers > 128);
     Record("AUTH_RUN_PARENT_BUDGET_72_REFUSED", route::kParentRequiredTransfers > 72);
     Record("AUTH_RUN_PARENT_BUDGET_73_ACCEPTED", route::kParentRequiredTransfers <= 73);
-    Record("AUTH_RUN_CHILD_BUDGET_156_ACCEPTED", route::kChildRequiredTransfers <= 156);
-    Record("AUTH_RUN_CHILD_BUDGET_155_REFUSED", route::kChildRequiredTransfers > 155);
+    Record("AUTH_RUN_CHILD_BUDGET_177_ACCEPTED", route::kChildRequiredTransfers <= 177);
+    Record("AUTH_RUN_CHILD_BUDGET_176_REFUSED", route::kChildRequiredTransfers > 176);
     char budget_line[96];
     std::snprintf(budget_line, sizeof(budget_line), "AUTH_RUN_PARENT_REQUIRED_TRANSFERS=%u",
                   route::kParentRequiredTransfers);
@@ -406,12 +406,14 @@ int main(int argc, char** argv) {
     Record("AUTH_RUN_SCOPE_EMPTY", scope_first == 0xFFFFFFFF);
     // The reviewed import slots and the exact call-site encodings.
     uint32_t enter_slot = 0, leave_slot = 0, create_slot = 0, close_slot = 0;
-    uint32_t hardware_slot = 0, version_slot = 0;
+    uint32_t hardware_slot = 0, version_slot = 0, misc_slot = 0, status_slot = 0;
     const bool slots_ok = image.Read32(0x003C9E44, enter_slot) && image.Read32(0x003C9E40, leave_slot) &&
                           image.Read32(0x003C9E68, create_slot) && image.Read32(0x003C9D4C, close_slot) &&
-                          image.Read32(0x003C9E34, hardware_slot) && image.Read32(0x003C9E3C, version_slot);
+                          image.Read32(0x003C9E34, hardware_slot) && image.Read32(0x003C9E3C, version_slot) &&
+                          image.Read32(0x003C9D34, misc_slot) && image.Read32(0x003C9DC0, status_slot);
     Record("AUTH_RUN_IMPORT_SLOTS", slots_ok && enter_slot == 0x80000115 && leave_slot == 0x80000126 &&
-                                        create_slot == 0x800000FF && close_slot == 0x800000BB);
+                                        create_slot == 0x800000FF && close_slot == 0x800000BB &&
+                                        misc_slot == 0x80000018 && status_slot == 0x8000012D);
     Record("AUTH_RUN_DATA_IMPORT_SLOTS", slots_ok && hardware_slot == 0x80000142 && version_slot == 0x80000144);
     // The three trap-only entries must decode to the reviewed lengths.
     bool traps_ok = true;
@@ -424,6 +426,7 @@ int main(int argc, char** argv) {
     Record("AUTH_RUN_TRAP_ENTRIES", traps_ok);
     g_lines.emplace_back("AUTH_RUN_STOP_PARENT=" + Hex(route::kParentStop));
     g_lines.emplace_back("AUTH_RUN_STOP_CHILD=" + Hex(route::kChildStop));
+    g_lines.emplace_back("AUTH_RUN_CHILD_STACK_CAPTURE=" + Hex(route::kChildDeviceQueryCall));
     g_lines.emplace_back("AUTH_RUN_STOP_KIND=pre-instruction");
     g_lines.emplace_back("AUTH_RUN_CHILD_TRANSITION=" + Hex(route::kChildStop) + " first-instruction-not-executed");
     g_lines.emplace_back("AUTH_RUN_TOTAL_EXECUTED=" + std::to_string(route::kParentRouteCount + route::kChildRouteCount));

@@ -14,6 +14,7 @@
 #include "kernel/authentic_run.h"
 #include "kernel/kernel_data_init.h"
 #include "kernel/kernel_objects.h"
+#include "kernel/nv_settings.h"
 
 #include <algorithm>
 #include <array>
@@ -45,6 +46,8 @@ const char* const kImageName294 = "RtlLeaveCriticalSection";
 const char* const kImageName47 = "HalRegisterShutdownNotification";
 const char* const kImageName107 = "KeInitializeDpc";
 const char* const kImageName113 = "KeInitializeTimerEx";
+const char* const kImageName24 = "ExQueryNonVolatileSetting";
+const char* const kImageName301 = "RtlNtStatusToDosError";
 constexpr uint32_t kShutdownCallbackLow = 0x00011000u;
 constexpr uint32_t kShutdownCallbackHigh = 0x00380000u;
 
@@ -489,10 +492,10 @@ bool VerifyStopSeh(WorkerSlot& slot, Thread& thread, const RouteManifest& manife
 // Read the transient stop frame while RunBoundWorker still holds the stack
 // lease. This is the only stack-memory access in the stop path; the result is
 // copied into host-owned evidence and is never re-read after finalisation.
-void CaptureStopStack(WorkerSlot& slot, Thread& thread) {
+void CaptureStopStack(WorkerSlot& slot, Thread& thread, uint32_t pc) {
     const RouteManifest& manifest = *slot.manifest;
     StopStackEvidence evidence;
-    evidence.pc = slot.stop_pc;
+    evidence.pc = pc;
     evidence.requested_words = manifest.stop_stack_words;
     evidence.memory_generation = mem::Generation();
     auto finish = [&] {
@@ -589,7 +592,8 @@ void VerifyStopState(WorkerSlot& slot) {
         slot.status = Status::kInternalError;
         return;
     }
-    if (manifest.stop_stack_frame != StopStackFrame::kNone) CaptureStopStack(slot, *thread);
+    if (manifest.stop_stack_frame != StopStackFrame::kNone && manifest.stop_stack_capture_pc == 0)
+        CaptureStopStack(slot, *thread, slot.stop_pc);
     if (manifest.seh_call) {
         uint32_t registration = 0;
         slot.seh_verified = VerifyStopSeh(slot, *thread, manifest, registration);
@@ -664,6 +668,8 @@ bool KernelNameMatches(uint32_t ordinal) {
         case 47: expected = kImageName47; break;
         case 107: expected = kImageName107; break;
         case 113: expected = kImageName113; break;
+        case 24: expected = kImageName24; break;
+        case 301: expected = kImageName301; break;
         default: return false;
     }
     const char* name = kernel::ExportName(ordinal);
@@ -727,22 +733,26 @@ CriticalResult CheckedCriticalLeave(uint32_t cs, uint32_t expected, uint32_t eth
 }
 
 void InvokeReviewedKernel(WorkerSlot& slot, X86Context& ctx, uint8_t* base, const route::Step& step,
-                          uint32_t return_address, uint32_t call_pc, uint32_t slot_address) {
+                          uint32_t return_address, uint32_t call_pc, uint32_t slot_address,
+                          bool tail_return = false) {
     KernelObservation observation;
     observation.ordinal = step.ordinal;
     observation.call_pc = call_pc;
     observation.return_pc = return_address;
     observation.slot = step.slot;
-    observation.esp_before = ctx.esp;
+    const uint32_t argument_address = tail_return ? ctx.esp + 4 : ctx.esp;
+    const uint32_t stack_address = tail_return ? ctx.esp : ctx.esp - 4;
+    observation.esp_before = argument_address;
     observation.status = Status::kReady;
     if (slot.kernel_calls + 1 > slot.kernel_budget)
         Violation(slot, Status::kBudgetExceeded, call_pc, step.target);
     ++slot.kernel_calls;
     const uint32_t argument_bytes = uint32_t(step.arguments) * sizeof(uint32_t);
-    if (!argument_bytes || mem::CheckAccess(ctx.esp, argument_bytes, mem::kRead) != mem::AccessStatus::kOk)
+    if (!argument_bytes ||
+        mem::CheckAccess(argument_address, argument_bytes, mem::kRead) != mem::AccessStatus::kOk)
         Violation(slot, Status::kKernelRejected, call_pc, step.target);
     uint32_t first_argument = 0;
-    if (mem::Read(ctx.esp, &first_argument, sizeof(first_argument)) != mem::AccessStatus::kOk)
+    if (mem::Read(argument_address, &first_argument, sizeof(first_argument)) != mem::AccessStatus::kOk)
         Violation(slot, Status::kKernelRejected, call_pc, step.target);
     observation.argument = first_argument;
     if (slot_address) {
@@ -753,9 +763,15 @@ void InvokeReviewedKernel(WorkerSlot& slot, X86Context& ctx, uint8_t* base, cons
     }
     if (!KernelNameMatches(step.ordinal)) Violation(slot, Status::kKernelRejected, call_pc, step.target);
     TraceEvent(slot, EventKind::kKernelCall, call_pc, step.target, step.ordinal, step.arguments);
-    const uint32_t stack_address = ctx.esp - 4;
-    x86_mem_write<uint32_t>(call_pc, stack_address, return_address);
-    ctx.esp = stack_address;
+    if (tail_return) {
+        uint32_t live_return = 0;
+        if (mem::Read(ctx.esp, &live_return, sizeof(live_return)) != mem::AccessStatus::kOk ||
+            live_return != return_address)
+            Violation(slot, Status::kKernelAbiMismatch, call_pc, step.target);
+    } else {
+        x86_mem_write<uint32_t>(call_pc, stack_address, return_address);
+        ctx.esp = stack_address;
+    }
     t_pending_kernel = &observation;
     if (step.ordinal == 277 || step.ordinal == 294) {
         Thread* thread = Current();
@@ -799,7 +815,6 @@ void InvokeReviewedKernel(WorkerSlot& slot, X86Context& ctx, uint8_t* base, cons
     TraceEvent(slot, EventKind::kKernelReturn, call_pc, step.target, step.ordinal, step.arguments);
     TraceContext(slot);
 }
-
 }  // namespace
 
 const char* TlsEvidenceStatusName(TlsEvidenceStatus status) {
@@ -907,6 +922,7 @@ const RouteManifest& AuthenticChildManifest() {
         route::kChildRequiredTransfers,
         StopStackFrame::kContinuationDeviceQuery,
         5,
+        route::kChildDeviceQueryCall,
     };
     return manifest;
 }
@@ -1127,6 +1143,12 @@ void AdmitGeneratedTransfer(X86Context& ctx, uint32_t target, uint32_t return_ad
             Violation(slot, Status::kUnreviewedTransfer, transfer_pc, target);
         if (return_address != step.next)
             Violation(slot, Status::kUnreviewedTransfer, transfer_pc, target);
+        if (manifest.stop_stack_frame != StopStackFrame::kNone &&
+            manifest.stop_stack_capture_pc == transfer_pc &&
+            slot.stop_stack.status == StopStackStatus::kNotEvaluated) {
+            Thread* thread = Current();
+            if (thread) CaptureStopStack(slot, *thread, transfer_pc);
+        }
         if (target == manifest.stop) {
             // The reviewed dynamic start-routine call retires (its return
             // address is pushed) and the callee entry is refused. Zero
@@ -1201,6 +1223,27 @@ void AdmitGeneratedTransfer(X86Context& ctx, uint32_t target, uint32_t return_ad
     TraceEvent(slot, EventKind::kJumpTransfer, transfer_pc, target);
     TraceContext(slot);
     EnterNode(slot, next);
+}
+
+void AdmitKernelTailCall(X86Context& ctx, uint8_t* base, uint32_t ordinal, uint32_t slot_address,
+                         uint32_t return_address, uint32_t transfer_pc) {
+    if (!GateActive()) return;
+    WorkerSlot& slot = *t_active;
+    t_context = &ctx;
+    const RouteManifest& manifest = *slot.manifest;
+    const route::Step& step = manifest.steps[slot.node];
+    if (step.kind != route::StepKind::kKernelCall || step.pc != transfer_pc || step.ordinal != ordinal ||
+        step.ordinal == 0 || return_address != step.next)
+        Violation(slot, Status::kKernelRejected, transfer_pc, return_address);
+    InvokeReviewedKernel(slot, ctx, base, step, return_address, transfer_pc, slot_address, true);
+    // The kernel's tail return consumes the return address of the reviewed
+    // CALL to this import thunk. Pop that call frame here; the caller's
+    // generated checked jump then performs the single step.next transfer.
+    if (slot.depth == 0) Violation(slot, Status::kUnreviewedTransfer, transfer_pc, step.next);
+    const uint32_t call_node = slot.call_stack[--slot.depth];
+    if (manifest.steps[call_node].next != step.next)
+        Violation(slot, Status::kUnreviewedTransfer, transfer_pc, step.next);
+    slot.node = call_node;
 }
 
 void AdmitGuestReturn(X86Context& ctx, uint32_t pc, uint32_t pop_bytes) {
@@ -1627,8 +1670,10 @@ Status InstallHarnessKernelExports() {
     RegisterExport(47, kImageName47, HarnessShutdownRegistration);
     RegisterExport(107, kImageName107, HarnessInitializeDpc);
     RegisterExport(113, kImageName113, HarnessInitializeTimerEx);
+    RegisterExport(24, "ExQueryNonVolatileSetting", nv::QueryReviewedNonVolatileSettingEntry);
+    RegisterExport(301, "RtlNtStatusToDosError", nv::NtStatusToDosErrorEntry);
     if (!HasExport(255) || !HasExport(187) || !HasExport(277) || !HasExport(294) || !HasExport(47) ||
-        !HasExport(107) || !HasExport(113))
+        !HasExport(107) || !HasExport(113) || !HasExport(24) || !HasExport(301))
         return Status::kInternalError;
     return Status::kReady;
 }

@@ -334,3 +334,29 @@ The corrected driver compiled off/on and passed prepare-only admission with clea
 authentic execution was started. `FIFTH_AUTHENTIC_RUN = FAIL` and `SIXTH_AUTHENTIC_RUN = FAIL` remain
 preserved; the sixth run's route completed but its stack evidence was not captured. Gate A GO; Gate B is
 preparation READY with execution NOT AUTHORISED; Gate C remains NO-GO.
+
+## Phase 2D-29 — non-volatile device query continuation
+
+`PHASE_2D29_DEVICE_QUERY = PASS` (offline only; no authentic execution).
+
+The reviewed caller at `002B5E5F` enters wrapper `002B39B9`, which forwards `XC_MISC` (`0x0011`,
+`REG_DWORD`, four bytes) through the `002B95AC` thunk to `ExQueryNonVolatileSetting` (24), then converts
+the NTSTATUS through `RtlNtStatusToDosError` (301), returns to `002B5E64` and selects the reviewed
+success path at `002B5E68` or failure path at `002B5E75`. The runtime EEPROM user default has the
+auto-power-down bit clear; both 0 and 1 success values and the failure branch are covered. The child
+route now retires 173 instructions / 177 transfers and stops before `002B5E7F`; total 244/246. Child
+manifest `4F974C3816F3D56A`, mapping `8D0082429CE5EB01` (259); parent unchanged at
+`85527B8FA581229F` (71/73). Kernel ordinals 24 and 301 are supported through the checked
+`nv_settings.cpp` implementation with fail-closed pointers/buffers/unsupported indexes; the reviewed
+NTSTATUS mappings include 0, 2, 23, 122 and unknown non-success.
+
+The synthetic fixture now exercises the full success route and an independent failure route
+(170 instructions / 174 transfers), the latter setting `004EDBEC` while leaving `004EDBE8` clear.
+Fresh Debug/Release: 194 authentic tests, 812 checked fixtures, safe CTests 5/5, preflight PASS 259/259,
+accounting 1280 -> 0, memory 454/0, Android ARM64 syntax PASS. The driver compiled off/on and passed
+prepare-only admission (`ceilings=2/7`, cleanup/accounting) without authentic execution.
+
+The timer dependency was assessed but not implemented: `002B5E7F -> 002B5DE5` reaches `KeSetTimer`
+(149, `80000095`) with timer `004EDBC0`, DPC `004EDBA0`; the DPC `002B5E00` can call
+`HalInitiateShutdown` (360, `80000168`) when `004EDBE8` is set. Timer scheduling, DPC dispatch and
+shutdown remain prohibited; Gate B is preparation READY/execution NOT AUTHORISED, Gate C NO-GO.
